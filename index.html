@@ -1,0 +1,1094 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>TAB 악보 결합 도구</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  :root{
+    --bg:#faf8f3;
+    --card:#ffffff;
+    --border:#ddd8cc;
+    --border-strong:#bdb6a4;
+    --text:#1a1a1a;
+    --text2:#6b6b63;
+    --accent:#3c3489;
+    --accent-bg:#eeedfe;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans KR",sans-serif;
+    background:var(--bg);
+    color:var(--text);
+    padding:24px;
+  }
+  .app{max-width:780px;margin:0 auto;display:flex;flex-direction:column;gap:20px;}
+  .titlebar{display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border);padding-bottom:12px;}
+  .titlebar input{
+    flex:1;font-family:Georgia,"Noto Serif KR",serif;font-size:22px;font-weight:600;
+    border:none;background:transparent;outline:none;color:var(--text);
+  }
+  .toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
+  button{
+    border:1px solid var(--border-strong);background:var(--card);color:var(--text);
+    border-radius:8px;padding:8px 14px;font-size:14px;cursor:pointer;
+  }
+  button:hover{background:var(--accent-bg);}
+  button:disabled{opacity:0.4;cursor:default;}
+  .icon-btn{padding:6px 8px;font-size:13px;}
+  .save-msg{font-size:13px;color:var(--accent);}
+  .saved-list{display:flex;gap:8px;flex-wrap:wrap;align-items:center;font-size:13px;color:var(--text2);}
+  .saved-chip{display:inline-flex;border:1px solid var(--border-strong);border-radius:8px;overflow:hidden;}
+  .saved-chip button{border:none;border-radius:0;}
+  .saved-chip button:first-child{border-right:1px solid var(--border-strong);}
+  .empty{
+    text-align:center;padding:48px 16px;color:var(--text2);font-size:14px;
+    border:1px dashed var(--border-strong);border-radius:12px;line-height:1.6;
+  }
+  .block{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;}
+  .block-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-size:13px;color:var(--text2);}
+  .block-actions{display:flex;gap:6px;}
+  canvas.preview{width:100%;display:block;background:#fff;border:1px solid var(--border);border-radius:8px;}
+  .adv-toggle-row{display:flex;justify-content:space-between;align-items:center;font-size:12.5px;color:var(--text2);gap:8px;}
+  .lyric-section{margin-top:14px;border-top:1px solid var(--border);padding-top:12px;}
+  .lyric-head-mini{
+    display:flex;justify-content:space-between;align-items:center;
+    font-size:12px;color:var(--text2);margin-bottom:8px;gap:8px;
+  }
+  .lyric-head-mini .icon-btn{font-size:11px;padding:3px 8px;}
+  .lane-wrap{display:flex;flex-direction:column;}
+  .lane-ref-strip-standalone{
+    width:100%;flex-shrink:0;
+    background-repeat:no-repeat;background-size:100% auto;background-position:bottom;
+    opacity:0.32;pointer-events:none;
+    border:1px dashed var(--border-strong);border-bottom:none;border-radius:8px 8px 0 0;
+  }
+  .lyric-lane{
+    position:relative;width:100%;min-height:20px;
+    border:1px dashed var(--border-strong);border-radius:0 0 8px 8px;
+    background-color:#fdfdfb;
+    background-image:repeating-linear-gradient(to right, var(--border) 0, var(--border) 1px, transparent 1px, transparent 5%);
+  }
+  .lyric-lane.no-ref{border-radius:8px;}
+  .lane-empty{
+    position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    text-align:center;padding:8px;font-size:11.5px;color:var(--text2);line-height:1.5;
+  }
+  .lyric-tag{
+    position:absolute;transform:translate(0,-50%);
+    z-index:1;
+  }
+  .lyric-tag-row{
+    display:flex;align-items:center;gap:3px;
+    background:#ffffff;border:1px solid var(--border-strong);border-radius:6px;
+    padding:2px 4px;box-shadow:0 1px 4px rgba(0,0,0,0.14);
+  }
+  .tag-handle{
+    position:absolute;left:0;bottom:100%;margin-bottom:2px;
+    cursor:grab;touch-action:none;font-size:11px;color:var(--text2);
+    background:#ffffff;border:1px solid var(--border-strong);border-radius:4px;
+    padding:0 3px;line-height:14px;user-select:none;
+  }
+  .lyric-tag input{
+    border:none;background:transparent;outline:none;
+    font-family:Georgia,"Noto Serif KR",serif;font-size:inherit;color:#1a1a1a;padding:0;
+  }
+  .tag-del{border:none;background:transparent;color:var(--text2);font-size:13px;padding:0 2px;cursor:pointer;}
+  .lane-resize-handle{
+    position:absolute;left:50%;bottom:2px;transform:translateX(-50%);
+    width:40px;height:11px;border-radius:4px;background:var(--border-strong);
+    cursor:ns-resize;touch-action:none;
+  }
+  .controls{display:flex;flex-direction:column;gap:10px;margin-top:12px;}
+  .controls label{display:flex;align-items:center;gap:8px;font-size:13px;}
+  .slider-label{font-size:12px;color:var(--text2);margin-bottom:4px;}
+  input[type=range]{width:100%;}
+  select{border:1px solid var(--border-strong);border-radius:8px;padding:6px 8px;font-size:13px;background:var(--card);color:var(--text);width:100%;}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px 16px;}
+  textarea{
+    width:100%;resize:vertical;font-family:Georgia,"Noto Serif KR",serif;font-size:15px;
+    border:none;background:transparent;outline:none;color:var(--text);
+  }
+  .list{display:flex;flex-direction:column;gap:12px;}
+  .hr{border:none;border-top:1px solid var(--border);margin:4px 0;}
+
+  .notice-banner{
+    display:flex;align-items:flex-start;gap:10px;
+    background:var(--accent-bg);border:1px solid var(--accent);border-radius:10px;
+    padding:12px 14px;font-size:12.5px;line-height:1.6;color:var(--text);
+  }
+  .notice-banner .notice-text{flex:1;}
+  .notice-banner .notice-text b{color:var(--accent);}
+  .notice-banner button{flex-shrink:0;padding:4px 10px;font-size:12px;}
+  .disclaimer-footer{
+    margin-top:8px;padding-top:14px;border-top:1px solid var(--border);
+    font-size:11.5px;line-height:1.7;color:var(--text2);text-align:center;
+  }
+
+  .float-preview{
+    position:fixed;bottom:16px;right:16px;width:300px;max-width:90vw;
+    max-height:70vh;background:var(--card);border:1px solid var(--border-strong);
+    border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.18);
+    display:flex;flex-direction:column;overflow:hidden;z-index:50;
+  }
+  .float-preview.collapsed{width:auto;max-height:none;}
+  .float-preview-head{
+    display:flex;justify-content:space-between;align-items:center;gap:8px;
+    padding:8px 10px;font-size:12px;color:var(--text2);
+    border-bottom:1px solid var(--border);background:var(--card);
+  }
+  .float-preview.collapsed .float-preview-head{border-bottom:none;}
+  .float-preview-body{overflow:auto;padding:8px;}
+  .float-preview-body img{width:100%;display:block;}
+  @media (max-width:640px){
+    .float-preview{width:46vw;}
+  }
+  .preview-modal-backdrop{
+    position:fixed;inset:0;background:rgba(0,0,0,0.5);
+    display:flex;align-items:center;justify-content:center;z-index:100;padding:24px;
+  }
+  .preview-modal{
+    background:var(--card);border-radius:12px;box-shadow:0 8px 40px rgba(0,0,0,0.3);
+    width:min(900px,100%);max-height:90vh;display:flex;flex-direction:column;overflow:hidden;
+  }
+  .preview-modal-head{
+    display:flex;justify-content:space-between;align-items:center;
+    padding:12px 16px;border-bottom:1px solid var(--border);font-size:13px;color:var(--text2);
+  }
+  .preview-modal-body{overflow:auto;padding:12px;}
+  .preview-modal-body img{width:100%;display:block;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useEffect } = React;
+
+const DB_NAME = 'tab_score_builder_db';
+const STORE_NAME = 'scores';
+const DRAFT_KEY = '__draft__';
+
+const DEFAULTS_INIT = {
+  removeBg: true,
+  invertMode: 'auto',
+  threshold: 140,
+  softness: 18,
+  despeckle: true,
+  despeckleSize: 3,
+  cropTop: 0, cropBottom: 0, cropLeft: 0, cropRight: 0,
+  imageGap: 18,
+  lyricFontSize: 26,
+  lyricAreaHeight: 90,
+};
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) { reject(new Error('IndexedDB unavailable')); return; }
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(STORE_NAME)) {
+        req.result.createObjectStore(STORE_NAME);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function dbPut(key, value) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.objectStore(STORE_NAME).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function dbGet(key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const req = tx.objectStore(STORE_NAME).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function dbDelete(key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.objectStore(STORE_NAME).delete(key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function dbAllKeys() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const req = tx.objectStore(STORE_NAME).getAllKeys();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function clampPct(v) { return Math.min(45, Math.max(0, v || 0)); }
+
+function sampleAvgLuminance(img) {
+  const c = document.createElement('canvas');
+  const w = 60;
+  const h = Math.max(1, Math.round((60 * img.naturalHeight) / img.naturalWidth));
+  c.width = w; c.height = h;
+  const ctx = c.getContext('2d');
+  ctx.drawImage(img, 0, 0, w, h);
+  const d = ctx.getImageData(0, 0, w, h).data;
+  let sum = 0, n = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    sum += 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
+    n++;
+  }
+  return sum / n;
+}
+
+function smoothstep(edge0, edge1, x) {
+  if (edge0 === edge1) return x < edge0 ? 0 : 1;
+  const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
+  return t * t * (3 - 2 * t);
+}
+
+function applyThreshold(imageData, threshold, invert, softness) {
+  const d = imageData.data;
+  const lo = threshold - softness;
+  const hi = threshold + softness;
+  for (let i = 0; i < d.length; i += 4) {
+    const lum = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
+    const t = smoothstep(lo, hi, lum);
+    const v = invert ? 255 * (1 - t) : 255 * t;
+    d[i] = v; d[i+1] = v; d[i+2] = v; d[i+3] = 255;
+  }
+}
+
+function despeckleBinary(imageData, w, h, maxArea) {
+  if (!maxArea || maxArea <= 0) return;
+  const data = imageData.data;
+  const total = w * h;
+  const visited = new Uint8Array(total);
+  const stack = new Int32Array(total);
+  const isInk = (idx) => data[idx*4] < 128;
+  for (let start = 0; start < total; start++) {
+    if (visited[start] || !isInk(start)) continue;
+    let sp = 0;
+    stack[sp++] = start; visited[start] = 1;
+    let head = 0;
+    while (head < sp) {
+      const p = stack[head++];
+      const x = p % w, y = (p - x) / w | 0;
+      if (x > 0) { const n = p-1; if (!visited[n] && isInk(n)) { visited[n]=1; stack[sp++]=n; } }
+      if (x < w-1) { const n = p+1; if (!visited[n] && isInk(n)) { visited[n]=1; stack[sp++]=n; } }
+      if (y > 0) { const n = p-w; if (!visited[n] && isInk(n)) { visited[n]=1; stack[sp++]=n; } }
+      if (y < h-1) { const n = p+w; if (!visited[n] && isInk(n)) { visited[n]=1; stack[sp++]=n; } }
+    }
+    if (sp <= maxArea) {
+      for (let k = 0; k < sp; k++) {
+        const idx = stack[k] * 4;
+        data[idx]=255; data[idx+1]=255; data[idx+2]=255;
+      }
+    }
+  }
+}
+
+function drawProcessed(canvas, img, s) {
+  const W = img.naturalWidth, H = img.naturalHeight;
+  const cropTop = clampPct(s.cropTop), cropBottom = clampPct(s.cropBottom);
+  const cropLeft = clampPct(s.cropLeft), cropRight = clampPct(s.cropRight);
+  const sx = Math.floor(W * cropLeft / 100);
+  const sy = Math.floor(H * cropTop / 100);
+  const sw = Math.max(1, Math.floor(W * (100 - cropLeft - cropRight) / 100));
+  const sh = Math.max(1, Math.floor(H * (100 - cropTop - cropBottom) / 100));
+  canvas.width = sw; canvas.height = sh;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+  if (s.removeBg) {
+    const imageData = ctx.getImageData(0, 0, sw, sh);
+    applyThreshold(imageData, s.threshold, s.invert, s.softness || 0);
+    if (s.despeckle) despeckleBinary(imageData, sw, sh, s.despeckleSize || 0);
+    ctx.putImageData(imageData, 0, 0);
+  }
+}
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src;
+  });
+}
+
+function effectiveImageSettings(item, defaults) {
+  const o = item.override;
+  if (o) {
+    return {
+      removeBg: o.removeBg, invert: o.invert,
+      threshold: o.threshold, softness: o.softness,
+      despeckle: o.despeckle, despeckleSize: o.despeckleSize,
+      cropTop: o.cropTop, cropBottom: o.cropBottom, cropLeft: o.cropLeft, cropRight: o.cropRight,
+    };
+  }
+  return {
+    removeBg: defaults.removeBg,
+    invert: item.invert,
+    threshold: defaults.threshold,
+    softness: defaults.softness,
+    despeckle: defaults.despeckle,
+    despeckleSize: defaults.despeckleSize,
+    cropTop: defaults.cropTop, cropBottom: defaults.cropBottom,
+    cropLeft: defaults.cropLeft, cropRight: defaults.cropRight,
+  };
+}
+
+async function composeScore(items, title, W, opts) {
+  opts = opts || {};
+  const defaults = opts.defaults || {};
+  const scale = W / (opts.referenceWidth || 780);
+  const PAD = Math.round(50 * scale);
+  const titleH = Math.round(90 * scale);
+  const gapAfterImage = Math.round((opts.imageGap != null ? opts.imageGap : 18) * scale);
+  const titleFontPx = Math.max(10, Math.round((opts.titleFontSize || 44) * scale));
+  const titleFont = 'bold ' + titleFontPx + 'px serif';
+  const lyricFontPx = Math.max(8, Math.round((opts.lyricFontSize || 26) * scale));
+  const lyricFont = lyricFontPx + 'px Georgia, "Noto Serif KR", serif';
+  const lyricLineH = Math.round(lyricFontPx * 1.3);
+  const defaultLyricRatio = (opts.lyricAreaHeight != null ? opts.lyricAreaHeight : 90) / (opts.referenceWidth || 780);
+
+  const processed = [];
+  for (const it of items) {
+    const img = await loadImage(it.src);
+    const off = document.createElement('canvas');
+    drawProcessed(off, img, effectiveImageSettings(it, defaults));
+    const scaledH = Math.round(off.height * W / off.width);
+    const tags = ((it.lyrics && it.lyrics.tags) || []).filter(t => (t.text || '').trim() !== '');
+    const ratio = (it.lyrics && it.lyrics.areaHeightRatio != null) ? it.lyrics.areaHeightRatio : defaultLyricRatio;
+    const laneH = tags.length > 0 ? Math.max(lyricLineH, Math.round(ratio * W)) : 0;
+    processed.push({ canvas: off, scaledH, tags, laneH });
+  }
+
+  let totalH = PAD + titleH;
+  for (const p of processed) totalH += p.scaledH + p.laneH + gapAfterImage;
+  totalH += PAD;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = W; canvas.height = Math.max(Math.round(totalH), titleH + PAD * 2);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  let y = PAD;
+  ctx.fillStyle = '#1a1a1a';
+  ctx.textAlign = 'center';
+  ctx.font = titleFont;
+  ctx.fillText(title.trim() || '제목 없음', W / 2, y + Math.round(titleH * 0.55));
+  y += titleH;
+
+  ctx.textAlign = 'left';
+  for (const p of processed) {
+    ctx.drawImage(p.canvas, 0, y, W, p.scaledH);
+    y += p.scaledH;
+    if (p.tags.length > 0) {
+      ctx.font = lyricFont;
+      ctx.fillStyle = '#1a1a1a';
+      ctx.textBaseline = 'middle';
+      for (const t of p.tags) {
+        const tx = Math.min(W - 4, Math.max(4, (t.xPct / 100) * W));
+        const half = lyricLineH / 2;
+        const cy = y + Math.min(p.laneH - half, Math.max(half, (t.yPct / 100) * p.laneH));
+        ctx.fillText(t.text, tx, cy);
+      }
+      ctx.textBaseline = 'alphabetic';
+      y += p.laneH;
+    }
+    y += gapAfterImage;
+  }
+  return canvas;
+}
+
+const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults, lyricFontSize, defaultLyricAreaHeight, onChange, onDelete, onMove }) {
+  const canvasRef = useRef(null);
+  const imgRef = useRef(null);
+  const laneRef = useRef(null);
+  const measureCtxRef = useRef(null);
+  const [advanced, setAdvanced] = useState(!!item.override);
+  const [laneWidth, setLaneWidth] = useState(700);
+  const [naturalRatio, setNaturalRatio] = useState(null);
+
+  const eff = effectiveImageSettings(item, defaults);
+
+  useEffect(() => {
+    let active = true;
+    loadImage(item.src).then(img => {
+      if (!active) return;
+      imgRef.current = img;
+      setNaturalRatio(img.naturalHeight / img.naturalWidth);
+      redraw();
+    });
+    return () => { active = false; };
+  }, [item.src]);
+
+  useEffect(() => { redraw(); }, [item, defaults]);
+
+  useEffect(() => {
+    if (laneRef.current) setLaneWidth(laneRef.current.offsetWidth || 700);
+  }, []);
+
+  function redraw() {
+    if (!imgRef.current || !canvasRef.current) return;
+    drawProcessed(canvasRef.current, imgRef.current, effectiveImageSettings(item, defaults));
+  }
+
+  function updateOverride(patch) {
+    const base = item.override || eff;
+    onChange({ ...item, override: { ...base, ...patch } });
+  }
+  function enableAdvanced() {
+    setAdvanced(true);
+    if (!item.override) onChange({ ...item, override: { ...eff } });
+  }
+  function clearOverride() {
+    setAdvanced(false);
+    onChange({ ...item, override: null });
+  }
+
+  const lyricsObj = item.lyrics || { tags: [], areaHeightRatio: null };
+  const tags = lyricsObj.tags || [];
+  const laneHeightRatio = lyricsObj.areaHeightRatio != null ? lyricsObj.areaHeightRatio : (defaultLyricAreaHeight / (laneWidth || 700));
+  const laneHeight = Math.round(laneHeightRatio * (laneWidth || 700));
+  const refStripHeight = naturalRatio ? Math.round((laneWidth || 700) * naturalRatio * 0.3) : 0;
+
+  function updateLyrics(patch) {
+    onChange({ ...item, lyrics: { ...lyricsObj, ...patch } });
+  }
+  function addTag() {
+    const id = Date.now() + '_' + Math.random().toString(36).slice(2);
+    updateLyrics({ tags: [...tags, { id, text: '가사', xPct: 8, yPct: Math.min(90, 15 + tags.length * 20) }] });
+  }
+  function updateTag(id, patch) {
+    updateLyrics({ tags: tags.map(t => t.id === id ? { ...t, ...patch } : t) });
+  }
+  function deleteTag(id) {
+    updateLyrics({ tags: tags.filter(t => t.id !== id) });
+  }
+  function startDrag(e, tagId) {
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = laneRef.current.getBoundingClientRect();
+    function onMove(ev) {
+      let xPct = ((ev.clientX - rect.left) / rect.width) * 100;
+      let yPct = ((ev.clientY - rect.top) / rect.height) * 100;
+      xPct = Math.min(100, Math.max(0, xPct));
+      yPct = Math.min(100, Math.max(0, yPct));
+      updateTag(tagId, { xPct, yPct });
+    }
+    function onUp() {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    }
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }
+  function startResize(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    const startY = e.clientY;
+    const startH = laneHeight;
+    const w = (laneRef.current && laneRef.current.offsetWidth) || laneWidth || 700;
+    function onMove(ev) {
+      const newH = Math.max(20, Math.round(startH + (ev.clientY - startY)));
+      updateLyrics({ areaHeightRatio: newH / w });
+    }
+    function onUp() {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    }
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }
+  function sizeInput(el, text) {
+    if (!el) return;
+    if (!measureCtxRef.current) measureCtxRef.current = document.createElement('canvas').getContext('2d');
+    const mctx = measureCtxRef.current;
+    mctx.font = lyricFontSize + 'px Georgia, "Noto Serif KR", serif';
+    const w = mctx.measureText(text || ' ').width;
+    el.style.width = Math.max(20, w + 12) + 'px';
+  }
+
+  return (
+    <div className="block">
+      <div className="block-head">
+        <span>TAB 이미지 {index + 1}</span>
+        <div className="block-actions">
+          <button className="icon-btn" onClick={() => onMove(-1)} disabled={index === 0}>위</button>
+          <button className="icon-btn" onClick={() => onMove(1)} disabled={index === total - 1}>아래</button>
+          <button className="icon-btn" onClick={onDelete}>삭제</button>
+        </div>
+      </div>
+
+      <canvas ref={canvasRef} className="preview" />
+
+      <div className="controls">
+        {!advanced ? (
+          <div className="adv-toggle-row">
+            <span>이 이미지: 기본 설정을 따르는 중</span>
+            <button className="icon-btn" onClick={enableAdvanced}>고급 설정 사용</button>
+          </div>
+        ) : (
+          <React.Fragment>
+            <div className="adv-toggle-row">
+              <span>이 이미지만의 고급 설정 사용 중</span>
+              <button className="icon-btn" onClick={clearOverride}>기본값 따르기로 되돌리기</button>
+            </div>
+            <label>
+              <input type="checkbox" checked={eff.removeBg} onChange={e => updateOverride({ removeBg: e.target.checked })} />
+              배경 제거 (사진 배경 → 흰색)
+            </label>
+            {eff.removeBg && (
+              <React.Fragment>
+                <label>
+                  <input type="checkbox" checked={eff.invert} onChange={e => updateOverride({ invert: e.target.checked })} />
+                  어두운 사진 배경 (밝은 글씨/선을 검정으로 변환)
+                </label>
+                <div>
+                  <div className="slider-label">배경 제거 강도 ({eff.threshold})</div>
+                  <input type="range" min="0" max="255" step="1" value={eff.threshold}
+                    onChange={e => updateOverride({ threshold: Number(e.target.value) })} />
+                </div>
+                <div>
+                  <div className="slider-label">부드러운 경계 — 안티앨리어싱 유지 ({eff.softness})</div>
+                  <input type="range" min="0" max="60" step="1" value={eff.softness}
+                    onChange={e => updateOverride({ softness: Number(e.target.value) })} />
+                </div>
+                <label>
+                  <input type="checkbox" checked={eff.despeckle} onChange={e => updateOverride({ despeckle: e.target.checked })} />
+                  잡티(고립 노이즈) 제거
+                </label>
+                {eff.despeckle && (
+                  <div>
+                    <div className="slider-label">제거할 잡티 크기 ({eff.despeckleSize}px 이하)</div>
+                    <input type="range" min="1" max="12" step="1" value={eff.despeckleSize}
+                      onChange={e => updateOverride({ despeckleSize: Number(e.target.value) })} />
+                  </div>
+                )}
+              </React.Fragment>
+            )}
+            <div className="grid2">
+              <div>
+                <div className="slider-label">위쪽 자르기 ({eff.cropTop}%)</div>
+                <input type="range" min="0" max="40" step="1" value={eff.cropTop}
+                  onChange={e => updateOverride({ cropTop: Number(e.target.value) })} />
+              </div>
+              <div>
+                <div className="slider-label">아래쪽 자르기 ({eff.cropBottom}%)</div>
+                <input type="range" min="0" max="40" step="1" value={eff.cropBottom}
+                  onChange={e => updateOverride({ cropBottom: Number(e.target.value) })} />
+              </div>
+              <div>
+                <div className="slider-label">왼쪽 자르기 ({eff.cropLeft}%)</div>
+                <input type="range" min="0" max="40" step="1" value={eff.cropLeft}
+                  onChange={e => updateOverride({ cropLeft: Number(e.target.value) })} />
+              </div>
+              <div>
+                <div className="slider-label">오른쪽 자르기 ({eff.cropRight}%)</div>
+                <input type="range" min="0" max="40" step="1" value={eff.cropRight}
+                  onChange={e => updateOverride({ cropRight: Number(e.target.value) })} />
+              </div>
+            </div>
+          </React.Fragment>
+        )}
+      </div>
+
+      <div className="lyric-section">
+        <div className="lyric-head-mini">
+          <span>가사 배치 — 손잡이(⠿)로 위치 이동, 하단 막대로 입력 영역 높이 조절 (이미지 하단 30%는 참고용 미리보기)</span>
+          <button className="icon-btn" onClick={addTag}>+ 가사 추가</button>
+        </div>
+        <div className="lane-wrap">
+          {refStripHeight > 0 && (
+            <div className="lane-ref-strip-standalone" style={{ height: refStripHeight + 'px', backgroundImage: 'url(' + item.src + ')' }} />
+          )}
+          <div className={refStripHeight > 0 ? 'lyric-lane' : 'lyric-lane no-ref'} ref={laneRef} style={{ height: laneHeight + 'px' }}>
+            {tags.length === 0 && (
+              <div className="lane-empty">"+ 가사 추가"로 가사를 추가한 뒤 원하는 위치로 끌어서 놓으세요.</div>
+            )}
+            {tags.map(t => (
+              <div className="lyric-tag" key={t.id} style={{ left: t.xPct + '%', top: t.yPct + '%', fontSize: lyricFontSize + 'px' }}>
+                <span className="tag-handle" onPointerDown={e => startDrag(e, t.id)}>⠿</span>
+                <div className="lyric-tag-row">
+                  <input
+                    ref={el => sizeInput(el, t.text)}
+                    value={t.text}
+                    onChange={e => { updateTag(t.id, { text: e.target.value }); sizeInput(e.target, e.target.value); }}
+                  />
+                  <button className="tag-del" onClick={() => deleteTag(t.id)}>×</button>
+                </div>
+              </div>
+            ))}
+            <div className="lane-resize-handle" onPointerDown={startResize} title="드래그해서 입력 영역 높이 조절" />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+});
+
+
+function GlobalSettings({ defaults, setDefaults, titleFontSize, setTitleFontSize, lyricFontSize, setLyricFontSize, onApplyAll, onApplyLyricAreaHeight, hasItems }) {
+  const [open, setOpen] = useState(true);
+  function update(patch) { setDefaults(prev => ({ ...prev, ...patch })); }
+
+  return (
+    <div className="block">
+      <div className="block-head">
+        <span>기본 설정 (개별 "고급 설정"이 없는 모든 이미지에 실시간 적용)</span>
+        <button className="icon-btn" onClick={() => setOpen(o => !o)}>{open ? '접기' : '펼치기'}</button>
+      </div>
+      {open && (
+        <div className="controls">
+          <label>
+            <input type="checkbox" checked={defaults.removeBg} onChange={e => update({ removeBg: e.target.checked })} />
+            배경 제거 기본 사용
+          </label>
+          <div>
+            <div className="slider-label">어두운 배경 처리</div>
+            <select value={defaults.invertMode} onChange={e => update({ invertMode: e.target.value })}>
+              <option value="auto">자동 감지</option>
+              <option value="on">항상 반전 (어두운 사진 배경)</option>
+              <option value="off">항상 일반 (밝은/흰 배경)</option>
+            </select>
+          </div>
+          <div>
+            <div className="slider-label">배경 제거 강도 ({defaults.threshold})</div>
+            <input type="range" min="0" max="255" step="1" value={defaults.threshold}
+              onChange={e => update({ threshold: Number(e.target.value) })} />
+          </div>
+          <div>
+            <div className="slider-label">부드러운 경계 — 안티앨리어싱 유지 ({defaults.softness})</div>
+            <input type="range" min="0" max="60" step="1" value={defaults.softness}
+              onChange={e => update({ softness: Number(e.target.value) })} />
+          </div>
+          <label>
+            <input type="checkbox" checked={defaults.despeckle} onChange={e => update({ despeckle: e.target.checked })} />
+            잡티(고립 노이즈) 제거
+          </label>
+          {defaults.despeckle && (
+            <div>
+              <div className="slider-label">제거할 잡티 크기 ({defaults.despeckleSize}px 이하)</div>
+              <input type="range" min="1" max="12" step="1" value={defaults.despeckleSize}
+                onChange={e => update({ despeckleSize: Number(e.target.value) })} />
+            </div>
+          )}
+
+          <div className="grid2">
+            <div>
+              <div className="slider-label">위쪽 자르기 ({defaults.cropTop}%)</div>
+              <input type="range" min="0" max="40" step="1" value={defaults.cropTop}
+                onChange={e => update({ cropTop: Number(e.target.value) })} />
+            </div>
+            <div>
+              <div className="slider-label">아래쪽 자르기 ({defaults.cropBottom}%)</div>
+              <input type="range" min="0" max="40" step="1" value={defaults.cropBottom}
+                onChange={e => update({ cropBottom: Number(e.target.value) })} />
+            </div>
+            <div>
+              <div className="slider-label">왼쪽 자르기 ({defaults.cropLeft}%)</div>
+              <input type="range" min="0" max="40" step="1" value={defaults.cropLeft}
+                onChange={e => update({ cropLeft: Number(e.target.value) })} />
+            </div>
+            <div>
+              <div className="slider-label">오른쪽 자르기 ({defaults.cropRight}%)</div>
+              <input type="range" min="0" max="40" step="1" value={defaults.cropRight}
+                onChange={e => update({ cropRight: Number(e.target.value) })} />
+            </div>
+          </div>
+
+          {hasItems && (
+            <button onClick={onApplyAll}>모든 이미지의 개별(고급) 설정 지우기</button>
+          )}
+
+          <hr className="hr" />
+
+          <div>
+            <div className="slider-label">제목 글자 크기 ({titleFontSize})</div>
+            <input type="range" min="24" max="80" step="1" value={titleFontSize}
+              onChange={e => setTitleFontSize(Number(e.target.value))} />
+          </div>
+
+          <div>
+            <div className="slider-label">가사 글자 크기 ({lyricFontSize}) — 아래 각 이미지의 가사 입력칸에 실시간 반영</div>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <input type="range" min="10" max="60" step="1" value={lyricFontSize}
+                style={{ flex: 1 }}
+                onChange={e => setLyricFontSize(Number(e.target.value))} />
+              <input type="number" min="8" max="120" step="1" value={lyricFontSize}
+                style={{ width: '70px', border: '1px solid var(--border-strong)', borderRadius: '8px', padding: '5px 6px', fontSize: '13px' }}
+                onChange={e => setLyricFontSize(Math.max(8, Number(e.target.value) || 0))} />
+            </div>
+          </div>
+
+          <div>
+            <div className="slider-label">가사 입력 영역 기본 높이 ({defaults.lyricAreaHeight}px, 악보 이미지 아래부터 기준)</div>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <input type="range" min="20" max="400" step="10" value={defaults.lyricAreaHeight}
+                style={{ flex: 1 }}
+                onChange={e => update({ lyricAreaHeight: Number(e.target.value) })} />
+              <input type="number" min="10" max="2000" step="10" value={defaults.lyricAreaHeight}
+                style={{ width: '70px', border: '1px solid var(--border-strong)', borderRadius: '8px', padding: '5px 6px', fontSize: '13px' }}
+                onChange={e => update({ lyricAreaHeight: Math.max(10, Number(e.target.value) || 0) })} />
+            </div>
+          </div>
+          {hasItems && (
+            <button onClick={onApplyLyricAreaHeight}>모든 가사 입력 영역의 개별 높이 지우기</button>
+          )}
+
+          <div>
+            <div className="slider-label">이미지 사이 거리 ({defaults.imageGap}px, 가사 영역과 무관하게 이미지↔이미지 간 순수 여백)</div>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <input type="range" min="0" max="200" step="2" value={defaults.imageGap}
+                style={{ flex: 1 }}
+                onChange={e => update({ imageGap: Number(e.target.value) })} />
+              <input type="number" min="0" max="2000" step="2" value={defaults.imageGap}
+                style={{ width: '70px', border: '1px solid var(--border-strong)', borderRadius: '8px', padding: '5px 6px', fontSize: '13px' }}
+                onChange={e => update({ imageGap: Math.max(0, Number(e.target.value) || 0) })} />
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FloatingPreview({ title, items, titleFontSize, referenceWidth, imageGap, lyricFontSize, lyricAreaHeight, defaults }) {
+  const [previewSrc, setPreviewSrc] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (items.length === 0) { setPreviewSrc(null); return; }
+    setBusy(true);
+    const timer = setTimeout(async () => {
+      try {
+        const canvas = await composeScore(items, title, 800, { titleFontSize, referenceWidth, imageGap, lyricFontSize, lyricAreaHeight, defaults });
+        if (cancelled) return;
+        setPreviewSrc(canvas.toDataURL('image/png'));
+      } finally {
+        if (!cancelled) setBusy(false);
+      }
+    }, 450);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [title, items, titleFontSize, referenceWidth, imageGap, lyricFontSize, lyricAreaHeight, defaults]);
+
+  if (items.length === 0) return null;
+
+  return (
+    <React.Fragment>
+      <div className={collapsed ? 'float-preview collapsed' : 'float-preview'}>
+        <div className="float-preview-head">
+          <span>미리보기{busy ? ' ...' : ''}</span>
+          <div className="block-actions">
+            {!collapsed && <button className="icon-btn" onClick={() => setExpanded(true)}>크게 보기</button>}
+            <button className="icon-btn" onClick={() => setCollapsed(c => !c)}>{collapsed ? '펼치기' : '접기'}</button>
+          </div>
+        </div>
+        {!collapsed && (
+          <div className="float-preview-body">
+            {previewSrc && <img src={previewSrc} alt="미리보기" />}
+          </div>
+        )}
+      </div>
+
+      {expanded && (
+        <div className="preview-modal-backdrop" onClick={() => setExpanded(false)}>
+          <div className="preview-modal" onClick={e => e.stopPropagation()}>
+            <div className="preview-modal-head">
+              <span>전체 미리보기{busy ? ' (갱신 중...)' : ''}</span>
+              <button className="icon-btn" onClick={() => setExpanded(false)}>닫기</button>
+            </div>
+            <div className="preview-modal-body">
+              {previewSrc && <img src={previewSrc} alt="전체 미리보기" />}
+            </div>
+          </div>
+        </div>
+      )}
+    </React.Fragment>
+  );
+}
+
+function TabScoreBuilder() {
+  const [title, setTitle] = useState('');
+  const [items, setItems] = useState([]);
+  const [defaults, setDefaults] = useState(DEFAULTS_INIT);
+  const [titleFontSize, setTitleFontSize] = useState(44);
+  const [lyricFontSize, setLyricFontSize] = useState(26);
+  const [exporting, setExporting] = useState(false);
+  const [savedList, setSavedList] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [saveMsg, setSaveMsg] = useState('');
+  const [noticeDismissed, setNoticeDismissed] = useState(true);
+  const fileInputRef = useRef(null);
+  const listRef = useRef(null);
+  function getReferenceWidth() {
+    return (listRef.current && listRef.current.getBoundingClientRect().width) || 780;
+  }
+
+  useEffect(() => {
+    try {
+      setNoticeDismissed(localStorage.getItem('tab_score_builder_notice_dismissed') === '1');
+    } catch (e) {}
+  }, []);
+  function dismissNotice() {
+    setNoticeDismissed(true);
+    try { localStorage.setItem('tab_score_builder_notice_dismissed', '1'); } catch (e) {}
+  }
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const draft = await dbGet(DRAFT_KEY);
+        if (draft) {
+          setTitle(draft.title || '');
+          setItems(draft.items || []);
+          if (draft.defaults) setDefaults({ ...DEFAULTS_INIT, ...draft.defaults });
+          if (draft.titleFontSize) setTitleFontSize(draft.titleFontSize);
+          if (draft.lyricFontSize) setLyricFontSize(draft.lyricFontSize);
+        }
+        const keys = await dbAllKeys();
+        setSavedList(keys.filter(k => k !== DRAFT_KEY));
+      } catch (e) {
+        console.warn('IndexedDB 사용 불가:', e);
+      }
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setTimeout(() => {
+      dbPut(DRAFT_KEY, { title, items, defaults, titleFontSize, lyricFontSize }).catch(() => {});
+    }, 800);
+    return () => clearTimeout(t);
+  }, [title, items, defaults, titleFontSize, lyricFontSize, loaded]);
+
+  function handleFiles(e) {
+    const files = Array.from(e.target.files || []);
+    files.forEach(file => {
+      const reader = new FileReader();
+      reader.onload = ev => {
+        const src = ev.target.result;
+        const probe = new Image();
+        probe.onload = () => {
+          const avg = sampleAvgLuminance(probe);
+          const invert = defaults.invertMode === 'auto' ? (avg < 128) : defaults.invertMode === 'on';
+          const baseId = Date.now() + '_' + Math.random().toString(36).slice(2);
+          setItems(prev => [
+            ...prev,
+            {
+              id: baseId, type: 'image', src,
+              invert,
+              override: null,
+              lyrics: { tags: [], areaHeightRatio: null },
+            },
+          ]);
+        };
+        probe.src = src;
+      };
+      reader.readAsDataURL(file);
+    });
+    e.target.value = '';
+  }
+
+  function applyDefaultsToAll() {
+    if (items.length === 0) return;
+    if (!window.confirm('모든 이미지의 개별(고급) 설정을 지우고 위쪽 기본값을 따르도록 되돌립니다. 계속할까요?')) return;
+    setItems(prev => prev.map(it => ({ ...it, override: null })));
+  }
+
+  function applyLyricAreaHeightToAll() {
+    if (items.length === 0) return;
+    if (!window.confirm('모든 가사 입력 영역의 개별 높이 설정을 지우고 위쪽 기본값을 따르도록 되돌립니다. 계속할까요?')) return;
+    setItems(prev => prev.map(it => it.lyrics ? { ...it, lyrics: { ...it.lyrics, areaHeightRatio: null } } : it));
+  }
+
+  function updateItem(id, next) {
+    setItems(prev => prev.map(it => it.id === id ? next : it));
+  }
+  function deleteItem(id) {
+    setItems(prev => prev.filter(it => it.id !== id));
+  }
+  function moveItem(id, dir) {
+    setItems(prev => {
+      const idx = prev.findIndex(it => it.id === id);
+      const next = idx + dir;
+      if (next < 0 || next >= prev.length) return prev;
+      const copy = [...prev];
+      [copy[idx], copy[next]] = [copy[next], copy[idx]];
+      return copy;
+    });
+  }
+
+  async function handleExport() {
+    if (items.length === 0) return;
+    setExporting(true);
+    try {
+      const canvas = await composeScore(items, title, 1400, {
+        titleFontSize, referenceWidth: getReferenceWidth(), imageGap: defaults.imageGap,
+        lyricFontSize, lyricAreaHeight: defaults.lyricAreaHeight, defaults,
+      });
+      canvas.toBlob(blob => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = (title.trim() || 'tab_score') + '.png';
+        a.click();
+        URL.revokeObjectURL(url);
+        setExporting(false);
+      });
+    } catch (err) {
+      console.error(err);
+      setExporting(false);
+    }
+  }
+
+  async function handleFinalSave() {
+    const name = title.trim();
+    if (!name) { alert('저장하려면 먼저 제목을 입력해주세요.'); return; }
+    try {
+      await dbPut(name, { title, items, defaults, titleFontSize, lyricFontSize });
+      const keys = await dbAllKeys();
+      setSavedList(keys.filter(k => k !== DRAFT_KEY));
+      setSaveMsg('"' + name + '" 저장됨');
+      setTimeout(() => setSaveMsg(''), 2500);
+    } catch (e) {
+      alert('저장에 실패했습니다 (브라우저 저장소를 사용할 수 없음).');
+    }
+  }
+
+  async function handleLoad(name) {
+    try {
+      const data = await dbGet(name);
+      if (data) {
+        setTitle(data.title || '');
+        setItems(data.items || []);
+        if (data.defaults) setDefaults({ ...DEFAULTS_INIT, ...data.defaults });
+        if (data.titleFontSize) setTitleFontSize(data.titleFontSize);
+        if (data.lyricFontSize) setLyricFontSize(data.lyricFontSize);
+      }
+    } catch (e) {}
+  }
+
+  async function handleDeleteSaved(name) {
+    if (!window.confirm('"' + name + '" 악보를 삭제할까요?')) return;
+    try {
+      await dbDelete(name);
+      const keys = await dbAllKeys();
+      setSavedList(keys.filter(k => k !== DRAFT_KEY));
+    } catch (e) {}
+  }
+
+  async function handleReset() {
+    if (!window.confirm('현재 작업 중인 내용을 모두 지울까요? (저장된 악보 목록은 유지됩니다)')) return;
+    setTitle('');
+    setItems([]);
+    try { await dbDelete(DRAFT_KEY); } catch (e) {}
+  }
+
+  return (
+    <div className="app">
+      <div className="titlebar">
+        <input type="text" value={title} onChange={e => setTitle(e.target.value)} placeholder="악보 제목을 입력하세요" />
+      </div>
+
+      {!noticeDismissed && (
+        <div className="notice-banner">
+          <div className="notice-text">
+            <b>안내:</b> 본 도구는 사용자가 직접 보유한 이미지를 편집·정리하기 위한 <b>개인 연습용 도구</b>입니다.
+            모든 데이터는 이 브라우저에만 저장되며 서버로 전송되거나 다른 사용자와 공유되지 않습니다.
+            업로드하는 이미지에 대한 저작권 및 이용 책임은 사용자 본인에게 있습니다.
+          </div>
+          <button className="icon-btn" onClick={dismissNotice}>확인</button>
+        </div>
+      )}
+
+      <GlobalSettings
+        defaults={defaults}
+        setDefaults={setDefaults}
+        titleFontSize={titleFontSize}
+        setTitleFontSize={setTitleFontSize}
+        lyricFontSize={lyricFontSize}
+        setLyricFontSize={setLyricFontSize}
+        onApplyAll={applyDefaultsToAll}
+        onApplyLyricAreaHeight={applyLyricAreaHeightToAll}
+        hasItems={items.length > 0}
+      />
+
+      <div className="toolbar">
+        <input ref={fileInputRef} type="file" accept="image/*" multiple onChange={handleFiles} style={{ display: 'none' }} />
+        <button onClick={() => fileInputRef.current && fileInputRef.current.click()}>TAB 이미지 추가</button>
+        <button onClick={handleExport} disabled={items.length === 0 || exporting}>
+          {exporting ? '내보내는 중...' : 'PNG로 내보내기'}
+        </button>
+        <button onClick={handleFinalSave} disabled={items.length === 0}>최종 저장</button>
+        <button onClick={handleReset} disabled={items.length === 0 && !title}>초기화</button>
+        {saveMsg && <span className="save-msg">{saveMsg}</span>}
+      </div>
+
+      {savedList.length > 0 && (
+        <div className="saved-list">
+          <span>저장된 악보:</span>
+          {savedList.map(name => (
+            <span className="saved-chip" key={name}>
+              <button className="icon-btn" onClick={() => handleLoad(name)}>{name}</button>
+              <button className="icon-btn" onClick={() => handleDeleteSaved(name)}>삭제</button>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {items.length === 0 && (
+        <div className="empty">
+          위 "기본 설정"에서 배경 제거 강도·가사 글자 크기 등을 먼저 맞춰두면, 추가하는 이미지마다 그 값이 실시간 적용됩니다.<br />
+          TAB 캡쳐 이미지를 순서대로 추가하고, 각 이미지 아래에서 가사를 원하는 위치로 끌어다 놓으세요. 작업 내용은 자동으로 임시저장됩니다.
+        </div>
+      )}
+
+      <div className="list" ref={listRef}>
+        {items.map((item, idx) => (
+          <ImageBlock key={item.id} item={item} index={idx} total={items.length}
+            defaults={defaults}
+            lyricFontSize={lyricFontSize}
+            defaultLyricAreaHeight={defaults.lyricAreaHeight}
+            onChange={next => updateItem(item.id, next)}
+            onDelete={() => deleteItem(item.id)}
+            onMove={dir => moveItem(item.id, dir)} />
+        ))}
+      </div>
+
+      <FloatingPreview title={title} items={items} titleFontSize={titleFontSize}
+        referenceWidth={getReferenceWidth()} imageGap={defaults.imageGap}
+        lyricFontSize={lyricFontSize} lyricAreaHeight={defaults.lyricAreaHeight} defaults={defaults} />
+
+      <div className="disclaimer-footer">
+        본 도구는 이미지 편집·정리 기능만 제공하는 개인 연습용 소프트웨어이며, 악보나 이미지를 수집·배포하지 않습니다.<br />
+        모든 데이터는 사용자의 브라우저에만 저장되고, 업로드·내보내기 하는 콘텐츠의 저작권 준수 책임은 사용자에게 있습니다.
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<TabScoreBuilder />);
+</script>
+</body>
+</html>
