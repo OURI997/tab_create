@@ -40,6 +40,8 @@
   button:hover{background:var(--accent-bg);}
   button:disabled{opacity:0.4;cursor:default;}
   .icon-btn{padding:6px 8px;font-size:13px;}
+  .nav-link{border:1px solid var(--border-strong);background:var(--card);color:var(--text);border-radius:8px;padding:6px 10px;font-size:13px;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;white-space:nowrap;}
+  .nav-link:hover{background:var(--accent-bg);}
   .save-msg{font-size:13px;color:var(--accent);}
   .saved-list{display:flex;gap:8px;flex-wrap:wrap;align-items:center;font-size:13px;color:var(--text2);}
   .saved-chip{display:inline-flex;border:1px solid var(--border-strong);border-radius:8px;overflow:hidden;}
@@ -1008,6 +1010,7 @@ function TabScoreBuilder() {
     <div className="app">
       <div className="titlebar">
         <input type="text" value={title} onChange={e => setTitle(e.target.value)} placeholder="악보 제목을 입력하세요" />
+        <a className="nav-link" href="chord-chart-builder.html">코드보 만들기 →</a>
       </div>
 
       {!noticeDismissed && (
