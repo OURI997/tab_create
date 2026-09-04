@@ -1,0 +1,1297 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>코드보 만들기</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  :root{
+    --bg:#faf8f3; --card:#ffffff; --border:#e5e0d5; --border-strong:#c9c2b0;
+    --text:#2b2620; --text2:#8a8272; --accent:#6f5bd0; --accent-bg:#efeaff;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Pretendard,sans-serif;}
+  .app{max-width:900px;margin:0 auto;padding:24px;display:flex;flex-direction:column;gap:20px;}
+  .titlebar input{width:100%;font-size:24px;font-weight:700;border:none;background:transparent;outline:none;padding:8px 0;border-bottom:1px solid var(--border);color:var(--text);}
+  .block{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;}
+  .block-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;font-size:13px;color:var(--text2);}
+  .icon-btn{border:1px solid var(--border-strong);background:#fff;border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;color:var(--text);}
+  .icon-btn:hover{background:#f5f2ea;}
+  button{font-family:inherit;}
+  .toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
+  .toolbar button{border:1px solid var(--border-strong);background:#fff;border-radius:10px;padding:10px 16px;font-size:14px;cursor:pointer;}
+  .toolbar button:disabled{opacity:0.4;cursor:not-allowed;}
+  .toolbar .new-score-btn{margin-left:auto;border-color:var(--accent);background:var(--accent);color:#fff;font-weight:600;}
+  .toolbar .new-score-btn:hover:not(:disabled){background:#5d4bb8;}
+  .lib-grid{display:flex;flex-wrap:wrap;gap:10px;}
+  .lib-item{border:1px solid var(--border-strong);border-radius:8px;padding:6px;background:#fff;position:relative;cursor:pointer;}
+  .lib-item.needs-review{border-color:#c0392b;box-shadow:0 0 0 2px rgba(192,57,43,0.15);}
+  .needs-review-badge{position:absolute;top:-8px;right:-8px;width:18px;height:18px;border-radius:50%;background:#c0392b;color:#fff;font-size:11px;line-height:18px;text-align:center;z-index:2;}
+  .lib-item canvas{display:block;}
+  .lib-item .lib-actions{display:flex;gap:4px;justify-content:center;margin-top:4px;}
+  .lib-item .lib-actions button{font-size:10px;padding:2px 6px;}
+  .editor-panel{border:1px dashed var(--border-strong);border-radius:10px;padding:14px;margin-top:10px;background:#fdfcf9;}
+  .editor-row{display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap;}
+  .editor-row label{font-size:12.5px;color:var(--text2);}
+  .editor-row input[type="text"], .editor-row input[type="number"]{border:1px solid var(--border-strong);border-radius:6px;padding:5px 8px;font-size:13px;}
+  .string-toggle-row{display:flex;}
+  .string-toggle{width:40px;height:24px;display:flex;align-items:center;justify-content:center;font-size:13px;color:var(--text2);cursor:pointer;border:1px solid transparent;border-radius:4px;user-select:none;}
+  .string-toggle:hover{border-color:var(--border-strong);}
+  .grid-svg{display:block;}
+  .barre-hint{display:flex;gap:6px;align-items:center;margin-top:6px;font-size:12px;flex-wrap:wrap;}
+  .barre-chip{display:flex;align-items:center;gap:4px;border:1px solid var(--border-strong);border-radius:6px;padding:2px 6px;font-size:11.5px;}
+  .barre-chip button{border:none;background:none;cursor:pointer;color:var(--text2);}
+  .line-block{border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:12px;background:#fdfcf9;position:relative;}
+  .line-block-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;}
+  .line-block-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+  .default-measure-field{display:flex;align-items:center;gap:6px;}
+  .default-measure-field label{font-size:12.5px;color:var(--text2);}
+  .default-measure-field input{width:50px;border:1px solid var(--border-strong);border-radius:6px;padding:5px 6px;font-size:13px;}
+  .default-measure-hint{font-size:10.5px;color:var(--text2);}
+  .hide-grids-toggle{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text);cursor:pointer;}
+  .free-lane{position:relative;border:1px dashed var(--border);border-radius:8px;background:#fff;overflow:visible;}
+  .lane-baseline{position:absolute;left:0;right:0;height:1px;background:var(--border-strong);z-index:1;}
+  .divider-wrap{position:absolute;z-index:2;}
+  .divider-tick{position:absolute;width:2px;left:0;top:0;bottom:0;background:var(--border-strong);cursor:ew-resize;}
+  .divider-tick:hover{background:var(--accent);}
+  .divider-repeat{position:absolute;top:0;bottom:0;width:20px;left:50%;transform:translateX(-50%);cursor:ew-resize;display:flex;align-items:stretch;}
+  .divider-repeat .rep-thick{width:3px;background:var(--text);align-self:stretch;}
+  .divider-repeat .rep-thin{width:1.5px;background:var(--text);align-self:stretch;margin:0 3px;}
+  .divider-repeat .rep-dots{display:flex;flex-direction:column;justify-content:center;gap:3px;margin:0 3px;}
+  .divider-repeat .rep-dots span{width:4px;height:4px;border-radius:50%;background:var(--text);display:block;}
+  .divider-del-btn{position:absolute;top:-16px;left:50%;transform:translateX(-50%);width:16px;height:16px;border-radius:50%;background:#fff;border:1px solid var(--border-strong);font-size:10px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;z-index:3;}
+  .divider-type-popup{position:absolute;top:100%;left:50%;transform:translateX(-50%);margin-top:6px;background:#fff;border:1px solid var(--border-strong);border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,0.15);padding:6px;z-index:6;display:flex;flex-direction:column;gap:4px;white-space:nowrap;}
+  .chord-placement{position:absolute;transform:translate(0,-50%);cursor:grab;z-index:4;border-radius:6px;}
+  .chord-placement.hidden-text{transform:none;line-height:1;}
+  .chord-placement.selected{outline:2px solid var(--accent);outline-offset:3px;background:var(--accent-bg);}
+  .chord-placement .del-btn{position:absolute;top:-8px;right:-8px;width:16px;height:16px;border-radius:50%;background:#fff;border:1px solid var(--border-strong);font-size:10px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;}
+  .chord-name-text{font-weight:700;font-family:Georgia,serif;color:#1a1a1a;white-space:nowrap;}
+  .chord-context-menu{position:absolute;top:100%;left:50%;transform:translateX(-50%);margin-top:6px;background:#fff;border:1px solid var(--border-strong);border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,0.15);padding:6px;z-index:7;white-space:nowrap;}
+  .line-lyric-input{width:100%;border:1px solid var(--border);border-radius:8px;background:transparent;font-family:Georgia,"Noto Serif KR",serif;padding:6px 8px;outline:none;margin-top:6px;resize:vertical;min-height:1.8em;}
+  .line-lyric-input:focus{border-color:var(--accent);}
+  .picker-popup{position:absolute;top:100%;left:0;margin-top:6px;background:#fff;border:1px solid var(--border-strong);border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,0.15);padding:8px;z-index:6;display:flex;flex-wrap:wrap;gap:6px;max-width:280px;}
+  .slider-label{font-size:12.5px;color:var(--text2);margin-bottom:4px;}
+  .controls{display:flex;flex-direction:column;gap:14px;}
+  .float-preview{position:fixed;right:20px;bottom:20px;width:300px;max-height:70vh;background:var(--card);border:1px solid var(--border-strong);border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,0.12);overflow:hidden;display:flex;flex-direction:column;z-index:10;}
+  .float-preview.collapsed{width:auto;}
+  .float-preview-head{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-bottom:1px solid var(--border);font-size:12px;color:var(--text2);gap:8px;}
+  .float-preview-body{overflow:auto;padding:8px;}
+  .float-preview-body img{width:100%;display:block;}
+  .save-msg{font-size:12px;color:var(--accent);}
+  .saved-list{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:13px;color:var(--text2);}
+  .backup-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;}
+  .saved-chip{display:flex;border:1px solid var(--border-strong);border-radius:8px;overflow:hidden;}
+  .saved-chip .icon-btn{border:none;border-radius:0;}
+  .empty{padding:30px;text-align:center;color:var(--text2);font-size:13.5px;line-height:1.7;background:var(--card);border:1px dashed var(--border-strong);border-radius:12px;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+// ---------- IndexedDB helpers ----------
+const DB_NAME = 'chord_chart_builder_db';
+const STORE = 'charts';
+const DRAFT_KEY = '__draft__';
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => { req.result.createObjectStore(STORE); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function dbPut(key, value) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    tx.objectStore(STORE).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function dbGet(key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readonly');
+    const req = tx.objectStore(STORE).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function dbAllKeys() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readonly');
+    const req = tx.objectStore(STORE).getAllKeys();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function dbDelete(key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    tx.objectStore(STORE).delete(key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// ---------- Chord diagram drawing (shared by thumbnails & export) ----------
+function drawChordDiagram(ctx, chord, x, y, w, h) {
+  const strings = chord.strings || Array(6).fill(null);
+  const numFrets = chord.numFrets || 4;
+  const startFret = Number(chord.startFret) || 1;
+  const padTop = h * 0.32;
+  const padBottom = h * 0.02;
+  const gridH = h - padTop - padBottom;
+  const fretGap = gridH / numFrets;
+  const dotR = fretGap * 0.30;
+  const thin = Math.max(1, w * 0.006);
+  const thick = Math.max(2.5, w * 0.022);
+  const leftMargin = Math.max(w * 0.04, dotR + thin * 2);
+  let rightMargin = Math.max(w * 0.16, dotR + thin * 2);
+  if (startFret > 1) {
+    const hasRow1Barre = (chord.barres || []).some(b => b.fret === 1);
+    const barreOverhang = hasRow1Barre ? dotR : 0;
+    const labelFontPx = Math.round(h * 0.095);
+    ctx.font = labelFontPx + 'px Georgia, serif';
+    const labelW = ctx.measureText(startFret + 'fr').width;
+    const neededRightMargin = barreOverhang + w * 0.03 + labelW + thin * 2;
+    rightMargin = Math.max(rightMargin, neededRightMargin);
+  }
+  const gridW = w - leftMargin - rightMargin;
+  const gridX = x + leftMargin;
+  const gridY = y + padTop;
+  const stringGap = gridW / 5;
+
+  ctx.save();
+  ctx.strokeStyle = '#1a1a1a';
+  ctx.fillStyle = '#1a1a1a';
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'alphabetic';
+  ctx.font = 'bold ' + Math.round(h * 0.13) + 'px Georgia, serif';
+  ctx.fillText(chord.name || '', x + w / 2, y + h * 0.10);
+
+  ctx.lineWidth = thin;
+  for (let i = 0; i < 6; i++) {
+    const sx = gridX + i * stringGap;
+    ctx.beginPath();
+    ctx.moveTo(sx, gridY);
+    ctx.lineTo(sx, gridY + gridH);
+    ctx.stroke();
+  }
+  for (let i = 0; i <= numFrets; i++) {
+    const fy = gridY + i * fretGap;
+    ctx.lineWidth = (i === 0 && startFret === 1) ? thick : thin;
+    ctx.beginPath();
+    ctx.moveTo(gridX, fy);
+    ctx.lineTo(gridX + gridW, fy);
+    ctx.stroke();
+  }
+  ctx.lineWidth = thin;
+
+  if (startFret > 1) {
+    const barreR = fretGap * 0.30;
+    let labelRightEdge = gridX + gridW;
+    (chord.barres || []).forEach(b => {
+      if (b.fret === 1) {
+        const barreRight = gridX + Math.max(b.from, b.to) * stringGap + barreR;
+        if (barreRight > labelRightEdge) labelRightEdge = barreRight;
+      }
+    });
+    ctx.textAlign = 'left';
+    ctx.font = Math.round(h * 0.095) + 'px Georgia, serif';
+    ctx.fillText(startFret + 'fr', labelRightEdge + w * 0.03, gridY + fretGap * 0.7);
+  }
+
+  const markRowY = y + h * 0.235;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = Math.round(h * 0.11) + 'px Georgia, serif';
+  strings.forEach((s, i) => {
+    const sx = gridX + i * stringGap;
+    if (s === 'x') {
+      ctx.fillText('\u00D7', sx, markRowY);
+    } else if (s === 'o') {
+      ctx.beginPath();
+      ctx.arc(sx, markRowY, w * 0.02, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  });
+  ctx.textBaseline = 'alphabetic';
+
+  (chord.barres || []).forEach(b => {
+    const rowY = gridY + (b.fret - 0.5) * fretGap;
+    const from = Math.min(b.from, b.to), to = Math.max(b.from, b.to);
+    const x0 = gridX + from * stringGap;
+    const x1 = gridX + to * stringGap;
+    const r = fretGap * 0.30;
+    ctx.beginPath();
+    ctx.moveTo(x0, rowY - r);
+    ctx.lineTo(x1, rowY - r);
+    ctx.arc(x1, rowY, r, -Math.PI / 2, Math.PI / 2);
+    ctx.lineTo(x0, rowY + r);
+    ctx.arc(x0, rowY, r, Math.PI / 2, Math.PI * 1.5);
+    ctx.closePath();
+    ctx.fill();
+  });
+
+  strings.forEach((s, i) => {
+    if (typeof s === 'number') {
+      const sx = gridX + i * stringGap;
+      const sy = gridY + (s - 0.5) * fretGap;
+      ctx.beginPath();
+      ctx.arc(sx, sy, fretGap * 0.30, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  });
+
+  ctx.restore();
+}
+
+function ChordThumb({ chord, size }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    const canvas = ref.current;
+    if (!canvas) return;
+    const w = size || 90, h = Math.round((size || 90) * 1.5);
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, w, h);
+    drawChordDiagram(ctx, chord, 0, 0, w, h);
+  }, [chord, size]);
+  return <canvas ref={ref} />;
+}
+
+function ChordNameLabel({ chord, fontSize }) {
+  return (
+    <span className="chord-name-text" style={{ fontSize: fontSize + 'px' }}>
+      {chord.name || ''}
+    </span>
+  );
+}
+
+// ---------- Chord editor (manual grid: dots, X/O, barres) ----------
+function ChordEditor({ initial, onSave, onCancel }) {
+  const [name, setName] = useState(initial ? initial.name : '');
+  const [startFret, setStartFret] = useState(initial ? initial.startFret : 1);
+  const numFrets = 4;
+  const [strings, setStrings] = useState(initial ? initial.strings.slice() : Array(6).fill('x'));
+  const [barres, setBarres] = useState(initial ? (initial.barres || []).slice() : []);
+
+  const cellW = 40, cellH = 34, topPad = 30;
+  const svgW = cellW * 5 + 20, svgH = topPad + cellH * numFrets + 10;
+
+  function toggleTop(i) {
+    setStrings(prev => {
+      const next = prev.slice();
+      const cur = next[i];
+      next[i] = cur === 'x' ? 'o' : cur === 'o' ? null : 'x';
+      return next;
+    });
+  }
+  function clickCell(i, row) {
+    setStrings(prev => {
+      const next = prev.slice();
+      next[i] = next[i] === row ? null : row;
+      return next;
+    });
+  }
+  const rowGroups = {};
+  strings.forEach((s, i) => {
+    if (typeof s === 'number') {
+      rowGroups[s] = rowGroups[s] || [];
+      rowGroups[s].push(i);
+    }
+  });
+  function makeBarre(row) {
+    const idxs = rowGroups[row];
+    if (!idxs || idxs.length < 2) return;
+    const from = Math.min.apply(null, idxs), to = Math.max.apply(null, idxs);
+    setBarres(prev => [...prev, { fret: row, from, to }]);
+    setStrings(prev => prev.map((s, i) => (i >= from && i <= to && s === row) ? null : s));
+  }
+  function removeBarre(idx) {
+    setBarres(prev => prev.filter((_, i) => i !== idx));
+  }
+
+  const previewChord = { name, startFret: Number(startFret) || 1, numFrets, strings, barres };
+
+  return (
+    <div className="editor-panel">
+      <div className="editor-row">
+        <label>코드 이름</label>
+        <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="예: C11" style={{ width: '110px' }} />
+        <label>시작 프렛</label>
+        <input type="number" min="1" max="20" value={startFret} onChange={e => setStartFret(e.target.value)} style={{ width: '60px' }} />
+      </div>
+      <div style={{ display: 'flex', gap: '24px', flexWrap: 'wrap', alignItems: 'flex-start' }}>
+        <div>
+          <div className="string-toggle-row" style={{ marginLeft: '10px' }}>
+            {strings.map((s, i) => (
+              <div key={i} className="string-toggle" style={{ width: cellW + 'px' }} onClick={() => toggleTop(i)}>
+                {s === 'x' ? '\u00D7' : s === 'o' ? 'O' : ''}
+              </div>
+            ))}
+          </div>
+          <svg className="grid-svg" width={svgW} height={svgH}>
+            {Array.from({ length: 6 }).map((_, i) => (
+              <line key={'v' + i} x1={10 + i * cellW} y1={topPad} x2={10 + i * cellW} y2={topPad + cellH * numFrets}
+                stroke="#1a1a1a" strokeWidth="1" />
+            ))}
+            {Array.from({ length: numFrets + 1 }).map((_, i) => (
+              <line key={'h' + i} x1={10} y1={topPad + i * cellH} x2={10 + cellW * 5} y2={topPad + i * cellH}
+                stroke="#1a1a1a" strokeWidth={(i === 0 && Number(startFret) === 1) ? 4 : 1} />
+            ))}
+            {Number(startFret) > 1 && (
+              <text x={20 + cellW * 5} y={topPad + cellH * 0.65} fontSize="13" fill="#1a1a1a">{startFret}fr</text>
+            )}
+            {barres.map((b, bi) => {
+              const y0 = topPad + (b.fret - 0.5) * cellH;
+              const x0 = 10 + b.from * cellW, x1 = 10 + b.to * cellW;
+              return <rect key={bi} x={x0 - 10} y={y0 - 10} width={(x1 - x0) + 20} height="20" rx="10" fill="#6f5bd0" opacity="0.85" />;
+            })}
+            {strings.map((s, i) => typeof s === 'number' ? (
+              <circle key={'dot' + i} cx={10 + i * cellW} cy={topPad + (s - 0.5) * cellH} r="10" fill="#1a1a1a" />
+            ) : null)}
+            {Array.from({ length: 6 }).map((_, i) => Array.from({ length: numFrets }).map((_, r) => (
+              <rect key={i + '_' + r} x={10 + i * cellW - cellW / 2} y={topPad + r * cellH} width={cellW} height={cellH}
+                fill="transparent" style={{ cursor: 'pointer' }}
+                onClick={() => clickCell(i, r + 1)} />
+            )))}
+          </svg>
+          {Object.keys(rowGroups).filter(r => rowGroups[r].length >= 2).map(r => (
+            <div key={r} className="barre-hint">
+              <span>{r}번째 칸에 {rowGroups[r].length}개 짚음 —</span>
+              <button className="icon-btn" onClick={() => makeBarre(Number(r))}>바레로 연결</button>
+            </div>
+          ))}
+          {barres.length > 0 && (
+            <div className="barre-hint">
+              {barres.map((b, i) => (
+                <span key={i} className="barre-chip">
+                  {b.fret}번째 칸 바레
+                  <button onClick={() => removeBarre(i)}>{'\u00D7'}</button>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+        <div>
+          <div className="slider-label">미리보기</div>
+          <ChordThumb chord={previewChord} size={110} />
+        </div>
+      </div>
+      <div className="editor-row" style={{ marginTop: '12px' }}>
+        <button className="icon-btn" onClick={() => onSave(previewChord)} disabled={!name.trim()}>저장</button>
+        <button className="icon-btn" onClick={onCancel}>취소</button>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Library panel ----------
+function LibraryPanel({ library, setLibrary }) {
+  const [editingId, setEditingId] = useState(null);
+  const [creating, setCreating] = useState(false);
+
+  function addChord(chord) {
+    setLibrary(prev => [...prev, { ...chord, id: Date.now() + '_' + Math.random().toString(36).slice(2) }]);
+    setCreating(false);
+  }
+  function updateChord(id, chord) {
+    setLibrary(prev => prev.map(c => c.id === id ? { ...chord, id } : c));
+    setEditingId(null);
+  }
+  function deleteChord(id) {
+    if (!window.confirm('이 코드를 삭제할까요? 가사에 배치된 것도 함께 사라집니다.')) return;
+    setLibrary(prev => prev.filter(c => c.id !== id));
+  }
+
+  return (
+    <div className="block">
+      <div className="block-head">
+        <span>코드 라이브러리</span>
+        <button className="icon-btn" onClick={() => { setCreating(true); setEditingId(null); }}>+ 새 코드 만들기</button>
+      </div>
+      <div className="lib-grid">
+        {library.map(c => (
+          <div key={c.id} className={c.needsReview ? 'lib-item needs-review' : 'lib-item'}>
+            {c.needsReview && <span className="needs-review-badge" title="저프렛 대체 운지를 찾지 못해 옥타브 위로 자동 이동됨">⚠</span>}
+            <ChordThumb chord={c} size={80} />
+            <div className="lib-actions">
+              <button className="icon-btn" onClick={() => { setEditingId(c.id); setCreating(false); }}>수정</button>
+              <button className="icon-btn" onClick={() => deleteChord(c.id)}>삭제</button>
+            </div>
+          </div>
+        ))}
+        {library.length === 0 && !creating && (
+          <div style={{ fontSize: '12.5px', color: 'var(--text2)' }}>아직 만든 코드가 없어요. "+ 새 코드 만들기"로 시작하세요.</div>
+        )}
+      </div>
+      {creating && <ChordEditor onSave={addChord} onCancel={() => setCreating(false)} />}
+      {editingId && (
+        <ChordEditor initial={library.find(c => c.id === editingId)} onSave={c => updateChord(editingId, c)} onCancel={() => setEditingId(null)} />
+      )}
+    </div>
+  );
+}
+
+// ---------- Free-placement layout constants ----------
+const CHORD_AREA_RATIO = 1.3;
+const COMPACT_AREA_RATIO = 0.42;
+const HIDDEN_TEXT_FONT_RATIO = 0.1209; // matches drawChordDiagram's name-label font: (chordSize*0.93) * 0.13
+const HIDDEN_TEXT_LINE_RATIO = 1.3;
+const TICK_PX = 8;
+
+function lineHasVisibleChord(chords, hideAllGrids) {
+  return (chords || []).some(c => !(hideAllGrids || c.hideGrid));
+}
+
+// ---------- Divider (measure tick or repeat mark crossing the baseline, freely draggable) ----------
+const REPEAT_TICK_PX = TICK_PX * 1.6;
+
+function DividerTick({ divider, laneRef, baselineTop, onChange, onDelete }) {
+  const [popupOpen, setPopupOpen] = useState(false);
+  const repeat = divider.repeat || null;
+  const half = repeat ? REPEAT_TICK_PX : TICK_PX;
+
+  function startDrag(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = laneRef.current.getBoundingClientRect();
+    const startClientX = e.clientX;
+    let moved = false;
+    function onMove(ev) {
+      if (Math.abs(ev.clientX - startClientX) > 2) moved = true;
+      let xPct = ((ev.clientX - rect.left) / rect.width) * 100;
+      xPct = Math.min(100, Math.max(0, xPct));
+      onChange({ ...divider, xPct });
+    }
+    function onUp() {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      if (!moved) setPopupOpen(o => !o);
+    }
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }
+
+  function setRepeat(val) {
+    onChange({ ...divider, repeat: val });
+    setPopupOpen(false);
+  }
+
+  return (
+    <div className="divider-wrap" style={{ left: divider.xPct + '%', top: (baselineTop - half) + 'px', height: (half * 2) + 'px' }}>
+      {!repeat && <div className="divider-tick" onPointerDown={startDrag} />}
+      {repeat === 'start' && (
+        <div className="divider-repeat" onPointerDown={startDrag}>
+          <span className="rep-thick" /><span className="rep-thin" />
+          <span className="rep-dots"><span /><span /></span>
+        </div>
+      )}
+      {repeat === 'end' && (
+        <div className="divider-repeat" onPointerDown={startDrag}>
+          <span className="rep-dots"><span /><span /></span>
+          <span className="rep-thin" /><span className="rep-thick" />
+        </div>
+      )}
+      <button className="divider-del-btn" onPointerDown={e => e.stopPropagation()} onClick={onDelete}>{'×'}</button>
+      {popupOpen && (
+        <div className="divider-type-popup" onPointerDown={e => e.stopPropagation()}>
+          <button className="icon-btn" onClick={() => setRepeat(null)}>일반 눈금</button>
+          <button className="icon-btn" onClick={() => setRepeat('start')}>시작 도돌이표</button>
+          <button className="icon-btn" onClick={() => setRepeat('end')}>끝 도돌이표</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- Chord placement (selectable; dragging is orchestrated by the parent LineEditor) ----------
+function ChordPlacement({ placed, chord, chordSize, areaHeight, selected, hideAllGrids, onPointerDownChord, onDelete, onToggleHideGrid }) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const hidden = hideAllGrids || placed.hideGrid;
+  const fontSize = Math.round(chordSize * HIDDEN_TEXT_FONT_RATIO);
+  const textBlockHeight = Math.round(fontSize * HIDDEN_TEXT_LINE_RATIO);
+  const topPx = hidden ? (areaHeight - textBlockHeight) : (placed.yPct / 100) * areaHeight;
+
+  function handleContextMenu(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    setMenuOpen(o => !o);
+  }
+
+  return (
+    <div className={(selected ? 'chord-placement selected' : 'chord-placement') + (hidden ? ' hidden-text' : '')}
+      style={{ left: placed.xPct + '%', top: topPx + 'px' }}
+      onPointerDown={e => onPointerDownChord(e, placed.id)} onContextMenu={handleContextMenu}>
+      {hidden ? <ChordNameLabel chord={chord} fontSize={fontSize} /> : <ChordThumb chord={chord} size={chordSize * 0.62} />}
+      <button className="del-btn" onPointerDown={e => e.stopPropagation()} onClick={onDelete}>{'×'}</button>
+      {menuOpen && (
+        <div className="chord-context-menu" onPointerDown={e => e.stopPropagation()}>
+          <button className="icon-btn" onClick={() => { onToggleHideGrid(); setMenuOpen(false); }}>
+            {placed.hideGrid ? '지판 보이기' : '지판 숨기기'}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- Line (baseline + measure ticks + free-position chords above it + lyric below it) ----------
+function LineEditor({ line, library, chordSize, lyricFontSize, hideAllGrids, onChange, onDelete, selectedIds, onSelectionChange, onCopyLine, onPasteLine, hasClipboard }) {
+  const laneRef = useRef(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const dividers = line.dividers || [];
+  const chords = line.chords || [];
+  const chordAreaHeight = Math.round(chordSize * CHORD_AREA_RATIO);
+  const compactAreaHeight = Math.round(chordSize * COMPACT_AREA_RATIO);
+  const hasVisible = lineHasVisibleChord(chords, hideAllGrids);
+  const areaHeight = hasVisible ? chordAreaHeight : compactAreaHeight;
+  const laneHeight = areaHeight + TICK_PX;
+  const allChordsHidden = chords.length > 0 && chords.every(c => c.hideGrid);
+
+  function addDivider() {
+    onChange({ ...line, dividers: [...dividers, { id: Date.now() + '_' + Math.random().toString(36).slice(2), xPct: 50 }] });
+  }
+  function updateDivider(id, patch) {
+    onChange({ ...line, dividers: dividers.map(d => d.id === id ? patch : d) });
+  }
+  function deleteDivider(id) {
+    onChange({ ...line, dividers: dividers.filter(d => d.id !== id) });
+  }
+
+  function addChord(chordId) {
+    onChange({ ...line, chords: [...chords, { id: Date.now() + '_' + Math.random().toString(36).slice(2), chordId, xPct: 6, yPct: 50 }] });
+    setPickerOpen(false);
+  }
+  function deleteChord(id) {
+    onChange({ ...line, chords: chords.filter(p => p.id !== id) });
+    onSelectionChange(selectedIds.filter(sid => sid !== id));
+  }
+  function toggleChordHideGrid(id) {
+    onChange({ ...line, chords: chords.map(c => c.id === id ? { ...c, hideGrid: !c.hideGrid } : c) });
+  }
+  function toggleLineHideGrid() {
+    const nextHidden = !allChordsHidden;
+    onChange({ ...line, chords: chords.map(c => ({ ...c, hideGrid: nextHidden })) });
+  }
+
+  function alignSelectedChords() {
+    if (selectedIds.length < 2) return;
+    const selectedChords = chords.filter(c => selectedIds.includes(c.id));
+    const avgY = selectedChords.reduce((sum, c) => sum + c.yPct, 0) / selectedChords.length;
+    onChange({ ...line, chords: chords.map(c => selectedIds.includes(c.id) ? { ...c, yPct: avgY } : c) });
+  }
+
+  function handleChordPointerDown(e, chordId) {
+    e.preventDefault();
+    e.stopPropagation();
+    const additive = e.shiftKey || e.ctrlKey || e.metaKey;
+    const wasSelected = selectedIds.includes(chordId);
+
+    let nextSelection;
+    if (additive) {
+      nextSelection = wasSelected ? selectedIds.filter(id => id !== chordId) : [...selectedIds, chordId];
+    } else if (wasSelected && selectedIds.length > 1) {
+      nextSelection = selectedIds;
+    } else {
+      nextSelection = [chordId];
+    }
+    onSelectionChange(nextSelection);
+
+    const dragIds = additive ? (nextSelection.includes(chordId) ? nextSelection : []) : nextSelection;
+    if (dragIds.length === 0) return;
+
+    const rect = laneRef.current.getBoundingClientRect();
+    const startPositions = {};
+    chords.forEach(c => { if (dragIds.includes(c.id)) startPositions[c.id] = { xPct: c.xPct, yPct: c.yPct }; });
+    const startClientX = e.clientX, startClientY = e.clientY;
+    let moved = false;
+
+    function onMove(ev) {
+      if (Math.abs(ev.clientX - startClientX) > 2 || Math.abs(ev.clientY - startClientY) > 2) moved = true;
+      const dxPct = ((ev.clientX - startClientX) / rect.width) * 100;
+      const dyPct = ((ev.clientY - startClientY) / areaHeight) * 100;
+      onChange({
+        ...line,
+        chords: chords.map(c => {
+          const sp = startPositions[c.id];
+          if (!sp) return c;
+          return {
+            ...c,
+            xPct: Math.min(96, Math.max(0, sp.xPct + dxPct)),
+            yPct: Math.min(100, Math.max(4, sp.yPct + dyPct)),
+          };
+        }),
+      });
+    }
+    function onUp() {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      if (!moved && !additive && wasSelected && selectedIds.length > 1) {
+        onSelectionChange([chordId]);
+      }
+    }
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }
+
+  return (
+    <div className="line-block">
+      <div className="line-block-head">
+        <div className="line-block-controls">
+          <button className="icon-btn" onClick={() => setPickerOpen(o => !o)}>+ 코드</button>
+        </div>
+        <div className="line-block-controls">
+          <button className="icon-btn" onClick={addDivider}>+ 구분선 추가</button>
+          <button className="icon-btn" onClick={onCopyLine}>줄 복사</button>
+          <button className="icon-btn" onClick={onPasteLine} disabled={!hasClipboard}>붙여넣기</button>
+          <button className="icon-btn" onClick={toggleLineHideGrid} disabled={chords.length === 0}>
+            {allChordsHidden ? '이 줄 지판 보이기' : '이 줄 지판 숨기기'}
+          </button>
+          <button className="icon-btn" onClick={alignSelectedChords} disabled={selectedIds.length < 2}>선택 코드 정렬</button>
+          <button className="icon-btn" onClick={onDelete}>줄 삭제</button>
+        </div>
+      </div>
+
+      <div className="free-lane" ref={laneRef} style={{ height: laneHeight + 'px' }}
+        onPointerDown={e => { if (e.target === laneRef.current) onSelectionChange([]); }}>
+        <div className="lane-baseline" style={{ top: areaHeight + 'px' }} />
+        {dividers.map(d => (
+          <DividerTick key={d.id} divider={d} laneRef={laneRef} baselineTop={areaHeight}
+            onChange={patch => updateDivider(d.id, patch)} onDelete={() => deleteDivider(d.id)} />
+        ))}
+        {chords.map(p => {
+          const chord = library.find(c => c.id === p.chordId);
+          if (!chord) return null;
+          return (
+            <ChordPlacement key={p.id} placed={p} chord={chord} chordSize={chordSize} areaHeight={areaHeight}
+              selected={selectedIds.includes(p.id)} hideAllGrids={hideAllGrids} onPointerDownChord={handleChordPointerDown}
+              onDelete={() => deleteChord(p.id)} onToggleHideGrid={() => toggleChordHideGrid(p.id)} />
+          );
+        })}
+        {pickerOpen && (
+          <div className="picker-popup">
+            {library.length === 0 && <span style={{ fontSize: '11.5px', color: 'var(--text2)' }}>먼저 코드 라이브러리에서 코드를 만들어주세요.</span>}
+            {library.map(c => (
+              <div key={c.id} className="lib-item" onClick={() => addChord(c.id)}>
+                <ChordThumb chord={c} size={56} />
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <textarea className="line-lyric-input" style={{ fontSize: lyricFontSize + 'px' }} value={line.lyricText || ''}
+        onChange={e => onChange({ ...line, lyricText: e.target.value })} placeholder="가사를 입력하세요" />
+    </div>
+  );
+}
+
+// ---------- Draw just the chord name (grid hidden), text only, baseline-anchored ----------
+function drawChordNameOnly(ctx, chord, x, baselineY, fontPx) {
+  ctx.save();
+  ctx.fillStyle = '#1a1a1a';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.font = 'bold ' + fontPx + 'px Georgia, serif';
+  ctx.fillText(chord.name || '', x, baselineY - Math.round(fontPx * 0.25));
+  ctx.restore();
+}
+
+// ---------- Compose export canvas ----------
+async function composeChart(title, lines, library, opts) {
+  opts = opts || {};
+  const W = opts.width || 1400;
+  const referenceWidth = opts.referenceWidth || 780;
+  const scale = W / referenceWidth;
+  const PAD = Math.round(50 * scale);
+  const titleH = Math.round(80 * scale);
+  const laneH = Math.round((opts.chordSize || 90) * scale);
+  const chordAreaH = Math.round(laneH * CHORD_AREA_RATIO);
+  const compactAreaH = Math.round(laneH * COMPACT_AREA_RATIO);
+  const hiddenFontPx = Math.max(8, Math.round(laneH * HIDDEN_TEXT_FONT_RATIO));
+  const hiddenTextBlockH = Math.round(hiddenFontPx * HIDDEN_TEXT_LINE_RATIO);
+  const tickPx = Math.max(1, Math.round(TICK_PX * scale));
+  const dw = laneH * 0.62, dh = laneH * 0.93;
+  const lyricFontPx = Math.max(10, Math.round((opts.lyricFontSize || 22) * scale));
+  const lyricLineHeight = Math.round(lyricFontPx * 1.35);
+  const lineGap = Math.round(18 * scale);
+
+  function lineAreaHeight(line) {
+    return lineHasVisibleChord(line.chords, opts.hideAllGrids) ? chordAreaH : compactAreaH;
+  }
+  function lineRowHeight(line) {
+    return lineAreaHeight(line) + tickPx;
+  }
+
+  function lyricBlockHeight(text) {
+    const numLines = (text || '').split('\n').length;
+    return numLines * lyricLineHeight + Math.round(lyricFontPx * 0.15);
+  }
+
+  let totalH = PAD + titleH;
+  lines.forEach(line => { totalH += lineRowHeight(line) + lyricBlockHeight(line.lyricText) + lineGap; });
+  totalH += PAD;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = W;
+  canvas.height = Math.max(Math.round(totalH), titleH + PAD * 2);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  let y = PAD;
+  ctx.fillStyle = '#1a1a1a';
+  ctx.textAlign = 'center';
+  ctx.font = 'bold ' + Math.round(titleH * 0.5) + 'px Georgia, serif';
+  ctx.fillText(title.trim() || '제목 없음', W / 2, y + Math.round(titleH * 0.6));
+  y += titleH;
+
+  const rowX = PAD, rowW = W - PAD * 2;
+
+  for (const line of lines) {
+    const areaH = lineAreaHeight(line);
+    const rowH = areaH + tickPx;
+    const baselineY = y + areaH;
+
+    ctx.strokeStyle = '#c9c2b0';
+    ctx.lineWidth = Math.max(1, scale);
+    ctx.beginPath();
+    ctx.moveTo(rowX, baselineY);
+    ctx.lineTo(rowX + rowW, baselineY);
+    ctx.stroke();
+
+    (line.dividers || []).forEach(d => {
+      const dx = rowX + (d.xPct / 100) * rowW;
+      if (!d.repeat) {
+        ctx.strokeStyle = '#c9c2b0';
+        ctx.lineWidth = Math.max(1, scale);
+        ctx.beginPath();
+        ctx.moveTo(dx, baselineY - tickPx);
+        ctx.lineTo(dx, baselineY + tickPx);
+        ctx.stroke();
+        return;
+      }
+      const repeatHalf = tickPx * 1.6;
+      const topY = baselineY - repeatHalf, botY = baselineY + repeatHalf;
+      const thickW = Math.max(2, 3 * scale);
+      const thinW = Math.max(1, 1.5 * scale);
+      const dotR = Math.max(1.5, 2 * scale);
+      const partGap = Math.max(2, 3 * scale);
+      ctx.strokeStyle = '#1a1a1a';
+      ctx.fillStyle = '#1a1a1a';
+      function drawLine(cx, lw) {
+        ctx.lineWidth = lw;
+        ctx.beginPath();
+        ctx.moveTo(cx, topY);
+        ctx.lineTo(cx, botY);
+        ctx.stroke();
+      }
+      function drawDots(cx) {
+        ctx.beginPath();
+        ctx.arc(cx, baselineY - dotR - partGap * 0.5, dotR, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(cx, baselineY + dotR + partGap * 0.5, dotR, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      if (d.repeat === 'start') {
+        drawLine(dx - partGap - thinW / 2, thickW);
+        drawLine(dx, thinW);
+        drawDots(dx + partGap + thinW / 2 + partGap);
+      } else {
+        drawDots(dx - partGap - thinW / 2 - partGap);
+        drawLine(dx, thinW);
+        drawLine(dx + partGap + thinW / 2, thickW);
+      }
+    });
+
+    (line.chords || []).forEach(p => {
+      const chord = library.find(c => c.id === p.chordId);
+      if (!chord) return;
+      const cx = rowX + (p.xPct / 100) * rowW;
+      if (opts.hideAllGrids || p.hideGrid) {
+        drawChordNameOnly(ctx, chord, cx, baselineY, hiddenFontPx);
+      } else {
+        const cy = y + (p.yPct / 100) * areaH - dh / 2;
+        drawChordDiagram(ctx, chord, cx, cy, dw, dh);
+      }
+    });
+
+    y += rowH;
+
+    ctx.textAlign = 'left';
+    ctx.font = lyricFontPx + 'px Georgia, "Noto Serif KR", serif';
+    ctx.fillStyle = '#1a1a1a';
+    const lyricLines = (line.lyricText || '').split('\n');
+    lyricLines.forEach((text, i) => {
+      ctx.fillText(text, PAD * 0.4, y + lyricFontPx + i * lyricLineHeight);
+    });
+    y += lyricBlockHeight(line.lyricText) + lineGap;
+  }
+  return canvas;
+}
+
+// ---------- Floating preview ----------
+function FloatingPreview({ title, lines, library, laneHeight, lyricFontSize, hideAllGrids, referenceWidth }) {
+  const [previewSrc, setPreviewSrc] = useState(null);
+  const [collapsed, setCollapsed] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (lines.length === 0) { setPreviewSrc(null); return; }
+    setBusy(true);
+    const timer = setTimeout(async () => {
+      const canvas = await composeChart(title, lines, library, { width: 800, referenceWidth, chordSize: laneHeight, lyricFontSize, hideAllGrids });
+      if (cancelled) return;
+      setPreviewSrc(canvas.toDataURL('image/png'));
+      setBusy(false);
+    }, 400);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [title, lines, library, laneHeight, lyricFontSize, hideAllGrids, referenceWidth]);
+
+  if (lines.length === 0) return null;
+
+  return (
+    <div className={collapsed ? 'float-preview collapsed' : 'float-preview'}>
+      <div className="float-preview-head">
+        <span>미리보기{busy ? ' ...' : ''}</span>
+        <button className="icon-btn" onClick={() => setCollapsed(c => !c)}>{collapsed ? '펼치기' : '접기'}</button>
+      </div>
+      {!collapsed && (
+        <div className="float-preview-body">
+          {previewSrc && <img src={previewSrc} alt="미리보기" />}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- Transpose helpers ----------
+const NOTE_SHARPS = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+const FLAT_TO_SHARP = { Db: 'C#', Eb: 'D#', Gb: 'F#', Ab: 'G#', Bb: 'A#' };
+
+function transposeChordName(name, semitones) {
+  const m = /^([A-Ga-g])([#b]?)/.exec(name || '');
+  if (!m) return name;
+  const rootRaw = m[1].toUpperCase() + m[2];
+  const rest = name.slice(m[0].length);
+  const normalized = FLAT_TO_SHARP[rootRaw] || rootRaw;
+  let idx = NOTE_SHARPS.indexOf(normalized);
+  if (idx === -1) return name;
+  idx = ((idx + semitones) % 12 + 12) % 12;
+  return NOTE_SHARPS[idx] + rest;
+}
+
+function transposeChord(chord, semitones) {
+  const newName = transposeChordName(chord.name || '', semitones);
+  let newStartFret = (Number(chord.startFret) || 1) + semitones;
+  let needsReview = false;
+  if (newStartFret < 1) {
+    newStartFret += 12;
+    needsReview = true;
+  }
+  return {
+    ...chord,
+    id: Date.now() + '_' + Math.random().toString(36).slice(2),
+    name: newName,
+    startFret: newStartFret,
+    needsReview,
+  };
+}
+
+// ---------- Main app ----------
+function ChordChartBuilder() {
+  const [title, setTitle] = useState('');
+  const [lines, setLines] = useState([]);
+  const [library, setLibrary] = useState([]);
+  const [laneHeight, setLaneHeight] = useState(110);
+  const [lyricFontSize, setLyricFontSize] = useState(22);
+  const [defaultMeasureCount, setDefaultMeasureCount] = useState(4);
+  const [savedList, setSavedList] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [saveMsg, setSaveMsg] = useState('');
+  const [clipboardLine, setClipboardLine] = useState(null);
+  const backupFileInputRef = useRef(null);
+  const [selection, setSelection] = useState({ lineId: null, ids: [] });
+  const [hideAllGrids, setHideAllGrids] = useState(false);
+  const [transposeSemitones, setTransposeSemitones] = useState(0);
+  const listRef = useRef(null);
+
+  function getReferenceWidth() {
+    return (listRef.current && listRef.current.getBoundingClientRect().width) || 780;
+  }
+
+  useEffect(() => {
+    function onKeyDown(e) {
+      if (!selection.lineId || selection.ids.length === 0) return;
+      const tag = document.activeElement && document.activeElement.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      let dx = 0, dy = 0;
+      if (e.key === 'ArrowLeft') dx = -1;
+      else if (e.key === 'ArrowRight') dx = 1;
+      else if (e.key === 'ArrowUp') dy = -1;
+      else if (e.key === 'ArrowDown') dy = 1;
+      else return;
+      e.preventDefault();
+      const step = e.shiftKey ? 2.0 : 0.4;
+      setLines(prev => prev.map(l => {
+        if (l.id !== selection.lineId) return l;
+        return {
+          ...l,
+          chords: (l.chords || []).map(c => selection.ids.includes(c.id)
+            ? { ...c, xPct: Math.min(96, Math.max(0, c.xPct + dx * step)), yPct: Math.min(100, Math.max(4, c.yPct + dy * step)) }
+            : c),
+        };
+      }));
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [selection]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const draft = await dbGet(DRAFT_KEY);
+        if (draft) {
+          setTitle(draft.title || '');
+          setLines(draft.lines || []);
+          setLibrary(draft.library || []);
+          if (draft.laneHeight) setLaneHeight(draft.laneHeight);
+          if (draft.lyricFontSize) setLyricFontSize(draft.lyricFontSize);
+          if (draft.defaultMeasureCount) setDefaultMeasureCount(draft.defaultMeasureCount);
+          if (draft.hideAllGrids) setHideAllGrids(draft.hideAllGrids);
+        }
+        const keys = await dbAllKeys();
+        setSavedList(keys.filter(k => k !== DRAFT_KEY));
+      } catch (e) { console.warn('IndexedDB 사용 불가:', e); }
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setTimeout(() => {
+      dbPut(DRAFT_KEY, { title, lines, library, laneHeight, lyricFontSize, defaultMeasureCount, hideAllGrids }).catch(() => {});
+    }, 800);
+    return () => clearTimeout(t);
+  }, [title, lines, library, laneHeight, lyricFontSize, defaultMeasureCount, hideAllGrids, loaded]);
+
+  function makeDividers(n) {
+    const count = parseInt(n, 10);
+    if (!count || count < 1) return [];
+    const next = [];
+    for (let i = 1; i < count; i++) {
+      next.push({ id: Date.now() + '_' + i + '_' + Math.random().toString(36).slice(2), xPct: (100 * i) / count });
+    }
+    return next;
+  }
+
+  function addLine() {
+    setLines(prev => [...prev, { id: Date.now() + '_' + Math.random().toString(36).slice(2), lyricText: '', dividers: makeDividers(defaultMeasureCount), chords: [] }]);
+  }
+  function updateLine(idx, patch) {
+    setLines(prev => prev.map((l, i) => i === idx ? patch : l));
+  }
+  function deleteLine(idx) {
+    const removedId = lines[idx] && lines[idx].id;
+    if (removedId && selection.lineId === removedId) setSelection({ lineId: null, ids: [] });
+    setLines(prev => prev.filter((_, i) => i !== idx));
+  }
+  function applyDefaultMeasureCountToAll() {
+    setLines(prev => prev.map(l => ({ ...l, dividers: makeDividers(defaultMeasureCount) })));
+  }
+
+  function copyLine(idx) {
+    const line = lines[idx];
+    if (!line) return;
+    setClipboardLine({
+      chords: (line.chords || []).map(c => ({ chordId: c.chordId, xPct: c.xPct, yPct: c.yPct })),
+      dividers: (line.dividers || []).map(d => ({ xPct: d.xPct, repeat: d.repeat || null })),
+    });
+  }
+  function pasteLine(idx) {
+    if (!clipboardLine) return;
+    const newChords = clipboardLine.chords.map(c => ({
+      id: Date.now() + '_' + Math.random().toString(36).slice(2), chordId: c.chordId, xPct: c.xPct, yPct: c.yPct,
+    }));
+    const newDividers = clipboardLine.dividers.map(d => ({
+      id: Date.now() + '_' + Math.random().toString(36).slice(2), xPct: d.xPct, repeat: d.repeat || null,
+    }));
+    setLines(prev => prev.map((l, i) => i === idx ? { ...l, chords: newChords, dividers: newDividers } : l));
+  }
+
+  async function handleTransposeSaveAs() {
+    const semitones = Number(transposeSemitones);
+    if (!semitones) { alert('먼저 조옮김할 반음 수를 선택해주세요.'); return; }
+    if (library.length === 0) { alert('코드 라이브러리가 비어있습니다.'); return; }
+
+    const idMap = {};
+    const newLibrary = library.map(chord => {
+      const t = transposeChord(chord, semitones);
+      idMap[chord.id] = t.id;
+      return t;
+    });
+    const newLines = lines.map(l => ({
+      ...l,
+      chords: (l.chords || []).map(p => ({
+        ...p,
+        id: Date.now() + '_' + Math.random().toString(36).slice(2),
+        chordId: idMap[p.chordId] || p.chordId,
+      })),
+    }));
+
+    const sign = semitones > 0 ? '+' : '';
+    const newTitle = (title.trim() || '제목 없음') + ' ' + sign + semitones;
+
+    try {
+      const existingKeys = await dbAllKeys();
+      if (existingKeys.includes(newTitle)) {
+        if (!window.confirm('"' + newTitle + '" 이름이 이미 있습니다. 덮어쓸까요?')) return;
+      }
+      await dbPut(newTitle, {
+        title: newTitle, lines: newLines, library: newLibrary,
+        laneHeight, lyricFontSize, defaultMeasureCount, hideAllGrids,
+      });
+      const keys = await dbAllKeys();
+      setSavedList(keys.filter(k => k !== DRAFT_KEY));
+      const reviewCount = newLibrary.filter(c => c.needsReview).length;
+      if (reviewCount > 0) {
+        alert(reviewCount + '개 코드가 저프렛 대체 운지를 찾지 못해 옥타브 위로 자동 이동됐습니다. 코드 라이브러리에서 빨간 표시된 코드를 확인해보세요.');
+      } else {
+        alert('"' + newTitle + '" 이름으로 저장했습니다.');
+      }
+    } catch (e) {
+      alert('조옮김 저장에 실패했습니다.');
+    }
+  }
+
+  async function handleExportBackup() {
+    try {
+      const keys = await dbAllKeys();
+      const chartNames = keys.filter(k => k !== DRAFT_KEY);
+      const charts = {};
+      for (const name of chartNames) {
+        charts[name] = await dbGet(name);
+      }
+      const backup = { version: 1, exportedAt: new Date().toISOString(), currentLibrary: library, charts };
+      const dateStr = new Date().toISOString().slice(0, 10);
+      const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'chord_charts_backup_' + dateStr + '.json';
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert('백업 내보내기에 실패했습니다.');
+    }
+  }
+
+  async function handleImportBackup(file) {
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      if (!data || typeof data !== 'object' || !data.charts || typeof data.charts !== 'object') {
+        throw new Error('invalid backup format');
+      }
+      const existingKeys = await dbAllKeys();
+      const existingNames = new Set(existingKeys.filter(k => k !== DRAFT_KEY));
+      let importedCount = 0;
+      for (const [name, chartData] of Object.entries(data.charts)) {
+        if (existingNames.has(name)) {
+          if (!window.confirm('이미 있는 "' + name + '"을(를) 덮어쓸까요?')) continue;
+        }
+        await dbPut(name, chartData);
+        importedCount++;
+      }
+      const keys = await dbAllKeys();
+      setSavedList(keys.filter(k => k !== DRAFT_KEY));
+      alert(importedCount + '개의 코드보를 가져왔습니다.');
+    } catch (e) {
+      alert('백업 파일을 읽는 데 실패했습니다. 파일 형식을 확인해주세요.');
+    }
+  }
+
+  async function handleExport() {
+    if (lines.length === 0) return;
+    const canvas = await composeChart(title, lines, library, {
+      width: 1400, referenceWidth: getReferenceWidth(), chordSize: laneHeight, lyricFontSize, hideAllGrids,
+    });
+    canvas.toBlob(blob => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = (title.trim() || 'chord_chart') + '.png';
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+  }
+
+  async function handleFinalSave() {
+    const name = title.trim();
+    if (!name) { alert('저장하려면 먼저 제목을 입력해주세요.'); return; }
+    try {
+      await dbPut(name, { title, lines, library, laneHeight, lyricFontSize, defaultMeasureCount, hideAllGrids });
+      const keys = await dbAllKeys();
+      setSavedList(keys.filter(k => k !== DRAFT_KEY));
+      setSaveMsg('"' + name + '" 저장됨');
+      setTimeout(() => setSaveMsg(''), 2500);
+    } catch (e) {
+      alert('저장에 실패했습니다 (브라우저 저장소를 사용할 수 없음).');
+    }
+  }
+
+  async function handleLoad(name) {
+    try {
+      const data = await dbGet(name);
+      if (data) {
+        setTitle(data.title || '');
+        setLines(data.lines || []);
+        setLibrary(data.library || []);
+        if (data.laneHeight) setLaneHeight(data.laneHeight);
+        if (data.lyricFontSize) setLyricFontSize(data.lyricFontSize);
+        if (data.defaultMeasureCount) setDefaultMeasureCount(data.defaultMeasureCount);
+        setHideAllGrids(!!data.hideAllGrids);
+      }
+    } catch (e) {}
+  }
+  async function handleDeleteSaved(name) {
+    if (!window.confirm('"' + name + '" 코드보를 삭제할까요?')) return;
+    try {
+      await dbDelete(name);
+      const keys = await dbAllKeys();
+      setSavedList(keys.filter(k => k !== DRAFT_KEY));
+    } catch (e) {}
+  }
+  async function handleReset() {
+    if (!window.confirm('현재 작업 중인 내용(코드 라이브러리 포함)을 모두 지울까요?')) return;
+    setTitle(''); setLines([]); setLibrary([]);
+    try { await dbDelete(DRAFT_KEY); } catch (e) {}
+  }
+  function handleResetLibrary() {
+    if (!window.confirm('저장된 코드가 모두 삭제됩니다. 계속할까요?')) return;
+    setLibrary([]);
+    setLines(prev => prev.map(l => ({ ...l, chords: [] })));
+  }
+  function handleNewScore() {
+    if (!window.confirm('현재 악보(제목, 가사, 배치)를 지우고 새 악보를 시작할까요? 코드 라이브러리는 그대로 남습니다.')) return;
+    setTitle('');
+    setLines([]);
+  }
+
+  return (
+    <div className="app">
+      <div className="titlebar">
+        <input type="text" value={title} onChange={e => setTitle(e.target.value)} placeholder="코드보 제목을 입력하세요" />
+      </div>
+
+      <LibraryPanel library={library} setLibrary={setLibrary} />
+
+      <div className="block">
+        <div className="block-head"><span>표시 설정</span></div>
+        <div className="controls">
+          <div>
+            <div className="slider-label">다이어그램 크기 ({laneHeight}px)</div>
+            <input type="range" min="60" max="240" step="5" value={laneHeight} onChange={e => setLaneHeight(Number(e.target.value))} />
+          </div>
+          <div>
+            <div className="slider-label">가사 글자 크기 ({lyricFontSize}px)</div>
+            <input type="range" min="12" max="40" step="1" value={lyricFontSize} onChange={e => setLyricFontSize(Number(e.target.value))} />
+          </div>
+          <div>
+            <div className="slider-label">기본 마디 수</div>
+            <div className="default-measure-field">
+              <input type="number" min="1" value={defaultMeasureCount}
+                onChange={e => setDefaultMeasureCount(Number(e.target.value))} />
+              <button className="icon-btn" onClick={applyDefaultMeasureCountToAll}>모든 줄에 기본 마디 수 적용</button>
+            </div>
+            <div className="default-measure-hint">새로 추가하는 줄에 기본으로 적용돼요. "적용" 버튼은 기존 줄의 구분선을 지우고 새로 배치합니다.</div>
+          </div>
+          <div>
+            <label className="hide-grids-toggle">
+              <input type="checkbox" checked={hideAllGrids} onChange={e => setHideAllGrids(e.target.checked)} />
+              기타 지판 그림 숨기기 — 코드 이름만 표시
+            </label>
+          </div>
+          <div>
+            <div className="slider-label">키 조옮김 (반음)</div>
+            <div className="default-measure-field">
+              <input type="number" min="-5" max="5" value={transposeSemitones}
+                onChange={e => setTransposeSemitones(Number(e.target.value))} />
+              <button className="icon-btn" onClick={handleTransposeSaveAs}>새 이름으로 저장</button>
+            </div>
+            <div className="default-measure-hint">현재 코드보를 반음만큼 옮긴 새 코드보를 저장합니다 (원본은 그대로 유지).</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="toolbar">
+        <button onClick={handleExport} disabled={lines.length === 0}>PNG로 내보내기</button>
+        <button onClick={handleFinalSave} disabled={lines.length === 0}>최종 저장</button>
+        <button onClick={handleReset} disabled={lines.length === 0 && !title}>초기화</button>
+        <button onClick={handleResetLibrary} disabled={library.length === 0}>코드 초기화</button>
+        {saveMsg && <span className="save-msg">{saveMsg}</span>}
+        <button className="new-score-btn" onClick={handleNewScore} disabled={lines.length === 0 && !title}>+ 새 악보 만들기</button>
+      </div>
+
+      <div className="backup-row">
+        <button className="icon-btn" onClick={handleExportBackup}>전체 백업 내보내기</button>
+        <button className="icon-btn" onClick={() => backupFileInputRef.current && backupFileInputRef.current.click()}>백업 가져오기</button>
+        <input type="file" accept="application/json" ref={backupFileInputRef} style={{ display: 'none' }}
+          onChange={e => { const f = e.target.files[0]; if (f) handleImportBackup(f); e.target.value = ''; }} />
+      </div>
+
+      {savedList.length > 0 && (
+        <div className="saved-list">
+          <span>저장된 코드보:</span>
+          {savedList.map(name => (
+            <span className="saved-chip" key={name}>
+              <button className="icon-btn" onClick={() => handleLoad(name)}>{name}</button>
+              <button className="icon-btn" onClick={() => handleDeleteSaved(name)}>삭제</button>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {lines.length === 0 && (
+        <div className="empty">
+          위에서 코드를 몇 개 만들어두고, "+ 줄 추가"로 코드보 줄을 만들어보세요.<br />
+          각 줄 위에서 코드와 구분선을 자유롭게 배치하고, 아래에 가사를 입력할 수 있어요.
+        </div>
+      )}
+
+      <div className="block" ref={listRef}>
+        {lines.map((line, idx) => (
+          <LineEditor key={line.id} line={line} library={library} chordSize={laneHeight} lyricFontSize={lyricFontSize} hideAllGrids={hideAllGrids}
+            onChange={patch => updateLine(idx, patch)} onDelete={() => deleteLine(idx)}
+            selectedIds={selection.lineId === line.id ? selection.ids : []}
+            onSelectionChange={ids => setSelection({ lineId: line.id, ids })}
+            onCopyLine={() => copyLine(idx)} onPasteLine={() => pasteLine(idx)} hasClipboard={!!clipboardLine} />
+        ))}
+        <button className="icon-btn" onClick={addLine}>+ 줄 추가</button>
+      </div>
+
+      <FloatingPreview title={title} lines={lines} library={library} laneHeight={laneHeight} lyricFontSize={lyricFontSize} hideAllGrids={hideAllGrids} referenceWidth={getReferenceWidth()} />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<ChordChartBuilder />);
+</script>
+</body>
+</html>
