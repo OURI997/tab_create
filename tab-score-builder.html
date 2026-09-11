@@ -8,6 +8,7 @@
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
 <style>
   :root{
     --bg:#faf8f3;
@@ -632,30 +633,11 @@ function detectStaffBand(imageData, w, h) {
   return best;
 }
 
-function analyzeLumRow(canvas, opts) {
-  opts = opts || {};
-  const ctx = canvas.getContext('2d');
-  const w = canvas.width;
-  const yTop = opts.yTop != null ? Math.max(0, Math.round(opts.yTop)) : 0;
-  const yBottom = opts.yBottom != null ? Math.min(canvas.height, Math.round(opts.yBottom)) : canvas.height;
-  const h = Math.max(1, yBottom - yTop);
-  const d = ctx.getImageData(0, yTop, w, h).data;
-  const lumThreshold = opts.lumThreshold != null ? opts.lumThreshold : 140;
-  const lum = new Float32Array(w * h);
-  const bin = new Float32Array(w * h);
-  for (let i = 0; i < w * h; i++) {
-    const l = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
-    lum[i] = l;
-    bin[i] = l < lumThreshold ? 1 : 0;
-  }
-  return { lum, bin, w, h };
-}
-
 // ---- uniform-border auto-crop ----
 // Letterboxing/frame borders added by a screen-capture or photo (usually solid black or white,
 // unbroken from the very edge) can otherwise get matched to each other as a "perfect overlap" by
-// findOverlapByCorrelation, since they're maximally self-similar. Detected once per image and used
-// for ALL downstream analysis (staff detection, overlap search, OCR) — but the final composited
+// downstream overlap detection, since they're maximally self-similar. Detected once per image and
+// used for ALL downstream analysis (staff detection, overlap search, OCR) — but the final composited
 // image still draws from the original, uncropped canvas; only the analysis coordinates are adjusted.
 function detectContentRect(imageData, w, h) {
   const d = imageData.data;
@@ -719,110 +701,125 @@ function cropCanvasToRect(canvas, rect) {
   return out;
 }
 
-function findOverlapByCorrelation(canvasA, canvasB, opts) {
-  opts = opts || {};
-  const minOverlapPx = opts.minOverlapPx || 20;
-  const maxOverlapPx = Math.min(opts.maxOverlapPx || 300, canvasA.width, canvasB.width);
-  const step = opts.step || 4;
-
-  // Compare only the actual TAB staff band when we know where it is — this is the part of the
-  // image that's stable across captures of the same content; album art / playback UI / chord
-  // diagrams above or below it vary capture-to-capture and would otherwise corrupt the match.
-  // Falls back to the full canvas height when staff detection failed for either image.
-  //
-  // NOTE: also tried loosening the ink-luminance threshold here to match detectStaffBand's lenient
-  // one (real recorded captures render staff lines much fainter than 140), plus excluding the known
-  // staff-line rows to stop them contributing a "free" match score at any offset (they're position-
-  // invariant). Reverted both: verified the combination let two genuinely UNRELATED synthetic staff
-  // images match at 0.87-0.93 confidence, and the row-exclusion needed to be wide enough to survive
-  // real line-position wobble that it also stripped out most of the real fret-number content sitting
-  // at the line position (unlike sheet music, TAB numbers sit ON the line, not clearly off it) —
-  // narrow enough to preserve the real match, it didn't suppress the false one. Fixing this properly
-  // needs a different comparison (e.g. column-density-profile correlation instead of raw per-pixel
-  // agreement), not a threshold tweak — left as a follow-up. This function's behavior is otherwise
-  // unchanged from before this round: strict 140 threshold, no row exclusion.
-  const rangeA = opts.staffBandA ? { yTop: opts.staffBandA.staffTop, yBottom: opts.staffBandA.staffBottom } : { yTop: 0, yBottom: canvasA.height };
-  const rangeB = opts.staffBandB ? { yTop: opts.staffBandB.staffTop, yBottom: opts.staffBandB.staffBottom } : { yTop: 0, yBottom: canvasB.height };
-
-  const binA = analyzeLumRow(canvasA, rangeA);
-  const binB = analyzeLumRow(canvasB, rangeB);
-  const h = Math.min(binA.h, binB.h);
-  const sampleRows = 40;
-  const rowStep = Math.max(1, Math.floor(h / sampleRows));
-
-  // Score by Jaccard similarity of the INK pixels only (not raw agreement) — two mostly-blank/white
-  // strips would otherwise "agree" almost everywhere by sharing background, producing a false-positive
-  // high score even for genuinely unrelated images. Requiring real ink overlap avoids that.
-  function scoreAt(overlapPx) {
-    let inkAgree = 0, inkUnion = 0, samples = 0;
-    let sumLum = 0, sumLumSq = 0, lumSamples = 0;
-    for (let y = 0; y < h; y += rowStep) {
-      for (let k = 0; k < overlapPx; k++) {
-        const ax = canvasA.width - overlapPx + k;
-        const bx = k;
-        if (ax < 0 || ax >= canvasA.width || bx >= canvasB.width) continue;
-        const av = binA.bin[y * binA.w + ax];
-        const bv = binB.bin[y * binB.w + bx];
-        samples++;
-        if (av || bv) {
-          inkUnion++;
-          if (av && bv) inkAgree++;
-        }
-        const alum = binA.lum[y * binA.w + ax], blum = binB.lum[y * binB.w + bx];
-        sumLum += alum + blum; sumLumSq += alum * alum + blum * blum; lumSamples += 2;
+// ---- ORB feature matching + RANSAC (the overlap-detection fallback when bar-number OCR fails) ----
+// Verified (both in an offline Python/OpenCV prototype and here) that per-pixel/column correlation
+// completely fails on real recorded TAB captures: at the true overlap the ink-agreement score was
+// 0.02-0.04 (noise level), while the global best-scoring offset (0.97) was a confirmed spurious
+// match. Feature matching succeeds on the same pair because it only needs LOCAL texture around each
+// keypoint (chord-diagram dots, note/number glyphs, staff/bar-line intersections) to survive — a
+// moving playhead-highlight overlay or capture-to-capture noise kills the few keypoints under it and
+// leaves the rest intact, whereas whole-row/column correlation is corrupted by any such local change.
+// It also doesn't depend on bar numbers being printed at all, unlike the OCR path this supplements.
+let _cvReadyPromise = null;
+function getCv() {
+  if (!_cvReadyPromise) {
+    // Not an onRuntimeInitialized callback hook: opencv.js (Emscripten) only invokes that hook once,
+    // at whatever moment its own init sequence happens to check for it — attaching to it here races
+    // that moment, and if we lose the race (cv exists but cv.Mat isn't set yet, and the real init has
+    // already moved past checking the hook) our callback never fires and this waits forever.
+    // Also not a manual `new Promise` wrapping a hand-rolled recursive setTimeout chain — verified
+    // that pattern here intermittently never settles even though the condition it's polling for is
+    // already true (root cause unconfirmed, possibly a Babel-transform interaction with a named
+    // function recursing inside a Promise executor); a plain async/await polling loop does not
+    // exhibit the problem and is simpler besides.
+    _cvReadyPromise = (async () => {
+      while (!(window.cv && window.cv.Mat)) {
+        await new Promise((r) => setTimeout(r, 50));
       }
+      return window.cv;
+    })();
+  }
+  return _cvReadyPromise;
+}
+
+async function findOverlapByFeatureMatching(canvasA, canvasB, opts) {
+  opts = opts || {};
+  const cv = await getCv();
+
+  const matA = cv.imread(canvasA), matB = cv.imread(canvasB);
+  const grayA = new cv.Mat(), grayB = new cv.Mat();
+  cv.cvtColor(matA, grayA, cv.COLOR_RGBA2GRAY);
+  cv.cvtColor(matB, grayB, cv.COLOR_RGBA2GRAY);
+
+  const orb = new cv.ORB(opts.nFeatures || 2000);
+  const kpA = new cv.KeyPointVector(), kpB = new cv.KeyPointVector();
+  const descA = new cv.Mat(), descB = new cv.Mat();
+  const mask = new cv.Mat();
+  orb.detectAndCompute(grayA, mask, kpA, descA);
+  orb.detectAndCompute(grayB, mask, kpB, descB);
+
+  let result = null;
+  const MIN_MATCHES_FOR_RANSAC = 8; // need enough correspondences for a robust affine estimate
+
+  if (descA.rows >= 2 && descB.rows >= 2) {
+    const bf = new cv.BFMatcher(cv.NORM_HAMMING, false);
+    const knn = new cv.DMatchVectorVector();
+    bf.knnMatch(descA, descB, knn, 2);
+
+    // Lowe's ratio test: a good match's best neighbor should be clearly better than its 2nd-best,
+    // otherwise the match is ambiguous (common on repetitive TAB structure — grid lines, digits)
+    const RATIO = 0.75;
+    const good = [];
+    for (let i = 0; i < knn.size(); i++) {
+      const m = knn.get(i);
+      if (m.size() < 2) continue;
+      const m0 = m.get(0), m1 = m.get(1);
+      if (m0.distance < RATIO * m1.distance) good.push(m0);
     }
-    // require a minimum ink DENSITY relative to the window size, not just a flat count — a flat
-    // minimum can be trivially satisfied by a wide, sparse window and let a low-signal match through
-    const MIN_INK_DENSITY = 0.03;
-    if (samples === 0 || inkUnion < 15 || (inkUnion / samples) < MIN_INK_DENSITY) return null;
-    // require real pixel variety in the compared window — a solid-color region (e.g. an uncropped
-    // border, or a plain colored UI block) can satisfy the ink-density check above (100% "dark")
-    // while carrying zero actual information; only a genuinely mixed ink/background region (real
-    // notes, text, staff lines) should be trusted as a match signal
-    const MIN_LUM_VARIANCE = 300;
-    const meanLum = sumLum / lumSamples;
-    const lumVariance = sumLumSq / lumSamples - meanLum * meanLum;
-    if (lumVariance < MIN_LUM_VARIANCE) return null;
-    return { overlapPx, score: inkAgree / inkUnion };
+
+    if (good.length >= MIN_MATCHES_FOR_RANSAC) {
+      const srcArr = new Float32Array(good.length * 2), dstArr = new Float32Array(good.length * 2);
+      for (let i = 0; i < good.length; i++) {
+        const ptA = kpA.get(good[i].queryIdx).pt, ptB = kpB.get(good[i].trainIdx).pt;
+        srcArr[i * 2] = ptA.x; srcArr[i * 2 + 1] = ptA.y;
+        dstArr[i * 2] = ptB.x; dstArr[i * 2 + 1] = ptB.y;
+      }
+      const srcMat = cv.matFromArray(good.length, 1, cv.CV_32FC2, srcArr);
+      const dstMat = cv.matFromArray(good.length, 1, cv.CV_32FC2, dstArr);
+      const inliers = new cv.Mat();
+      // estimateAffinePartial2D (similarity: uniform scale+rotation+translation) isn't exposed in
+      // this build of opencv.js — estimateAffine2D (full 6-DOF affine) is used instead; we still
+      // decompose and sanity-check the result against near-1 scale / near-0 rotation below, since a
+      // genuine same-content scroll-capture pair should never need real shear/anisotropic scaling.
+      const M = cv.estimateAffine2D(srcMat, dstMat, inliers, cv.RANSAC,
+        opts.ransacReprojThreshold || 3, 2000, 0.99, 10);
+
+      if (!M.empty()) {
+        let inlierCount = 0;
+        for (let i = 0; i < inliers.rows; i++) if (inliers.data[i]) inlierCount++;
+
+        const a = M.data64F[0], c = M.data64F[3], tx = M.data64F[2], ty = M.data64F[5];
+        const scale = Math.sqrt(a * a + c * c);
+        const rotationDeg = Math.atan2(c, a) * 180 / Math.PI;
+
+        // Verified against two real capture files: 166 inliers out of 470 candidate matches, a
+        // decisive majority — the threshold just needs to separate "a real consensus transform
+        // exists" from "no consensus / too few points to trust". Left tunable; the caller (and the
+        // manual "순서대로 이어붙이기 / 개별로 추가" fallback for whatever this rejects) needs real
+        // sample diversity (bar numbers present/absent, recorded/clean-scanned) to tune precisely.
+        const MIN_INLIERS = opts.minInliers != null ? opts.minInliers : 20;
+        const MAX_SCALE_DEVIATION = 0.1;   // reject if scale differs from 1.0 by more than this
+        const MAX_ROTATION_DEG = 3;        // reject implausibly large rotation for a scroll capture
+
+        const scaleOk = Math.abs(scale - 1) <= MAX_SCALE_DEVIATION;
+        const rotationOk = Math.abs(rotationDeg) <= MAX_ROTATION_DEG;
+
+        if (inlierCount >= MIN_INLIERS && scaleOk && rotationOk) {
+          const overlapPx = Math.round(canvasA.width + tx);
+          if (overlapPx > 0 && overlapPx < Math.min(canvasA.width, canvasB.width)) {
+            result = { overlapPx, inlierCount, totalMatches: good.length, scale, rotationDeg, tx, ty };
+          }
+        }
+      }
+      srcMat.delete(); dstMat.delete(); inliers.delete(); M.delete();
+    }
+    bf.delete(); knn.delete();
   }
 
-  const scored = [];
-  for (let overlapPx = minOverlapPx; overlapPx <= maxOverlapPx; overlapPx += step) {
-    const s = scoreAt(overlapPx);
-    if (s) scored.push(s);
-  }
-  if (scored.length === 0) return null;
-  scored.sort((a, b) => b.score - a.score);
-  let best = scored[0];
+  matA.delete(); matB.delete(); grayA.delete(); grayB.delete();
+  kpA.delete(); kpB.delete(); descA.delete(); descB.delete(); mask.delete(); orb.delete();
 
-  // A coarse step (used for wide images, to keep the search affordable) can step right over a sharp,
-  // narrow true peak — real content can have fine detail that only aligns within a couple of exact
-  // pixels. Refine locally around the coarse best at step=1 so the reported offset is pixel-exact
-  // rather than whatever coarse grid point happened to be sampled nearest to it.
-  if (step > 1) {
-    for (let overlapPx = Math.max(minOverlapPx, best.overlapPx - step); overlapPx <= Math.min(maxOverlapPx, best.overlapPx + step); overlapPx++) {
-      const s = scoreAt(overlapPx);
-      if (s && s.score > best.score) best = s;
-    }
-  }
-  // NOTE: an earlier version also rejected matches whose best score was too close to a "far"
-  // runner-up's score, to guard against ambiguous matches. That rule ended up rejecting genuinely
-  // correct matches on real TAB content: the staff/bar lines repeat across the whole width, so
-  // several unrelated offsets can legitimately score not-too-far-below the true best one just from
-  // that repetition — that's expected structure, not ambiguity. The uniform-region false-positive
-  // this was originally meant to catch (e.g. a border matching another border) is now caught earlier
-  // and more precisely by MIN_LUM_VARIANCE above, so the confidence threshold alone is sufficient.
-  //
-  // Also tried a lower threshold specifically for the staffBand path, since real recorded captures'
-  // achievable score is dragged down by a moving playhead-cursor highlight differing between frames.
-  // Reverted: verified it let genuinely unrelated staff-bearing images through too (see the NOTE
-  // above the range/threshold setup). Real staff-content pairs that can't confidently auto-match
-  // still fall through to the existing "순서대로 이어붙이기 / 개별로 추가" prompt — a safe manual
-  // fallback — rather than either silently guessing or blocking the batch.
-  const CONFIDENCE_THRESHOLD = 0.78;
-  if (best.score < CONFIDENCE_THRESHOLD) return null;
-  return best;
+  return result;
 }
 
 // ---- bar-slice regrouping ("한 줄에 몇 마디") ----
@@ -953,24 +950,18 @@ async function stitchImages(files, opts, onProgress) {
       seams.push({ i, method: 'ocr', cutLeftPx });
       continue;
     }
-    const narrowerContentWidth = Math.min(contentCanvases[i].width, contentCanvases[i + 1].width);
-    // search up to 70% of the narrower image's (content-only) width — a fixed small cap would miss
-    // genuinely large overlaps from tightly-spaced scroll captures. step is kept at 1 (exhaustive)
-    // rather than widened for large images: real TAB content (thin staff/bar lines, small digits)
-    // can have a very sharp true-alignment peak that a coarser step risks stepping right over,
-    // locking onto an unrelated offset instead — verified this actually happens while testing this
-    // fix. The search is cheap enough in absolute terms (milliseconds) that there's no real need to
-    // trade accuracy for it, especially next to the OCR pass this only runs alongside.
-    const maxOverlapPx = Math.max(20, Math.round(narrowerContentWidth * 0.7));
-    const step = 1;
-    const pxOverlap = findOverlapByCorrelation(contentCanvases[i], contentCanvases[i + 1], {
-      staffBandA: staffBands[i], staffBandB: staffBands[i + 1], maxOverlapPx, step,
-    });
-    if (pxOverlap) {
-      // pxOverlap.overlapPx is in contentCanvases[i+1]'s own coordinate space (counted from its own
-      // left edge) — convert to the original canvas B's coordinate space the same way as above
-      const cutLeftPx = contentRects[i + 1].left + pxOverlap.overlapPx;
-      seams.push({ i, method: 'pixel', cutLeftPx });
+    // Per-pixel/column correlation (the previous fallback here) was verified to fail completely on
+    // real recorded captures — 0.02-0.04 similarity at the true seam, a confirmed-spurious offset
+    // scoring highest instead. ORB feature matching + RANSAC succeeds on the same pairs because it
+    // only needs enough LOCAL keypoints (chord-diagram dots, glyphs, line intersections) to survive
+    // whatever differs between captures (a moving playhead highlight, compression noise), and works
+    // whether or not bar numbers are printed at all (unlike the OCR path above).
+    const featureOverlap = await findOverlapByFeatureMatching(contentCanvases[i], contentCanvases[i + 1], {});
+    if (featureOverlap) {
+      // featureOverlap.overlapPx is in contentCanvases[i+1]'s own coordinate space (counted from its
+      // own left edge) — convert to the original canvas B's coordinate space the same way as above
+      const cutLeftPx = contentRects[i + 1].left + featureOverlap.overlapPx;
+      seams.push({ i, method: 'feature', cutLeftPx, inlierCount: featureOverlap.inlierCount, totalMatches: featureOverlap.totalMatches });
       continue;
     }
     seams.push({ i, method: 'unresolved' });
@@ -984,7 +975,7 @@ async function stitchImages(files, opts, onProgress) {
     for (let i = 0; i < seams.length; i++) {
       const seam = seams[i];
       const nextCanvas = canvases[i + 1];
-      if (seam.method === 'ocr' || seam.method === 'pixel') {
+      if (seam.method === 'ocr' || seam.method === 'feature') {
         // seam.cutLeftPx is already converted to the ORIGINAL (uncropped) canvas B's coordinate
         // space — see the border/content-crop conversion where each seam was built above
         parts.push({ canvas: nextCanvas, cutLeftPx: seam.cutLeftPx, srcIndex: i + 1 });
