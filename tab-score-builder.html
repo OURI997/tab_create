@@ -7,6 +7,7 @@
 <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
 <style>
   :root{
     --bg:#faf8f3;
@@ -163,6 +164,27 @@
   }
   .preview-modal-body{overflow:auto;padding:12px;}
   .preview-modal-body img{width:100%;display:block;}
+
+  .canvas-overlay-wrap{position:relative;}
+  .canvas-overlay-wrap.picking canvas.preview{cursor:crosshair;}
+  .playhead-overlay,.barline-overlay{position:absolute;inset:0;pointer-events:none;}
+  .playhead-run-highlight{
+    position:absolute;top:0;bottom:0;background:rgba(230,60,60,0.28);
+    cursor:pointer;pointer-events:auto;border-left:1px dashed rgba(230,60,60,0.7);border-right:1px dashed rgba(230,60,60,0.7);
+  }
+  .playhead-run-highlight.excluded{background:rgba(120,120,120,0.12);border-color:rgba(120,120,120,0.4);}
+  .bar-marker{position:absolute;top:0;bottom:0;width:2px;background:var(--accent);cursor:ew-resize;pointer-events:auto;}
+  .bar-marker:hover{background:#c0392b;}
+  .bar-marker-del{
+    position:absolute;top:-16px;left:50%;transform:translateX(-50%);
+    width:16px;height:16px;border-radius:50%;background:#fff;border:1px solid var(--border-strong);
+    font-size:10px;line-height:1;cursor:pointer;padding:0;pointer-events:auto;
+  }
+  .color-swatch{display:inline-block;width:14px;height:14px;border-radius:50%;border:1px solid var(--border-strong);vertical-align:middle;}
+  .eyedrop-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+  .stitch-progress-row{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text2);}
+  .stitch-conflict-card{border:1px solid var(--border);border-radius:10px;padding:10px;display:flex;flex-direction:column;gap:8px;font-size:13px;}
+  .barline-section{margin-top:14px;border-top:1px solid var(--border);padding-top:12px;}
 </style>
 </head>
 <body>
@@ -181,6 +203,8 @@ const DEFAULTS_INIT = {
   softness: 18,
   despeckle: true,
   despeckleSize: 3,
+  playheadRemove: false,
+  playheadColor: null,
   cropTop: 0, cropBottom: 0, cropLeft: 0, cropRight: 0,
   imageGap: 18,
   lyricFontSize: 26,
@@ -302,6 +326,384 @@ function despeckleBinary(imageData, w, h, maxArea) {
   }
 }
 
+// ---- playhead removal (color + shape based, always previewed/reversible) ----
+const PLAYHEAD_HUE_DEFAULT = 210;        // blue/cyan estimate, degrees — only used until the user eyedropper-picks a real color
+const PLAYHEAD_HUE_TOLERANCE_DEFAULT = 35;
+const PLAYHEAD_SAT_MIN_DEFAULT = 0.35;
+
+function rgbToHsv(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  const d = max - min;
+  let h = 0;
+  if (d !== 0) {
+    if (max === r) h = ((g - b) / d) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+    if (h < 0) h += 360;
+  }
+  const s = max === 0 ? 0 : d / max;
+  return { h, s, v: max };
+}
+
+function sampleColorAtPoint(imageData, w, h, xPx, yPx) {
+  const x = Math.min(w - 1, Math.max(0, Math.round(xPx)));
+  const y = Math.min(h - 1, Math.max(0, Math.round(yPx)));
+  const i = (y * w + x) * 4;
+  const d = imageData.data;
+  const { h: hue, s: sat } = rgbToHsv(d[i], d[i + 1], d[i + 2]);
+  return { hue, sat };
+}
+
+function hueDist(a, b) {
+  const d = Math.abs(a - b) % 360;
+  return d > 180 ? 360 - d : d;
+}
+
+// columnwise scan; a column matches if the isMatchFn-passing pixel fraction exceeds minRunRatio;
+// adjacent matching columns are merged into runs (capped at maxRunWidthPx to avoid wide false positives)
+function scanVerticalRuns(imageData, w, h, isMatchFn, minRunRatio, maxRunWidthPx) {
+  const d = imageData.data;
+  const colMatch = new Uint8Array(w);
+  for (let x = 0; x < w; x++) {
+    let hits = 0;
+    for (let y = 0; y < h; y++) {
+      const i = (y * w + x) * 4;
+      if (isMatchFn(d[i], d[i + 1], d[i + 2])) hits++;
+    }
+    colMatch[x] = (hits / h) >= minRunRatio ? 1 : 0;
+  }
+  const runs = [];
+  let x = 0;
+  while (x < w) {
+    if (!colMatch[x]) { x++; continue; }
+    const startX = x;
+    while (x < w && colMatch[x]) x++;
+    const endX = x;
+    if (!maxRunWidthPx || (endX - startX) <= maxRunWidthPx) {
+      runs.push({ startX, endX, centerXPct: ((startX + endX) / 2 / w) * 100 });
+    }
+  }
+  return runs;
+}
+
+function detectPlayheadRuns(imageData, w, h, colorBand) {
+  const band = colorBand || { hue: PLAYHEAD_HUE_DEFAULT, hueTolerance: PLAYHEAD_HUE_TOLERANCE_DEFAULT, satMin: PLAYHEAD_SAT_MIN_DEFAULT };
+  const isMatch = (r, g, b) => {
+    const { h: hue, s: sat } = rgbToHsv(r, g, b);
+    return sat >= band.satMin && hueDist(hue, band.hue) <= band.hueTolerance;
+  };
+  const runs = scanVerticalRuns(imageData, w, h, isMatch, 0.6, 14);
+  return runs.map(r => ({ ...r, key: Math.round(r.centerXPct * 2) / 2 }));
+}
+
+function removePlayheadRuns(imageData, w, h, runs, excludedKeys, fillColor) {
+  const fill = fillColor || { r: 255, g: 255, b: 255 };
+  const excluded = new Set(excludedKeys || []);
+  const d = imageData.data;
+  for (const run of runs) {
+    if (excluded.has(run.key)) continue;
+    const x0 = Math.max(0, run.startX - 1), x1 = Math.min(w, run.endX + 1);
+    for (let y = 0; y < h; y++) {
+      for (let x = x0; x < x1; x++) {
+        const i = (y * w + x) * 4;
+        d[i] = fill.r; d[i + 1] = fill.g; d[i + 2] = fill.b; d[i + 3] = 255;
+      }
+    }
+  }
+}
+
+// ---- bar-line pixel detection (feature 3) — suggestion only, never auto-applied ----
+function detectBarLinesByPixels(imageData, w, h) {
+  const isMatch = (r, g, b) => (0.299 * r + 0.587 * g + 0.114 * b) < 100;
+  const runs = scanVerticalRuns(imageData, w, h, isMatch, 0.85, 6);
+  return runs.map(r => r.centerXPct);
+}
+
+// ---- bar-number OCR (feature 2) ----
+function extractTopStripCanvas(source, heightPct) {
+  // source: an <img> (naturalWidth/naturalHeight) or a <canvas> (width/height) — either works
+  const W = source.naturalWidth || source.width, H = source.naturalHeight || source.height;
+  const stripH = Math.max(1, Math.round(H * (heightPct || 0.15)));
+  const scale = 3;
+  const c = document.createElement('canvas');
+  c.width = W * scale; c.height = stripH * scale;
+  const ctx = c.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(source, 0, 0, W, stripH, 0, 0, c.width, c.height);
+  return c;
+}
+
+let _ocrWorkerPromise = null;
+async function getOcrWorker() {
+  if (!_ocrWorkerPromise) {
+    _ocrWorkerPromise = Tesseract.createWorker('eng').then(async w => {
+      await w.setParameters({ tessedit_char_whitelist: '0123456789' });
+      return w;
+    });
+  }
+  return _ocrWorkerPromise;
+}
+
+async function recognizeBarNumbers(stripCanvas, ocrWorker) {
+  try {
+    const { data } = await ocrWorker.recognize(stripCanvas);
+    const words = (data.words || []);
+    const candidates = [];
+    for (const w of words) {
+      const val = parseInt((w.text || '').trim(), 10);
+      if (!Number.isFinite(val) || val < 0 || val > 999) continue;
+      const bbox = w.bbox || {};
+      const xPct = ((((bbox.x0 || 0) + (bbox.x1 || 0)) / 2) / stripCanvas.width) * 100;
+      candidates.push({ value: val, xPct });
+    }
+    return { candidates };
+  } catch (e) {
+    return { candidates: [] };
+  }
+}
+
+function validateBarNumberSequence(candidates) {
+  const sorted = [...candidates].sort((a, b) => a.xPct - b.xPct);
+  let best = [];
+  for (let i = 0; i < sorted.length; i++) {
+    let run = [sorted[i]];
+    for (let j = i + 1; j < sorted.length; j++) {
+      const gap = sorted[j].value - run[run.length - 1].value;
+      if (gap >= 1 && gap <= 4) run.push(sorted[j]);
+      else break;
+    }
+    if (run.length > best.length) best = run;
+  }
+  if (best.length < 2) return null;
+  return { numbers: best.map(c => c.value), xPcts: best.map(c => c.xPct) };
+}
+
+// ---- horizontal overlap detection (feature 2) ----
+function computeOverlapFromBarNumbers(seqA, seqB) {
+  if (!seqA || !seqB) return null;
+  const common = seqA.numbers.filter(n => seqB.numbers.includes(n));
+  if (common.length === 0) return null;
+  const firstCommon = Math.min(...common);
+  const bIdx = seqB.numbers.indexOf(firstCommon);
+  const cutBLeftPct = seqB.xPcts[bIdx];
+  return { cutBLeftPct, seamBars: common };
+}
+
+function binarizeLumRow(canvas, opts) {
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  const d = ctx.getImageData(0, 0, w, h).data;
+  const out = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    const lum = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+    out[i] = lum < 140 ? 1 : 0;
+  }
+  return { data: out, w, h };
+}
+
+function findOverlapByCorrelation(canvasA, canvasB, opts) {
+  opts = opts || {};
+  const minOverlapPx = opts.minOverlapPx || 20;
+  const maxOverlapPx = Math.min(opts.maxOverlapPx || 300, canvasA.width, canvasB.width);
+  const step = opts.step || 4;
+  const h = Math.min(canvasA.height, canvasB.height);
+  const sampleRows = 40;
+  const rowStep = Math.max(1, Math.floor(h / sampleRows));
+
+  const binA = binarizeLumRow(canvasA, {});
+  const binB = binarizeLumRow(canvasB, {});
+
+  // Score by Jaccard similarity of the INK pixels only (not raw agreement) — two mostly-blank/white
+  // strips would otherwise "agree" almost everywhere by sharing background, producing a false-positive
+  // high score even for genuinely unrelated images. Requiring real ink overlap avoids that.
+  let best = null;
+  const MIN_INK_SAMPLES = 15; // too little ink in the compared window = not enough signal to trust
+  for (let overlapPx = minOverlapPx; overlapPx <= maxOverlapPx; overlapPx += step) {
+    let inkAgree = 0, inkUnion = 0;
+    for (let y = 0; y < h; y += rowStep) {
+      for (let k = 0; k < overlapPx; k++) {
+        const ax = canvasA.width - overlapPx + k;
+        const bx = k;
+        if (ax < 0 || ax >= canvasA.width || bx >= canvasB.width) continue;
+        const av = binA.data[y * binA.w + ax];
+        const bv = binB.data[y * binB.w + bx];
+        if (av || bv) {
+          inkUnion++;
+          if (av && bv) inkAgree++;
+        }
+      }
+    }
+    if (inkUnion < MIN_INK_SAMPLES) continue;
+    const score = inkAgree / inkUnion;
+    if (!best || score > best.score) best = { overlapPx, score };
+  }
+  const CONFIDENCE_THRESHOLD = 0.6;
+  if (!best || best.score < CONFIDENCE_THRESHOLD) return null;
+  return best;
+}
+
+// ---- bar-slice regrouping ("한 줄에 몇 마디") ----
+async function rebuildBarsPerRow(img, sortedMarkersXPct, barsPerRow) {
+  const W = img.naturalWidth, H = img.naturalHeight;
+  const boundaries = [0, ...sortedMarkersXPct, 100].filter((v, i, arr) => arr.indexOf(v) === i).sort((a, b) => a - b);
+  const slices = [];
+  for (let i = 0; i < boundaries.length - 1; i++) {
+    const sx = Math.round((boundaries[i] / 100) * W);
+    const sw = Math.max(1, Math.round(((boundaries[i + 1] - boundaries[i]) / 100) * W));
+    slices.push({ sx, sw });
+  }
+  const rows = [];
+  for (let i = 0; i < slices.length; i += barsPerRow) rows.push(slices.slice(i, i + barsPerRow));
+  const rowWidths = rows.map(row => row.reduce((s, sl) => s + sl.sw, 0));
+  const outW = Math.max(1, ...rowWidths);
+  const outH = H * rows.length;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = outW; canvas.height = outH;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, outW, outH);
+  rows.forEach((row, rowIdx) => {
+    let x = 0;
+    for (const sl of row) {
+      ctx.drawImage(img, sl.sx, 0, sl.sw, H, x, rowIdx * H, sl.sw, H);
+      x += sl.sw;
+    }
+  });
+  return canvas;
+}
+
+// ---- stitch orchestration (feature 2) ----
+function loadFileAsImage(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = ev.target.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function canvasFromImage(img) {
+  const c = document.createElement('canvas');
+  c.width = img.naturalWidth; c.height = img.naturalHeight;
+  c.getContext('2d').drawImage(img, 0, 0);
+  return c;
+}
+
+async function stitchImages(files, opts, onProgress) {
+  opts = opts || {};
+  const total = files.length;
+  const imgs = await Promise.all(files.map(f => loadFileAsImage(f)));
+  let canvases = imgs.map(img => canvasFromImage(img));
+
+  if (opts.playheadRemove) {
+    canvases = canvases.map(c => {
+      const ctx = c.getContext('2d');
+      const imageData = ctx.getImageData(0, 0, c.width, c.height);
+      const runs = detectPlayheadRuns(imageData, c.width, c.height, opts.playheadColor);
+      removePlayheadRuns(imageData, c.width, c.height, runs, [], { r: 255, g: 255, b: 255 });
+      ctx.putImageData(imageData, 0, 0);
+      return c;
+    });
+  }
+
+  const ocrResults = [];
+  if (total > 1) {
+    const worker = await getOcrWorker();
+    for (let i = 0; i < canvases.length; i++) {
+      onProgress && onProgress({ stage: 'ocr', i: i + 1, total });
+      // OCR the (possibly playhead-cleaned) canvas's top strip, not the original raw upload
+      const stripFromCanvas = extractTopStripCanvas(canvases[i], 0.15);
+      const { candidates } = await recognizeBarNumbers(stripFromCanvas, worker);
+      ocrResults[i] = validateBarNumberSequence(candidates);
+    }
+  }
+
+  const seams = [];
+  for (let i = 0; i < canvases.length - 1; i++) {
+    onProgress && onProgress({ stage: 'seam', i: i + 1, total: canvases.length - 1 });
+    const A = ocrResults[i], B = ocrResults[i + 1];
+    let overlap = computeOverlapFromBarNumbers(A, B);
+    if (overlap) { seams.push({ i, method: 'ocr', overlap }); continue; }
+    const pxOverlap = findOverlapByCorrelation(canvases[i], canvases[i + 1], {});
+    if (pxOverlap) { seams.push({ i, method: 'pixel', overlap: { overlapPx: pxOverlap.overlapPx } }); continue; }
+    seams.push({ i, method: 'unresolved' });
+  }
+
+  function resolvedResult(seamChoices) {
+    seamChoices = seamChoices || {};
+    const parts = [{ canvas: canvases[0], cutLeftPx: 0 }];
+    const seamMethods = [];
+    const warnings = [];
+    for (let i = 0; i < seams.length; i++) {
+      const seam = seams[i];
+      const nextCanvas = canvases[i + 1];
+      if (seam.method === 'ocr') {
+        const cutLeftPx = Math.round((seam.overlap.cutBLeftPct / 100) * nextCanvas.width);
+        parts.push({ canvas: nextCanvas, cutLeftPx });
+        seamMethods.push('ocr');
+      } else if (seam.method === 'pixel') {
+        parts.push({ canvas: nextCanvas, cutLeftPx: seam.overlap.overlapPx });
+        seamMethods.push('pixel');
+      } else {
+        const choice = seamChoices[i] || 'concat';
+        if (choice === 'concat') {
+          parts.push({ canvas: nextCanvas, cutLeftPx: 0 });
+          seamMethods.push('concat');
+          warnings.push('이미지 ' + (i + 1) + '↔' + (i + 2) + ': 겹침을 찾지 못해 그대로 이어붙임');
+        } else {
+          parts.push({ canvas: nextCanvas, cutLeftPx: 0 });
+          seamMethods.push('split');
+          warnings.push('이미지 ' + (i + 1) + '↔' + (i + 2) + ': 겹침을 찾지 못해 개별 이미지로 분리됨');
+        }
+      }
+    }
+    const splitAfter = new Set();
+    Object.keys(seamChoices).forEach(k => { if (seamChoices[k] === 'split') splitAfter.add(Number(k)); });
+
+    const groups = [[parts[0]]];
+    for (let i = 1; i < parts.length; i++) {
+      if (splitAfter.has(i - 1)) groups.push([parts[i]]);
+      else groups[groups.length - 1].push(parts[i]);
+    }
+
+    const finalCanvases = groups.map(group => {
+      const h = Math.max(...group.map(p => p.canvas.height));
+      let w = 0;
+      group.forEach((p, idx) => { w += (idx === 0 ? p.canvas.width : (p.canvas.width - p.cutLeftPx)); });
+      const out = document.createElement('canvas');
+      out.width = Math.max(1, w); out.height = h;
+      const ctx = out.getContext('2d');
+      ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, out.width, out.height);
+      let x = 0;
+      group.forEach((p, idx) => {
+        const cutLeftPx = idx === 0 ? 0 : p.cutLeftPx;
+        const sw = p.canvas.width - cutLeftPx;
+        ctx.drawImage(p.canvas, cutLeftPx, 0, sw, p.canvas.height, x, 0, sw, p.canvas.height);
+        x += sw;
+      });
+      return out;
+    });
+
+    return { canvases: finalCanvases, seamMethods, warnings };
+  }
+
+  const unresolvedPairs = seams.filter(s => s.method === 'unresolved').map(s => ({ indexA: s.i, indexB: s.i + 1 }));
+
+  return { resolvedResult, seams, unresolvedPairs, sourceCount: total };
+}
+
+function resolvedSrc(item) {
+  return (item.barLayout && item.barLayout.appliedSrc) || item.src;
+}
+
 function drawProcessed(canvas, img, s) {
   const W = img.naturalWidth, H = img.naturalHeight;
   const cropTop = clampPct(s.cropTop), cropBottom = clampPct(s.cropBottom);
@@ -313,12 +715,21 @@ function drawProcessed(canvas, img, s) {
   canvas.width = sw; canvas.height = sh;
   const ctx = canvas.getContext('2d');
   ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+  let playheadRuns = [];
+  if (s.playheadRemove) {
+    const imageData = ctx.getImageData(0, 0, sw, sh);
+    playheadRuns = detectPlayheadRuns(imageData, sw, sh, s.playheadColor);
+    const excluded = s.playheadExcluded || [];
+    removePlayheadRuns(imageData, sw, sh, playheadRuns, excluded, { r: 255, g: 255, b: 255 });
+    ctx.putImageData(imageData, 0, 0);
+  }
   if (s.removeBg) {
     const imageData = ctx.getImageData(0, 0, sw, sh);
     applyThreshold(imageData, s.threshold, s.invert, s.softness || 0);
     if (s.despeckle) despeckleBinary(imageData, sw, sh, s.despeckleSize || 0);
     ctx.putImageData(imageData, 0, 0);
   }
+  return { playheadRuns };
 }
 
 function loadImage(src) {
@@ -332,11 +743,13 @@ function loadImage(src) {
 
 function effectiveImageSettings(item, defaults) {
   const o = item.override;
+  const playheadExcluded = item.playheadExcluded || [];
   if (o) {
     return {
       removeBg: o.removeBg, invert: o.invert,
       threshold: o.threshold, softness: o.softness,
       despeckle: o.despeckle, despeckleSize: o.despeckleSize,
+      playheadRemove: o.playheadRemove, playheadColor: o.playheadColor, playheadExcluded,
       cropTop: o.cropTop, cropBottom: o.cropBottom, cropLeft: o.cropLeft, cropRight: o.cropRight,
     };
   }
@@ -347,6 +760,7 @@ function effectiveImageSettings(item, defaults) {
     softness: defaults.softness,
     despeckle: defaults.despeckle,
     despeckleSize: defaults.despeckleSize,
+    playheadRemove: defaults.playheadRemove, playheadColor: defaults.playheadColor, playheadExcluded,
     cropTop: defaults.cropTop, cropBottom: defaults.cropBottom,
     cropLeft: defaults.cropLeft, cropRight: defaults.cropRight,
   };
@@ -368,7 +782,7 @@ async function composeScore(items, title, W, opts) {
 
   const processed = [];
   for (const it of items) {
-    const img = await loadImage(it.src);
+    const img = await loadImage(resolvedSrc(it));
     const off = document.createElement('canvas');
     drawProcessed(off, img, effectiveImageSettings(it, defaults));
     const scaledH = Math.round(off.height * W / off.width);
@@ -425,19 +839,25 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   const [advanced, setAdvanced] = useState(!!item.override);
   const [laneWidth, setLaneWidth] = useState(700);
   const [naturalRatio, setNaturalRatio] = useState(null);
+  const [playheadRuns, setPlayheadRuns] = useState([]);
+  const [pickingColor, setPickingColor] = useState(false);
+  const [barEditOpen, setBarEditOpen] = useState(!!item.stitchMeta);
+  const [barsPerRowInput, setBarsPerRowInput] = useState((item.barLayout && item.barLayout.barsPerRow) || '');
+  const [barLayoutBusy, setBarLayoutBusy] = useState(false);
 
   const eff = effectiveImageSettings(item, defaults);
+  const resolvedItemSrc = resolvedSrc(item);
 
   useEffect(() => {
     let active = true;
-    loadImage(item.src).then(img => {
+    loadImage(resolvedItemSrc).then(img => {
       if (!active) return;
       imgRef.current = img;
       setNaturalRatio(img.naturalHeight / img.naturalWidth);
       redraw();
     });
     return () => { active = false; };
-  }, [item.src]);
+  }, [resolvedItemSrc]);
 
   useEffect(() => { redraw(); }, [item, defaults]);
 
@@ -447,7 +867,8 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
 
   function redraw() {
     if (!imgRef.current || !canvasRef.current) return;
-    drawProcessed(canvasRef.current, imgRef.current, effectiveImageSettings(item, defaults));
+    const result = drawProcessed(canvasRef.current, imgRef.current, effectiveImageSettings(item, defaults));
+    setPlayheadRuns((result && result.playheadRuns) || []);
   }
 
   function updateOverride(patch) {
@@ -461,6 +882,104 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   function clearOverride() {
     setAdvanced(false);
     onChange({ ...item, override: null });
+  }
+
+  function togglePlayheadExcluded(key) {
+    const cur = item.playheadExcluded || [];
+    const next = cur.includes(key) ? cur.filter(k => k !== key) : [...cur, key];
+    onChange({ ...item, playheadExcluded: next });
+  }
+
+  function startColorPick() {
+    setPickingColor(true);
+  }
+
+  function handleCanvasClick(e) {
+    if (!pickingColor || !canvasRef.current || !imgRef.current) return;
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const xPx = ((e.clientX - rect.left) / rect.width) * canvas.width;
+    const yPx = ((e.clientY - rect.top) / rect.height) * canvas.height;
+    // sample from a crop-only render of the ORIGINAL image (no bg-removal/threshold applied yet),
+    // since the displayed canvas may already be thresholded to black/white, which would destroy
+    // the exact color info the eyedropper needs — especially when default detection missed it
+    const img = imgRef.current;
+    const W = img.naturalWidth, H = img.naturalHeight;
+    const cropTop = clampPct(eff.cropTop), cropBottom = clampPct(eff.cropBottom);
+    const cropLeft = clampPct(eff.cropLeft), cropRight = clampPct(eff.cropRight);
+    const sx = Math.floor(W * cropLeft / 100), sy = Math.floor(H * cropTop / 100);
+    const sw = Math.max(1, Math.floor(W * (100 - cropLeft - cropRight) / 100));
+    const sh = Math.max(1, Math.floor(H * (100 - cropTop - cropBottom) / 100));
+    const rawCanvas = document.createElement('canvas');
+    rawCanvas.width = sw; rawCanvas.height = sh;
+    rawCanvas.getContext('2d').drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+    const imageData = rawCanvas.getContext('2d').getImageData(0, 0, sw, sh);
+    const sampled = sampleColorAtPoint(imageData, sw, sh, xPx, yPx);
+    const color = { hue: sampled.hue, hueTolerance: PLAYHEAD_HUE_TOLERANCE_DEFAULT, satMin: Math.max(0.15, sampled.sat - 0.15) };
+    updateOverride({ playheadColor: color });
+    setPickingColor(false);
+  }
+
+  const barLayout = item.barLayout;
+  const barMarkers = (barLayout && barLayout.markers) || [];
+
+  function setBarLayout(patch) {
+    onChange({ ...item, barLayout: { markers: [], barsPerRow: null, appliedSrc: null, ...(item.barLayout || {}), ...patch } });
+  }
+  function updateMarker(id, patch) {
+    setBarLayout({ markers: barMarkers.map(m => m.id === id ? { ...m, ...patch } : m) });
+  }
+  function addMarker() {
+    const id = Date.now() + '_' + Math.random().toString(36).slice(2);
+    setBarLayout({ markers: [...barMarkers, { id, xPct: 50, source: 'manual' }] });
+  }
+  function deleteMarker(id) {
+    setBarLayout({ markers: barMarkers.filter(m => m.id !== id) });
+  }
+  function runPixelDetection() {
+    if (!canvasRef.current) return;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const xPcts = detectBarLinesByPixels(imageData, canvas.width, canvas.height);
+    const newMarkers = xPcts.map(xPct => ({ id: Date.now() + '_' + Math.random().toString(36).slice(2), xPct, source: 'pixel' }));
+    setBarLayout({ markers: [...barMarkers, ...newMarkers] });
+  }
+  async function applyBarsPerRow() {
+    const n = Math.max(1, Number(barsPerRowInput) || 0);
+    if (!n || barMarkers.length === 0 || !imgRef.current) return;
+    setBarLayoutBusy(true);
+    try {
+      const sorted = [...barMarkers.map(m => m.xPct)].sort((a, b) => a - b);
+      const rawImg = await loadImage(item.src);
+      const out = await rebuildBarsPerRow(rawImg, sorted, n);
+      setBarLayout({ barsPerRow: n, appliedSrc: out.toDataURL('image/png') });
+    } finally {
+      setBarLayoutBusy(false);
+    }
+  }
+  function clearBarLayout() {
+    onChange({ ...item, barLayout: null });
+    setBarsPerRowInput('');
+  }
+  function startMarkerDrag(e, markerId) {
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = canvasRef.current.getBoundingClientRect();
+    let moved = false;
+    const startX = e.clientX;
+    function onMove(ev) {
+      if (Math.abs(ev.clientX - startX) > 2) moved = true;
+      let xPct = ((ev.clientX - rect.left) / rect.width) * 100;
+      xPct = Math.min(100, Math.max(0, xPct));
+      updateMarker(markerId, { xPct });
+    }
+    function onUp() {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    }
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
   }
 
   const lyricsObj = item.lyrics || { tags: [], areaHeightRatio: null };
@@ -537,7 +1056,32 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
         </div>
       </div>
 
-      <canvas ref={canvasRef} className="preview" />
+      <div className={pickingColor ? 'canvas-overlay-wrap picking' : 'canvas-overlay-wrap'}>
+        <canvas ref={canvasRef} className="preview" onClick={handleCanvasClick} />
+        {eff.playheadRemove && playheadRuns.length > 0 && (
+          <div className="playhead-overlay">
+            {playheadRuns.map(run => {
+              const excluded = (item.playheadExcluded || []).includes(run.key);
+              return (
+                <div key={run.key}
+                  className={excluded ? 'playhead-run-highlight excluded' : 'playhead-run-highlight'}
+                  style={{ left: run.centerXPct + '%', width: '10px', marginLeft: '-5px' }}
+                  title={excluded ? '클릭하면 다시 제거 대상에 포함' : '클릭하면 제거 대상에서 제외'}
+                  onClick={() => togglePlayheadExcluded(run.key)} />
+              );
+            })}
+          </div>
+        )}
+        {barEditOpen && (
+          <div className="barline-overlay">
+            {barMarkers.map(m => (
+              <div key={m.id} className="bar-marker" style={{ left: m.xPct + '%' }} onPointerDown={e => startMarkerDrag(e, m.id)}>
+                <button className="bar-marker-del" onPointerDown={e => e.stopPropagation()} onClick={() => deleteMarker(m.id)}>×</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
 
       <div className="controls">
         {!advanced ? (
@@ -583,6 +1127,28 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
                   </div>
                 )}
               </React.Fragment>
+            )}
+            <label>
+              <input type="checkbox" checked={!!eff.playheadRemove} onChange={e => updateOverride({ playheadRemove: e.target.checked })} />
+              재생 표시줄 제거 (세로로 긴 색상 커서 줄 감지 후 제거)
+            </label>
+            {eff.playheadRemove && (
+              <div className="eyedrop-row">
+                <button type="button" className="icon-btn" onClick={startColorPick}>
+                  {pickingColor ? '이미지에서 클릭하세요...' : '스포이드로 색 지정'}
+                </button>
+                <span className="color-swatch" style={{
+                  background: 'hsl(' + (eff.playheadColor ? eff.playheadColor.hue : PLAYHEAD_HUE_DEFAULT) + ', 80%, 50%)'
+                }} />
+                <span style={{ fontSize: '11.5px', color: 'var(--text2)' }}>
+                  {eff.playheadColor ? '지정된 색 사용 중' : '기본 추정 색(파란/청록 계열) 사용 중'}
+                </span>
+              </div>
+            )}
+            {eff.playheadRemove && playheadRuns.length > 0 && (
+              <div className="save-msg">
+                빨간 표시가 제거 대상입니다. 실제 마디선이라면 클릭해서 제외하세요 — 체크 해제하면 언제든 원본으로 즉시 복구됩니다.
+              </div>
             )}
             <div className="grid2">
               <div>
@@ -640,6 +1206,31 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
           </div>
         </div>
       </div>
+
+      <div className="barline-section">
+        <div className="lyric-head-mini">
+          <span>마디선 감지 및 재배열 (선택 사항 — 감지 결과는 제안일 뿐이며, 직접 조정 후 사용하세요)</span>
+          <button className="icon-btn" onClick={() => setBarEditOpen(o => !o)}>{barEditOpen ? '접기' : '펼치기'}</button>
+        </div>
+        {barEditOpen && (
+          <div className="controls">
+            <div className="stitch-progress-row">
+              <button className="icon-btn" onClick={runPixelDetection}>마디선 자동 감지</button>
+              <button className="icon-btn" onClick={addMarker}>+ 마디선 추가</button>
+              {barLayout && <button className="icon-btn" onClick={clearBarLayout}>원본으로 되돌리기</button>}
+            </div>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <div className="slider-label" style={{ margin: 0 }}>한 줄에 몇 마디</div>
+              <input type="number" min="1" step="1" value={barsPerRowInput}
+                style={{ width: '70px', border: '1px solid var(--border-strong)', borderRadius: '8px', padding: '5px 6px', fontSize: '13px' }}
+                onChange={e => setBarsPerRowInput(e.target.value)}
+                onBlur={applyBarsPerRow}
+                onKeyDown={e => { if (e.key === 'Enter') { e.target.blur(); } }} />
+              {barLayoutBusy && <span className="save-msg">재배열 중...</span>}
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 });
@@ -690,6 +1281,11 @@ function GlobalSettings({ defaults, setDefaults, titleFontSize, setTitleFontSize
                 onChange={e => update({ despeckleSize: Number(e.target.value) })} />
             </div>
           )}
+
+          <label>
+            <input type="checkbox" checked={!!defaults.playheadRemove} onChange={e => update({ playheadRemove: e.target.checked })} />
+            재생 표시줄 제거 기본 사용 (색상 지정은 각 이미지 아래 "고급 설정"에서 스포이드로)
+          </label>
 
           <div className="grid2">
             <div>
@@ -828,6 +1424,123 @@ function FloatingPreview({ title, items, titleFontSize, referenceWidth, imageGap
   );
 }
 
+function StitchUploadModal({ defaults, onComplete, onClose }) {
+  const [files, setFiles] = useState([]);
+  const [playheadRemove, setPlayheadRemove] = useState(!!defaults.playheadRemove);
+  const [phase, setPhase] = useState('pick'); // pick | processing | conflict | error
+  const [progress, setProgress] = useState({ stage: '', i: 0, total: 0 });
+  const [stitchState, setStitchState] = useState(null); // { resolvedResult, seams, unresolvedPairs }
+  const [conflictChoices, setConflictChoices] = useState({});
+  const [errorMsg, setErrorMsg] = useState('');
+  const fileRef = useRef(null);
+
+  async function start() {
+    if (files.length === 0) return;
+    setPhase('processing');
+    setErrorMsg('');
+    try {
+      const result = await stitchImages(files, { playheadRemove, playheadColor: defaults.playheadColor }, p => setProgress(p));
+      setStitchState(result);
+      if (result.unresolvedPairs.length > 0) {
+        setPhase('conflict');
+      } else {
+        finish(result, {});
+      }
+    } catch (e) {
+      console.error(e);
+      setErrorMsg('이어붙이기 중 오류가 발생했습니다: ' + (e && e.message ? e.message : e));
+      setPhase('error');
+    }
+  }
+
+  function chooseConflict(pairKey, choice) {
+    setConflictChoices(prev => ({ ...prev, [pairKey]: choice }));
+  }
+
+  function allConflictsResolved() {
+    if (!stitchState) return false;
+    return stitchState.unresolvedPairs.every(p => conflictChoices[p.indexA] != null);
+  }
+
+  function finishAfterConflicts() {
+    finish(stitchState, conflictChoices);
+  }
+
+  function finish(result, choices) {
+    const composed = result.resolvedResult(choices);
+    const newItems = composed.canvases.map((canvas, idx) => {
+      const baseId = Date.now() + '_' + Math.random().toString(36).slice(2) + '_' + idx;
+      return {
+        id: baseId, type: 'image', src: canvas.toDataURL('image/png'),
+        invert: false, override: null,
+        lyrics: { tags: [], areaHeightRatio: null },
+        playheadExcluded: [],
+        barLayout: null,
+        stitchMeta: { sourceCount: result.sourceCount, seamMethods: composed.seamMethods, warnings: composed.warnings },
+      };
+    });
+    onComplete(newItems);
+  }
+
+  return (
+    <div className="preview-modal-backdrop" onClick={onClose}>
+      <div className="preview-modal" onClick={e => e.stopPropagation()}>
+        <div className="preview-modal-head">
+          <span>여러 장 이어붙이기</span>
+          <button className="icon-btn" onClick={onClose}>닫기</button>
+        </div>
+        <div className="preview-modal-body">
+          {phase === 'pick' && (
+            <div className="controls">
+              <div className="slider-label">이어붙일 이미지를 순서대로 여러 장 선택하세요 (왼쪽→오른쪽 순서)</div>
+              <input ref={fileRef} type="file" accept="image/*" multiple
+                onChange={e => setFiles(Array.from(e.target.files || []))} />
+              <label>
+                <input type="checkbox" checked={playheadRemove} onChange={e => setPlayheadRemove(e.target.checked)} />
+                재생 표시줄 제거 적용 (이어붙이기 전 각 이미지에 먼저 적용)
+              </label>
+              <button onClick={start} disabled={files.length === 0}>이어붙이기 시작</button>
+            </div>
+          )}
+          {phase === 'processing' && (
+            <div className="stitch-progress-row">
+              <span>
+                {progress.stage === 'ocr' && `${progress.i}/${progress.total} 이미지 분석 중 (마디 번호 인식)...`}
+                {progress.stage === 'seam' && `${progress.i}/${progress.total} 겹침 위치 계산 중...`}
+                {!progress.stage && '처리 중...'}
+              </span>
+            </div>
+          )}
+          {phase === 'conflict' && stitchState && (
+            <div className="controls">
+              <div className="slider-label">겹침 위치를 자동으로 찾지 못한 이미지 쌍이 있습니다. 각각 선택해주세요.</div>
+              {stitchState.unresolvedPairs.map(p => (
+                <div className="stitch-conflict-card" key={p.indexA}>
+                  <span>{p.indexA + 1}번째, {p.indexB + 1}번째 이미지는 자동으로 겹침 위치를 못 찾았습니다. 순서대로 이어붙이기만 하시겠습니까, 아니면 개별 이미지로 각각 업로드하시겠습니까?</span>
+                  <div className="block-actions">
+                    <button className={conflictChoices[p.indexA] === 'concat' ? '' : 'icon-btn'}
+                      onClick={() => chooseConflict(p.indexA, 'concat')}>순서대로 이어붙이기</button>
+                    <button className={conflictChoices[p.indexA] === 'split' ? '' : 'icon-btn'}
+                      onClick={() => chooseConflict(p.indexA, 'split')}>개별 이미지로 추가</button>
+                  </div>
+                </div>
+              ))}
+              <button onClick={finishAfterConflicts} disabled={!allConflictsResolved()}>계속</button>
+            </div>
+          )}
+          {phase === 'error' && (
+            <div className="controls">
+              <div className="save-msg" style={{ color: '#c0392b' }}>{errorMsg}</div>
+              <div className="slider-label">자동 이어붙이기에 실패해도 각 이미지를 "TAB 이미지 추가"로 개별 업로드해서 계속 작업하실 수 있습니다.</div>
+              <button onClick={onClose}>닫기</button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function TabScoreBuilder() {
   const [title, setTitle] = useState('');
   const [items, setItems] = useState([]);
@@ -839,6 +1552,7 @@ function TabScoreBuilder() {
   const [loaded, setLoaded] = useState(false);
   const [saveMsg, setSaveMsg] = useState('');
   const [noticeDismissed, setNoticeDismissed] = useState(true);
+  const [showStitchModal, setShowStitchModal] = useState(false);
   const fileInputRef = useRef(null);
   const listRef = useRef(null);
   function getReferenceWidth() {
@@ -901,6 +1615,9 @@ function TabScoreBuilder() {
               invert,
               override: null,
               lyrics: { tags: [], areaHeightRatio: null },
+              playheadExcluded: [],
+              barLayout: null,
+              stitchMeta: null,
             },
           ]);
         };
@@ -909,6 +1626,11 @@ function TabScoreBuilder() {
       reader.readAsDataURL(file);
     });
     e.target.value = '';
+  }
+
+  function handleStitchComplete(newItems) {
+    setItems(prev => [...prev, ...newItems]);
+    setShowStitchModal(false);
   }
 
   function applyDefaultsToAll() {
@@ -1039,6 +1761,7 @@ function TabScoreBuilder() {
       <div className="toolbar">
         <input ref={fileInputRef} type="file" accept="image/*" multiple onChange={handleFiles} style={{ display: 'none' }} />
         <button onClick={() => fileInputRef.current && fileInputRef.current.click()}>TAB 이미지 추가</button>
+        <button className="icon-btn" onClick={() => setShowStitchModal(true)}>여러 장 이어붙이기</button>
         <button onClick={handleExport} disabled={items.length === 0 || exporting}>
           {exporting ? '내보내는 중...' : 'PNG로 내보내기'}
         </button>
@@ -1081,6 +1804,10 @@ function TabScoreBuilder() {
       <FloatingPreview title={title} items={items} titleFontSize={titleFontSize}
         referenceWidth={getReferenceWidth()} imageGap={defaults.imageGap}
         lyricFontSize={lyricFontSize} lyricAreaHeight={defaults.lyricAreaHeight} defaults={defaults} />
+
+      {showStitchModal && (
+        <StitchUploadModal defaults={defaults} onComplete={handleStitchComplete} onClose={() => setShowStitchModal(false)} />
+      )}
 
       <div className="disclaimer-footer">
         본 도구는 이미지 편집·정리 기능만 제공하는 개인 연습용 소프트웨어이며, 악보나 이미지를 수집·배포하지 않습니다.<br />
