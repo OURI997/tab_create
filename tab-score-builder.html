@@ -422,16 +422,29 @@ function detectBarLinesByPixels(imageData, w, h) {
 }
 
 // ---- bar-number OCR (feature 2) ----
-function extractTopStripCanvas(source, heightPct) {
+function extractTopStripCanvas(source, opts) {
   // source: an <img> (naturalWidth/naturalHeight) or a <canvas> (width/height) — either works
+  opts = opts || {};
   const W = source.naturalWidth || source.width, H = source.naturalHeight || source.height;
-  const stripH = Math.max(1, Math.round(H * (heightPct || 0.15)));
+  let stripTop, stripBottom;
+  if (opts.staffTopPx != null) {
+    // bar numbers sit just above the top staff line — use a band ending right at the detected
+    // staff top, regardless of how much varying album-art/UI chrome sits above it in this capture
+    const margin = opts.aboveMarginPx != null ? opts.aboveMarginPx : Math.round(H * 0.08);
+    stripBottom = Math.max(1, Math.round(opts.staffTopPx));
+    stripTop = Math.max(0, stripBottom - margin);
+  } else {
+    // fallback: fixed top percentage, used when staff-band detection failed
+    stripTop = 0;
+    stripBottom = Math.max(1, Math.round(H * (opts.heightPct || 0.15)));
+  }
+  const stripH = Math.max(1, stripBottom - stripTop);
   const scale = 3;
   const c = document.createElement('canvas');
   c.width = W * scale; c.height = stripH * scale;
   const ctx = c.getContext('2d');
   ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(source, 0, 0, W, stripH, 0, 0, c.width, c.height);
+  ctx.drawImage(source, 0, stripTop, W, stripH, 0, 0, c.width, c.height);
   return c;
 }
 
@@ -491,10 +504,78 @@ function computeOverlapFromBarNumbers(seqA, seqB) {
   return { cutBLeftPct, seamBars: common };
 }
 
+// ---- TAB staff-band auto-detection ----
+// Finds the actual Y-range of the 6 horizontal TAB staff lines, regardless of how much
+// album art / playback-UI chrome surrounds them or how the capture was cropped — so overlap
+// detection and bar-number OCR can compare/scan the part of the image that's actually stable
+// across captures of the same content, instead of a fixed top-% guess.
+function detectStaffBand(imageData, w, h) {
+  const d = imageData.data;
+  const inkRatio = new Float32Array(h);
+  for (let y = 0; y < h; y++) {
+    let dark = 0;
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      if (lum < 140) dark++;
+    }
+    inkRatio[y] = dark / w;
+  }
+  // a real staff line spans almost the full width and is only a few px thick — this combination
+  // is what separates it from a chord-box border (narrow) or bold title text (thick, uneven)
+  const LINE_RATIO_MIN = 0.55;
+  const MAX_LINE_THICKNESS = 4;
+  const candidates = [];
+  let y = 0;
+  while (y < h) {
+    if (inkRatio[y] < LINE_RATIO_MIN) { y++; continue; }
+    const startY = y;
+    while (y < h && inkRatio[y] >= LINE_RATIO_MIN) y++;
+    const endY = y;
+    if (endY - startY <= MAX_LINE_THICKNESS) candidates.push((startY + endY - 1) / 2);
+  }
+  if (candidates.length < 6) return null;
+
+  const GAP_TOLERANCE = 0.25; // relative tolerance for "nearly evenly spaced"
+  let best = null;
+  for (let i = 0; i < candidates.length; i++) {
+    for (let j = i + 1; j < candidates.length; j++) {
+      const gap = candidates[j] - candidates[i];
+      if (gap <= 0) continue;
+      const chain = [candidates[i]];
+      let ok = true;
+      for (let k = 1; k < 6; k++) {
+        const target = candidates[i] + gap * k;
+        let closest = null, closestDiff = Infinity;
+        for (const c of candidates) {
+          const diff = Math.abs(c - target);
+          if (diff < closestDiff) { closestDiff = diff; closest = c; }
+        }
+        if (closest === null || closestDiff > gap * GAP_TOLERANCE) { ok = false; break; }
+        chain.push(closest);
+      }
+      if (!ok || chain.length !== 6) continue;
+      const gaps = [];
+      for (let k = 1; k < 6; k++) gaps.push(chain[k] - chain[k - 1]);
+      const meanGap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+      const variance = gaps.reduce((a, b) => a + (b - meanGap) * (b - meanGap), 0) / gaps.length;
+      const confidence = 1 / (1 + variance);
+      if (!best || confidence > best.confidence) {
+        best = { staffTop: chain[0], staffBottom: chain[5], lineYs: chain, confidence };
+      }
+    }
+  }
+  return best;
+}
+
 function binarizeLumRow(canvas, opts) {
+  opts = opts || {};
   const ctx = canvas.getContext('2d');
-  const w = canvas.width, h = canvas.height;
-  const d = ctx.getImageData(0, 0, w, h).data;
+  const w = canvas.width;
+  const yTop = opts.yTop != null ? Math.max(0, Math.round(opts.yTop)) : 0;
+  const yBottom = opts.yBottom != null ? Math.min(canvas.height, Math.round(opts.yBottom)) : canvas.height;
+  const h = Math.max(1, yBottom - yTop);
+  const d = ctx.getImageData(0, yTop, w, h).data;
   const out = new Float32Array(w * h);
   for (let i = 0; i < w * h; i++) {
     const lum = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
@@ -508,20 +589,26 @@ function findOverlapByCorrelation(canvasA, canvasB, opts) {
   const minOverlapPx = opts.minOverlapPx || 20;
   const maxOverlapPx = Math.min(opts.maxOverlapPx || 300, canvasA.width, canvasB.width);
   const step = opts.step || 4;
-  const h = Math.min(canvasA.height, canvasB.height);
+
+  // Compare only the actual TAB staff band when we know where it is — this is the part of the
+  // image that's stable across captures of the same content; album art / playback UI / chord
+  // diagrams above or below it vary capture-to-capture and would otherwise corrupt the match.
+  // Falls back to the full canvas height when staff detection failed for either image.
+  const rangeA = opts.staffBandA ? { yTop: opts.staffBandA.staffTop, yBottom: opts.staffBandA.staffBottom } : { yTop: 0, yBottom: canvasA.height };
+  const rangeB = opts.staffBandB ? { yTop: opts.staffBandB.staffTop, yBottom: opts.staffBandB.staffBottom } : { yTop: 0, yBottom: canvasB.height };
+
+  const binA = binarizeLumRow(canvasA, rangeA);
+  const binB = binarizeLumRow(canvasB, rangeB);
+  const h = Math.min(binA.h, binB.h);
   const sampleRows = 40;
   const rowStep = Math.max(1, Math.floor(h / sampleRows));
-
-  const binA = binarizeLumRow(canvasA, {});
-  const binB = binarizeLumRow(canvasB, {});
 
   // Score by Jaccard similarity of the INK pixels only (not raw agreement) — two mostly-blank/white
   // strips would otherwise "agree" almost everywhere by sharing background, producing a false-positive
   // high score even for genuinely unrelated images. Requiring real ink overlap avoids that.
-  let best = null;
-  const MIN_INK_SAMPLES = 15; // too little ink in the compared window = not enough signal to trust
+  const scored = [];
   for (let overlapPx = minOverlapPx; overlapPx <= maxOverlapPx; overlapPx += step) {
-    let inkAgree = 0, inkUnion = 0;
+    let inkAgree = 0, inkUnion = 0, samples = 0;
     for (let y = 0; y < h; y += rowStep) {
       for (let k = 0; k < overlapPx; k++) {
         const ax = canvasA.width - overlapPx + k;
@@ -529,18 +616,32 @@ function findOverlapByCorrelation(canvasA, canvasB, opts) {
         if (ax < 0 || ax >= canvasA.width || bx >= canvasB.width) continue;
         const av = binA.data[y * binA.w + ax];
         const bv = binB.data[y * binB.w + bx];
+        samples++;
         if (av || bv) {
           inkUnion++;
           if (av && bv) inkAgree++;
         }
       }
     }
-    if (inkUnion < MIN_INK_SAMPLES) continue;
-    const score = inkAgree / inkUnion;
-    if (!best || score > best.score) best = { overlapPx, score };
+    // require a minimum ink DENSITY relative to the window size, not just a flat count — a flat
+    // minimum can be trivially satisfied by a wide, sparse window and let a low-signal match through
+    const MIN_INK_DENSITY = 0.03;
+    if (samples === 0 || inkUnion < 15 || (inkUnion / samples) < MIN_INK_DENSITY) continue;
+    scored.push({ overlapPx, score: inkAgree / inkUnion });
   }
-  const CONFIDENCE_THRESHOLD = 0.6;
-  if (!best || best.score < CONFIDENCE_THRESHOLD) return null;
+  if (scored.length === 0) return null;
+  scored.sort((a, b) => b.score - a.score);
+  const best = scored[0];
+  // an ambiguous match — a genuinely different offset (not just the neighboring pixel of the same
+  // peak) scoring nearly as well — is not a confident match; a smooth peak around the true offset
+  // is expected and should NOT be penalized, so only compare against candidates far from the best
+  const FAR_OFFSET_PX = 20;
+  const farRunnerUp = scored.find(s => Math.abs(s.overlapPx - best.overlapPx) > FAR_OFFSET_PX);
+
+  const CONFIDENCE_THRESHOLD = 0.78;
+  const MIN_MARGIN_OVER_RUNNER_UP = 0.08;
+  if (best.score < CONFIDENCE_THRESHOLD) return null;
+  if (farRunnerUp && (best.score - farRunnerUp.score) < MIN_MARGIN_OVER_RUNNER_UP) return null;
   return best;
 }
 
@@ -614,13 +715,30 @@ async function stitchImages(files, opts, onProgress) {
     });
   }
 
+  // Detect each image's actual TAB staff-line band ONCE and reuse it for both bar-number OCR and
+  // overlap detection below — this is what makes both steps robust to captures where album art /
+  // playback-UI chrome takes up a different proportion of the image each time.
+  const staffBands = canvases.map(c => {
+    const imageData = c.getContext('2d').getImageData(0, 0, c.width, c.height);
+    return detectStaffBand(imageData, c.width, c.height);
+  });
+
   const ocrResults = [];
   if (total > 1) {
     const worker = await getOcrWorker();
     for (let i = 0; i < canvases.length; i++) {
       onProgress && onProgress({ stage: 'ocr', i: i + 1, total });
-      // OCR the (possibly playhead-cleaned) canvas's top strip, not the original raw upload
-      const stripFromCanvas = extractTopStripCanvas(canvases[i], 0.15);
+      // OCR the (possibly playhead-cleaned) canvas's bar-number strip, not the original raw upload
+      const band = staffBands[i];
+      // scale the "how far above the staff" margin to the staff's OWN line spacing rather than a
+      // fraction of the whole image — the surrounding UI chrome height has nothing to do with how
+      // far bar numbers sit above the staff, but the staff's own line spacing does
+      const stripFromCanvas = band
+        ? extractTopStripCanvas(canvases[i], {
+            staffTopPx: band.staffTop,
+            aboveMarginPx: Math.max(40, Math.round(((band.staffBottom - band.staffTop) / 5) * 3)),
+          })
+        : extractTopStripCanvas(canvases[i], { heightPct: 0.15 });
       const { candidates } = await recognizeBarNumbers(stripFromCanvas, worker);
       ocrResults[i] = validateBarNumberSequence(candidates);
     }
@@ -632,14 +750,16 @@ async function stitchImages(files, opts, onProgress) {
     const A = ocrResults[i], B = ocrResults[i + 1];
     let overlap = computeOverlapFromBarNumbers(A, B);
     if (overlap) { seams.push({ i, method: 'ocr', overlap }); continue; }
-    const pxOverlap = findOverlapByCorrelation(canvases[i], canvases[i + 1], {});
+    const pxOverlap = findOverlapByCorrelation(canvases[i], canvases[i + 1], {
+      staffBandA: staffBands[i], staffBandB: staffBands[i + 1],
+    });
     if (pxOverlap) { seams.push({ i, method: 'pixel', overlap: { overlapPx: pxOverlap.overlapPx } }); continue; }
     seams.push({ i, method: 'unresolved' });
   }
 
   function resolvedResult(seamChoices) {
     seamChoices = seamChoices || {};
-    const parts = [{ canvas: canvases[0], cutLeftPx: 0 }];
+    const parts = [{ canvas: canvases[0], cutLeftPx: 0, srcIndex: 0 }];
     const seamMethods = [];
     const warnings = [];
     for (let i = 0; i < seams.length; i++) {
@@ -647,19 +767,19 @@ async function stitchImages(files, opts, onProgress) {
       const nextCanvas = canvases[i + 1];
       if (seam.method === 'ocr') {
         const cutLeftPx = Math.round((seam.overlap.cutBLeftPct / 100) * nextCanvas.width);
-        parts.push({ canvas: nextCanvas, cutLeftPx });
+        parts.push({ canvas: nextCanvas, cutLeftPx, srcIndex: i + 1 });
         seamMethods.push('ocr');
       } else if (seam.method === 'pixel') {
-        parts.push({ canvas: nextCanvas, cutLeftPx: seam.overlap.overlapPx });
+        parts.push({ canvas: nextCanvas, cutLeftPx: seam.overlap.overlapPx, srcIndex: i + 1 });
         seamMethods.push('pixel');
       } else {
         const choice = seamChoices[i] || 'concat';
         if (choice === 'concat') {
-          parts.push({ canvas: nextCanvas, cutLeftPx: 0 });
+          parts.push({ canvas: nextCanvas, cutLeftPx: 0, srcIndex: i + 1 });
           seamMethods.push('concat');
           warnings.push('이미지 ' + (i + 1) + '↔' + (i + 2) + ': 겹침을 찾지 못해 그대로 이어붙임');
         } else {
-          parts.push({ canvas: nextCanvas, cutLeftPx: 0 });
+          parts.push({ canvas: nextCanvas, cutLeftPx: 0, srcIndex: i + 1 });
           seamMethods.push('split');
           warnings.push('이미지 ' + (i + 1) + '↔' + (i + 2) + ': 겹침을 찾지 못해 개별 이미지로 분리됨');
         }
@@ -675,18 +795,32 @@ async function stitchImages(files, opts, onProgress) {
     }
 
     const finalCanvases = groups.map(group => {
-      const h = Math.max(...group.map(p => p.canvas.height));
+      // Captures of the same content can have very different album-art/playback-UI chrome heights
+      // above the staff, so naively drawing each segment at y=0 would leave the actual TAB lines
+      // jumping up/down at every seam. Align every segment's staff band to the first segment's
+      // (using the same staffBands already computed above — no extra detection work here), falling
+      // back to y=0 alignment for any segment whose staff band wasn't detected.
+      const refBand = staffBands[group[0].srcIndex];
+      const offsets = group.map(p => {
+        const band = staffBands[p.srcIndex];
+        return (refBand && band) ? (refBand.staffTop - band.staffTop) : 0;
+      });
+      const minOffset = Math.min(0, ...offsets);
+      const maxOffset = Math.max(0, ...offsets);
       let w = 0;
       group.forEach((p, idx) => { w += (idx === 0 ? p.canvas.width : (p.canvas.width - p.cutLeftPx)); });
+      const h = Math.max(...group.map((p, idx) => p.canvas.height + offsets[idx])) - minOffset;
+
       const out = document.createElement('canvas');
-      out.width = Math.max(1, w); out.height = h;
+      out.width = Math.max(1, w); out.height = Math.max(1, Math.round(h));
       const ctx = out.getContext('2d');
       ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, out.width, out.height);
       let x = 0;
       group.forEach((p, idx) => {
         const cutLeftPx = idx === 0 ? 0 : p.cutLeftPx;
         const sw = p.canvas.width - cutLeftPx;
-        ctx.drawImage(p.canvas, cutLeftPx, 0, sw, p.canvas.height, x, 0, sw, p.canvas.height);
+        const y = Math.round(offsets[idx] - minOffset);
+        ctx.drawImage(p.canvas, cutLeftPx, 0, sw, p.canvas.height, x, y, sw, p.canvas.height);
         x += sw;
       });
       return out;
