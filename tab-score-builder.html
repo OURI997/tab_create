@@ -505,63 +505,127 @@ function computeOverlapFromBarNumbers(seqA, seqB) {
 }
 
 // ---- TAB staff-band auto-detection ----
-// Finds the actual Y-range of the 6 horizontal TAB staff lines, regardless of how much
-// album art / playback-UI chrome surrounds them or how the capture was cropped — so overlap
-// detection and bar-number OCR can compare/scan the part of the image that's actually stable
-// across captures of the same content, instead of a fixed top-% guess.
+// Finds the actual Y-range (and, best-effort, X-range) of the 6 horizontal TAB staff lines,
+// regardless of how much album art / playback-UI chrome surrounds them or how the capture was
+// cropped — so overlap detection and bar-number OCR can compare/scan the part of the image that's
+// actually stable across captures of the same content, instead of a fixed top-% guess.
+//
+// A row-width-percentage test (the original approach) assumes a clean single-page scan where the
+// staff spans most of the image width. Verified against real screen-recording captures (a TAB
+// playback app filmed/recorded, with a video feed and other chrome around it) that this fails
+// completely: the real staff lines there covered as little as ~8-18% of the full image width, so
+// no row ever crossed a 55% threshold and detection silently returned null every time.
+// Also verified that recorded/compressed captures render staff lines much fainter than the shared
+// 140 ink threshold used elsewhere (for background-removal etc.) — down to luminance ~185-230
+// against a ~244 background, well above 140 — and that the true line position can visibly drift a
+// few pixels vertically across its width (capture/encoding artifact), which breaks any detector
+// that only looks at one exact row.
+const STAFF_LINE_LUM_THRESHOLD = 235;   // lenient vs. the shared 140 — tuned against real faint captures
+const STAFF_WOBBLE_BAND_PX = 4;         // absorbs the line's vertical drift across its width
+const STAFF_GAP_TOLERANCE_PX = 20;      // bridges small interruptions (numbers, anti-aliasing, compression)
+const STAFF_MIN_SPAN_FRACTION = 0.3;    // a real staff line still needs to cover a decent share of the width...
+const STAFF_MIN_SPAN_FLOOR_PX = 90;     // ...but never require more than this in absolute px (tunable)
+const STAFF_MAX_GROUP_THICKNESS = STAFF_WOBBLE_BAND_PX * 2 + 6; // a real line stays this thin even with wobble absorbed
+const STAFF_GAP_Y_TOLERANCE = 0.25;     // relative tolerance for "nearly evenly spaced" lines
+const STAFF_MIN_X_OVERLAP_FRACTION = 0.6; // the 6 lines must share roughly this much of their x-range
+
 function detectStaffBand(imageData, w, h) {
   const d = imageData.data;
-  const inkRatio = new Float32Array(h);
+  const isDark = new Uint8Array(w * h);
   for (let y = 0; y < h; y++) {
-    let dark = 0;
     for (let x = 0; x < w; x++) {
       const i = (y * w + x) * 4;
       const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-      if (lum < 140) dark++;
+      isDark[y * w + x] = lum < STAFF_LINE_LUM_THRESHOLD ? 1 : 0;
     }
-    inkRatio[y] = dark / w;
   }
-  // a real staff line spans almost the full width and is only a few px thick — this combination
-  // is what separates it from a chord-box border (narrow) or bold title text (thick, uneven)
-  const LINE_RATIO_MIN = 0.55;
-  const MAX_LINE_THICKNESS = 4;
-  const candidates = [];
+  const minSpan = Math.max(STAFF_MIN_SPAN_FLOOR_PX, w * STAFF_MIN_SPAN_FRACTION);
+
+  // For each row, OR together a small vertical band around it (absorbs wobble), then find the
+  // longest run of ink in that combined row allowing small gaps (bridges interruptions) — this is
+  // "does a staff line's worth of ink live near this row", not "what % of the row is dark".
+  const rowLeft = new Int32Array(h).fill(-1);
+  const rowRight = new Int32Array(h).fill(-1);
+  const rowLen = new Int32Array(h);
+  const bandOr = new Uint8Array(w);
+  for (let y = 0; y < h; y++) {
+    const lo = Math.max(0, y - STAFF_WOBBLE_BAND_PX), hi = Math.min(h - 1, y + STAFF_WOBBLE_BAND_PX);
+    bandOr.fill(0);
+    for (let yy = lo; yy <= hi; yy++) {
+      const rowOff = yy * w;
+      for (let x = 0; x < w; x++) if (isDark[rowOff + x]) bandOr[x] = 1;
+    }
+    let bestStart = -1, bestEnd = -1, bestLen = 0;
+    let x = 0;
+    while (x < w) {
+      if (!bandOr[x]) { x++; continue; }
+      const start = x;
+      let gap = 0, xe = x;
+      while (xe < w) {
+        if (bandOr[xe]) { gap = 0; xe++; }
+        else { gap++; if (gap > STAFF_GAP_TOLERANCE_PX) break; xe++; }
+      }
+      let end = xe;
+      while (end > start && !bandOr[end - 1]) end--;
+      if (end - start > bestLen) { bestLen = end - start; bestStart = start; bestEnd = end; }
+      x = xe;
+    }
+    if (bestLen >= minSpan) { rowLeft[y] = bestStart; rowRight[y] = bestEnd; rowLen[y] = bestLen; }
+  }
+
+  // group consecutive passing rows into line candidates; reject blobs too thick to be a real line
+  const groups = [];
   let y = 0;
   while (y < h) {
-    if (inkRatio[y] < LINE_RATIO_MIN) { y++; continue; }
-    const startY = y;
-    while (y < h && inkRatio[y] >= LINE_RATIO_MIN) y++;
-    const endY = y;
-    if (endY - startY <= MAX_LINE_THICKNESS) candidates.push((startY + endY - 1) / 2);
+    if (rowLen[y] === 0) { y++; continue; }
+    const start = y;
+    while (y < h && rowLen[y] > 0) y++;
+    const end = y;
+    if (end - start > STAFF_MAX_GROUP_THICKNESS) continue;
+    let peakY = start;
+    for (let yy = start + 1; yy < end; yy++) if (rowLen[yy] > rowLen[peakY]) peakY = yy;
+    groups.push({ y: (start + end - 1) / 2, left: rowLeft[peakY], right: rowRight[peakY] });
   }
-  if (candidates.length < 6) return null;
+  if (groups.length < 6) return null;
 
-  const GAP_TOLERANCE = 0.25; // relative tolerance for "nearly evenly spaced"
   let best = null;
-  for (let i = 0; i < candidates.length; i++) {
-    for (let j = i + 1; j < candidates.length; j++) {
-      const gap = candidates[j] - candidates[i];
+  for (let i = 0; i < groups.length; i++) {
+    for (let j = i + 1; j < groups.length; j++) {
+      const gap = groups[j].y - groups[i].y;
       if (gap <= 0) continue;
-      const chain = [candidates[i]];
+      const chain = [groups[i]];
       let ok = true;
       for (let k = 1; k < 6; k++) {
-        const target = candidates[i] + gap * k;
+        const target = groups[i].y + gap * k;
         let closest = null, closestDiff = Infinity;
-        for (const c of candidates) {
-          const diff = Math.abs(c - target);
-          if (diff < closestDiff) { closestDiff = diff; closest = c; }
+        for (const g of groups) {
+          const diff = Math.abs(g.y - target);
+          if (diff < closestDiff) { closestDiff = diff; closest = g; }
         }
-        if (closest === null || closestDiff > gap * GAP_TOLERANCE) { ok = false; break; }
+        if (closest === null || closestDiff > gap * STAFF_GAP_Y_TOLERANCE) { ok = false; break; }
         chain.push(closest);
       }
       if (!ok || chain.length !== 6) continue;
+
+      // the 6 lines should share roughly the same x-range (they're parallel rules of one staff) —
+      // this is what tells a real staff apart from 6 coincidentally evenly-spaced but unrelated
+      // horizontal streaks scattered around the image
+      const lefts = chain.map(c => c.left), rights = chain.map(c => c.right);
+      const overlapLeft = Math.max(...lefts), overlapRight = Math.min(...rights);
+      const avgSpan = chain.reduce((s, c) => s + (c.right - c.left), 0) / 6;
+      if (avgSpan <= 0 || (overlapRight - overlapLeft) < avgSpan * STAFF_MIN_X_OVERLAP_FRACTION) continue;
+
       const gaps = [];
-      for (let k = 1; k < 6; k++) gaps.push(chain[k] - chain[k - 1]);
+      for (let k = 1; k < 6; k++) gaps.push(chain[k].y - chain[k - 1].y);
       const meanGap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
       const variance = gaps.reduce((a, b) => a + (b - meanGap) * (b - meanGap), 0) / gaps.length;
       const confidence = 1 / (1 + variance);
       if (!best || confidence > best.confidence) {
-        best = { staffTop: chain[0], staffBottom: chain[5], lineYs: chain, confidence };
+        best = {
+          staffTop: chain[0].y, staffBottom: chain[5].y,
+          staffLeft: overlapLeft, staffRight: overlapRight,
+          lineYs: chain.map(c => c.y), confidence,
+        };
       }
     }
   }
@@ -576,12 +640,13 @@ function analyzeLumRow(canvas, opts) {
   const yBottom = opts.yBottom != null ? Math.min(canvas.height, Math.round(opts.yBottom)) : canvas.height;
   const h = Math.max(1, yBottom - yTop);
   const d = ctx.getImageData(0, yTop, w, h).data;
+  const lumThreshold = opts.lumThreshold != null ? opts.lumThreshold : 140;
   const lum = new Float32Array(w * h);
   const bin = new Float32Array(w * h);
   for (let i = 0; i < w * h; i++) {
     const l = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
     lum[i] = l;
-    bin[i] = l < 140 ? 1 : 0;
+    bin[i] = l < lumThreshold ? 1 : 0;
   }
   return { lum, bin, w, h };
 }
@@ -664,6 +729,18 @@ function findOverlapByCorrelation(canvasA, canvasB, opts) {
   // image that's stable across captures of the same content; album art / playback UI / chord
   // diagrams above or below it vary capture-to-capture and would otherwise corrupt the match.
   // Falls back to the full canvas height when staff detection failed for either image.
+  //
+  // NOTE: also tried loosening the ink-luminance threshold here to match detectStaffBand's lenient
+  // one (real recorded captures render staff lines much fainter than 140), plus excluding the known
+  // staff-line rows to stop them contributing a "free" match score at any offset (they're position-
+  // invariant). Reverted both: verified the combination let two genuinely UNRELATED synthetic staff
+  // images match at 0.87-0.93 confidence, and the row-exclusion needed to be wide enough to survive
+  // real line-position wobble that it also stripped out most of the real fret-number content sitting
+  // at the line position (unlike sheet music, TAB numbers sit ON the line, not clearly off it) —
+  // narrow enough to preserve the real match, it didn't suppress the false one. Fixing this properly
+  // needs a different comparison (e.g. column-density-profile correlation instead of raw per-pixel
+  // agreement), not a threshold tweak — left as a follow-up. This function's behavior is otherwise
+  // unchanged from before this round: strict 140 threshold, no row exclusion.
   const rangeA = opts.staffBandA ? { yTop: opts.staffBandA.staffTop, yBottom: opts.staffBandA.staffBottom } : { yTop: 0, yBottom: canvasA.height };
   const rangeB = opts.staffBandB ? { yTop: opts.staffBandB.staffTop, yBottom: opts.staffBandB.staffBottom } : { yTop: 0, yBottom: canvasB.height };
 
@@ -736,6 +813,13 @@ function findOverlapByCorrelation(canvasA, canvasB, opts) {
   // that repetition — that's expected structure, not ambiguity. The uniform-region false-positive
   // this was originally meant to catch (e.g. a border matching another border) is now caught earlier
   // and more precisely by MIN_LUM_VARIANCE above, so the confidence threshold alone is sufficient.
+  //
+  // Also tried a lower threshold specifically for the staffBand path, since real recorded captures'
+  // achievable score is dragged down by a moving playhead-cursor highlight differing between frames.
+  // Reverted: verified it let genuinely unrelated staff-bearing images through too (see the NOTE
+  // above the range/threshold setup). Real staff-content pairs that can't confidently auto-match
+  // still fall through to the existing "순서대로 이어붙이기 / 개별로 추가" prompt — a safe manual
+  // fallback — rather than either silently guessing or blocking the batch.
   const CONFIDENCE_THRESHOLD = 0.78;
   if (best.score < CONFIDENCE_THRESHOLD) return null;
   return best;
