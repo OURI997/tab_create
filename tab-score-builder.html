@@ -568,7 +568,7 @@ function detectStaffBand(imageData, w, h) {
   return best;
 }
 
-function binarizeLumRow(canvas, opts) {
+function analyzeLumRow(canvas, opts) {
   opts = opts || {};
   const ctx = canvas.getContext('2d');
   const w = canvas.width;
@@ -576,12 +576,82 @@ function binarizeLumRow(canvas, opts) {
   const yBottom = opts.yBottom != null ? Math.min(canvas.height, Math.round(opts.yBottom)) : canvas.height;
   const h = Math.max(1, yBottom - yTop);
   const d = ctx.getImageData(0, yTop, w, h).data;
-  const out = new Float32Array(w * h);
+  const lum = new Float32Array(w * h);
+  const bin = new Float32Array(w * h);
   for (let i = 0; i < w * h; i++) {
-    const lum = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
-    out[i] = lum < 140 ? 1 : 0;
+    const l = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+    lum[i] = l;
+    bin[i] = l < 140 ? 1 : 0;
   }
-  return { data: out, w, h };
+  return { lum, bin, w, h };
+}
+
+// ---- uniform-border auto-crop ----
+// Letterboxing/frame borders added by a screen-capture or photo (usually solid black or white,
+// unbroken from the very edge) can otherwise get matched to each other as a "perfect overlap" by
+// findOverlapByCorrelation, since they're maximally self-similar. Detected once per image and used
+// for ALL downstream analysis (staff detection, overlap search, OCR) — but the final composited
+// image still draws from the original, uncropped canvas; only the analysis coordinates are adjusted.
+function detectContentRect(imageData, w, h) {
+  const d = imageData.data;
+  function rowVariance(y) {
+    let sum = 0, sumSq = 0;
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      sum += lum; sumSq += lum * lum;
+    }
+    const mean = sum / w;
+    return sumSq / w - mean * mean;
+  }
+  function colVariance(x) {
+    let sum = 0, sumSq = 0;
+    for (let y = 0; y < h; y++) {
+      const i = (y * w + x) * 4;
+      const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      sum += lum; sumSq += lum * lum;
+    }
+    const mean = sum / h;
+    return sumSq / h - mean * mean;
+  }
+  const VARIANCE_THRESHOLD = 20;   // near-zero variance = a uniform-color row/column
+  const MIN_BORDER_RUN = 6;        // require several unbroken uniform rows/cols before trusting it as a real border, not noise
+  const MAX_BORDER_FRACTION = 0.25; // never trim more than this fraction from any one side, as a safety cap
+
+  function scanEdge(size, statFn, forward) {
+    const maxTrim = Math.floor(size * MAX_BORDER_FRACTION);
+    let runStart = -1, trimTo = 0;
+    for (let k = 0; k < maxTrim; k++) {
+      const idx = forward ? k : (size - 1 - k);
+      if (statFn(idx) < VARIANCE_THRESHOLD) {
+        if (runStart === -1) runStart = k;
+        if (k - runStart + 1 >= MIN_BORDER_RUN) trimTo = k + 1;
+      } else {
+        break; // a real border is unbroken from the edge — stop at the first non-uniform row/col
+      }
+    }
+    return trimTo;
+  }
+
+  const top = scanEdge(h, rowVariance, true);
+  const bottomTrim = scanEdge(h, rowVariance, false);
+  const left = scanEdge(w, colVariance, true);
+  const rightTrim = scanEdge(w, colVariance, false);
+  const rect = { left, top, right: w - rightTrim, bottom: h - bottomTrim };
+
+  // safety: never let this crop away most of the image (e.g. a genuinely blank/near-empty capture)
+  if (rect.right - rect.left < w * 0.5 || rect.bottom - rect.top < h * 0.5) {
+    return { left: 0, top: 0, right: w, bottom: h };
+  }
+  return rect;
+}
+
+function cropCanvasToRect(canvas, rect) {
+  const w = rect.right - rect.left, h = rect.bottom - rect.top;
+  const out = document.createElement('canvas');
+  out.width = Math.max(1, w); out.height = Math.max(1, h);
+  out.getContext('2d').drawImage(canvas, rect.left, rect.top, out.width, out.height, 0, 0, out.width, out.height);
+  return out;
 }
 
 function findOverlapByCorrelation(canvasA, canvasB, opts) {
@@ -597,8 +667,8 @@ function findOverlapByCorrelation(canvasA, canvasB, opts) {
   const rangeA = opts.staffBandA ? { yTop: opts.staffBandA.staffTop, yBottom: opts.staffBandA.staffBottom } : { yTop: 0, yBottom: canvasA.height };
   const rangeB = opts.staffBandB ? { yTop: opts.staffBandB.staffTop, yBottom: opts.staffBandB.staffBottom } : { yTop: 0, yBottom: canvasB.height };
 
-  const binA = binarizeLumRow(canvasA, rangeA);
-  const binB = binarizeLumRow(canvasB, rangeB);
+  const binA = analyzeLumRow(canvasA, rangeA);
+  const binB = analyzeLumRow(canvasB, rangeB);
   const h = Math.min(binA.h, binB.h);
   const sampleRows = 40;
   const rowStep = Math.max(1, Math.floor(h / sampleRows));
@@ -606,42 +676,68 @@ function findOverlapByCorrelation(canvasA, canvasB, opts) {
   // Score by Jaccard similarity of the INK pixels only (not raw agreement) — two mostly-blank/white
   // strips would otherwise "agree" almost everywhere by sharing background, producing a false-positive
   // high score even for genuinely unrelated images. Requiring real ink overlap avoids that.
-  const scored = [];
-  for (let overlapPx = minOverlapPx; overlapPx <= maxOverlapPx; overlapPx += step) {
+  function scoreAt(overlapPx) {
     let inkAgree = 0, inkUnion = 0, samples = 0;
+    let sumLum = 0, sumLumSq = 0, lumSamples = 0;
     for (let y = 0; y < h; y += rowStep) {
       for (let k = 0; k < overlapPx; k++) {
         const ax = canvasA.width - overlapPx + k;
         const bx = k;
         if (ax < 0 || ax >= canvasA.width || bx >= canvasB.width) continue;
-        const av = binA.data[y * binA.w + ax];
-        const bv = binB.data[y * binB.w + bx];
+        const av = binA.bin[y * binA.w + ax];
+        const bv = binB.bin[y * binB.w + bx];
         samples++;
         if (av || bv) {
           inkUnion++;
           if (av && bv) inkAgree++;
         }
+        const alum = binA.lum[y * binA.w + ax], blum = binB.lum[y * binB.w + bx];
+        sumLum += alum + blum; sumLumSq += alum * alum + blum * blum; lumSamples += 2;
       }
     }
     // require a minimum ink DENSITY relative to the window size, not just a flat count — a flat
     // minimum can be trivially satisfied by a wide, sparse window and let a low-signal match through
     const MIN_INK_DENSITY = 0.03;
-    if (samples === 0 || inkUnion < 15 || (inkUnion / samples) < MIN_INK_DENSITY) continue;
-    scored.push({ overlapPx, score: inkAgree / inkUnion });
+    if (samples === 0 || inkUnion < 15 || (inkUnion / samples) < MIN_INK_DENSITY) return null;
+    // require real pixel variety in the compared window — a solid-color region (e.g. an uncropped
+    // border, or a plain colored UI block) can satisfy the ink-density check above (100% "dark")
+    // while carrying zero actual information; only a genuinely mixed ink/background region (real
+    // notes, text, staff lines) should be trusted as a match signal
+    const MIN_LUM_VARIANCE = 300;
+    const meanLum = sumLum / lumSamples;
+    const lumVariance = sumLumSq / lumSamples - meanLum * meanLum;
+    if (lumVariance < MIN_LUM_VARIANCE) return null;
+    return { overlapPx, score: inkAgree / inkUnion };
+  }
+
+  const scored = [];
+  for (let overlapPx = minOverlapPx; overlapPx <= maxOverlapPx; overlapPx += step) {
+    const s = scoreAt(overlapPx);
+    if (s) scored.push(s);
   }
   if (scored.length === 0) return null;
   scored.sort((a, b) => b.score - a.score);
-  const best = scored[0];
-  // an ambiguous match — a genuinely different offset (not just the neighboring pixel of the same
-  // peak) scoring nearly as well — is not a confident match; a smooth peak around the true offset
-  // is expected and should NOT be penalized, so only compare against candidates far from the best
-  const FAR_OFFSET_PX = 20;
-  const farRunnerUp = scored.find(s => Math.abs(s.overlapPx - best.overlapPx) > FAR_OFFSET_PX);
+  let best = scored[0];
 
+  // A coarse step (used for wide images, to keep the search affordable) can step right over a sharp,
+  // narrow true peak — real content can have fine detail that only aligns within a couple of exact
+  // pixels. Refine locally around the coarse best at step=1 so the reported offset is pixel-exact
+  // rather than whatever coarse grid point happened to be sampled nearest to it.
+  if (step > 1) {
+    for (let overlapPx = Math.max(minOverlapPx, best.overlapPx - step); overlapPx <= Math.min(maxOverlapPx, best.overlapPx + step); overlapPx++) {
+      const s = scoreAt(overlapPx);
+      if (s && s.score > best.score) best = s;
+    }
+  }
+  // NOTE: an earlier version also rejected matches whose best score was too close to a "far"
+  // runner-up's score, to guard against ambiguous matches. That rule ended up rejecting genuinely
+  // correct matches on real TAB content: the staff/bar lines repeat across the whole width, so
+  // several unrelated offsets can legitimately score not-too-far-below the true best one just from
+  // that repetition — that's expected structure, not ambiguity. The uniform-region false-positive
+  // this was originally meant to catch (e.g. a border matching another border) is now caught earlier
+  // and more precisely by MIN_LUM_VARIANCE above, so the confidence threshold alone is sufficient.
   const CONFIDENCE_THRESHOLD = 0.78;
-  const MIN_MARGIN_OVER_RUNNER_UP = 0.08;
   if (best.score < CONFIDENCE_THRESHOLD) return null;
-  if (farRunnerUp && (best.score - farRunnerUp.score) < MIN_MARGIN_OVER_RUNNER_UP) return null;
   return best;
 }
 
@@ -715,30 +811,46 @@ async function stitchImages(files, opts, onProgress) {
     });
   }
 
+  // Auto-crop any uniform-color border (letterboxing from the capture/photo) once per image, BEFORE
+  // any analysis — staff detection, overlap search, and OCR all run on these content-only canvases
+  // so a border can never get mistaken for real content. The final composite still draws from the
+  // original uncropped canvases (see cutLeftPx conversion back to original coordinates below).
+  const contentRects = canvases.map(c => {
+    const imageData = c.getContext('2d').getImageData(0, 0, c.width, c.height);
+    return detectContentRect(imageData, c.width, c.height);
+  });
+  const contentCanvases = canvases.map((c, i) => cropCanvasToRect(c, contentRects[i]));
+
   // Detect each image's actual TAB staff-line band ONCE and reuse it for both bar-number OCR and
   // overlap detection below — this is what makes both steps robust to captures where album art /
   // playback-UI chrome takes up a different proportion of the image each time.
-  const staffBands = canvases.map(c => {
+  const staffBands = contentCanvases.map(c => {
     const imageData = c.getContext('2d').getImageData(0, 0, c.width, c.height);
     return detectStaffBand(imageData, c.width, c.height);
   });
+  // staffBands[i].staffTop is in contentCanvases[i]'s coordinate space; this converts it back to the
+  // original (uncropped) canvas's coordinate space, needed wherever we composite from the original.
+  function originalStaffTop(i) {
+    const band = staffBands[i];
+    return band ? contentRects[i].top + band.staffTop : null;
+  }
 
   const ocrResults = [];
   if (total > 1) {
     const worker = await getOcrWorker();
-    for (let i = 0; i < canvases.length; i++) {
+    for (let i = 0; i < contentCanvases.length; i++) {
       onProgress && onProgress({ stage: 'ocr', i: i + 1, total });
-      // OCR the (possibly playhead-cleaned) canvas's bar-number strip, not the original raw upload
+      // OCR the (possibly playhead-cleaned, border-cropped) canvas's bar-number strip
       const band = staffBands[i];
       // scale the "how far above the staff" margin to the staff's OWN line spacing rather than a
       // fraction of the whole image — the surrounding UI chrome height has nothing to do with how
       // far bar numbers sit above the staff, but the staff's own line spacing does
       const stripFromCanvas = band
-        ? extractTopStripCanvas(canvases[i], {
+        ? extractTopStripCanvas(contentCanvases[i], {
             staffTopPx: band.staffTop,
             aboveMarginPx: Math.max(40, Math.round(((band.staffBottom - band.staffTop) / 5) * 3)),
           })
-        : extractTopStripCanvas(canvases[i], { heightPct: 0.15 });
+        : extractTopStripCanvas(contentCanvases[i], { heightPct: 0.15 });
       const { candidates } = await recognizeBarNumbers(stripFromCanvas, worker);
       ocrResults[i] = validateBarNumberSequence(candidates);
     }
@@ -748,12 +860,35 @@ async function stitchImages(files, opts, onProgress) {
   for (let i = 0; i < canvases.length - 1; i++) {
     onProgress && onProgress({ stage: 'seam', i: i + 1, total: canvases.length - 1 });
     const A = ocrResults[i], B = ocrResults[i + 1];
-    let overlap = computeOverlapFromBarNumbers(A, B);
-    if (overlap) { seams.push({ i, method: 'ocr', overlap }); continue; }
-    const pxOverlap = findOverlapByCorrelation(canvases[i], canvases[i + 1], {
-      staffBandA: staffBands[i], staffBandB: staffBands[i + 1],
+    const barOverlap = computeOverlapFromBarNumbers(A, B);
+    if (barOverlap) {
+      // cutBLeftPct is a % of contentCanvases[i+1]'s width — convert to an absolute pixel offset in
+      // the ORIGINAL (uncropped) canvas B, since that's what actually gets composited
+      const contentWidthB = contentRects[i + 1].right - contentRects[i + 1].left;
+      const cutLeftPx = contentRects[i + 1].left + Math.round((barOverlap.cutBLeftPct / 100) * contentWidthB);
+      seams.push({ i, method: 'ocr', cutLeftPx });
+      continue;
+    }
+    const narrowerContentWidth = Math.min(contentCanvases[i].width, contentCanvases[i + 1].width);
+    // search up to 70% of the narrower image's (content-only) width — a fixed small cap would miss
+    // genuinely large overlaps from tightly-spaced scroll captures. step is kept at 1 (exhaustive)
+    // rather than widened for large images: real TAB content (thin staff/bar lines, small digits)
+    // can have a very sharp true-alignment peak that a coarser step risks stepping right over,
+    // locking onto an unrelated offset instead — verified this actually happens while testing this
+    // fix. The search is cheap enough in absolute terms (milliseconds) that there's no real need to
+    // trade accuracy for it, especially next to the OCR pass this only runs alongside.
+    const maxOverlapPx = Math.max(20, Math.round(narrowerContentWidth * 0.7));
+    const step = 1;
+    const pxOverlap = findOverlapByCorrelation(contentCanvases[i], contentCanvases[i + 1], {
+      staffBandA: staffBands[i], staffBandB: staffBands[i + 1], maxOverlapPx, step,
     });
-    if (pxOverlap) { seams.push({ i, method: 'pixel', overlap: { overlapPx: pxOverlap.overlapPx } }); continue; }
+    if (pxOverlap) {
+      // pxOverlap.overlapPx is in contentCanvases[i+1]'s own coordinate space (counted from its own
+      // left edge) — convert to the original canvas B's coordinate space the same way as above
+      const cutLeftPx = contentRects[i + 1].left + pxOverlap.overlapPx;
+      seams.push({ i, method: 'pixel', cutLeftPx });
+      continue;
+    }
     seams.push({ i, method: 'unresolved' });
   }
 
@@ -765,13 +900,11 @@ async function stitchImages(files, opts, onProgress) {
     for (let i = 0; i < seams.length; i++) {
       const seam = seams[i];
       const nextCanvas = canvases[i + 1];
-      if (seam.method === 'ocr') {
-        const cutLeftPx = Math.round((seam.overlap.cutBLeftPct / 100) * nextCanvas.width);
-        parts.push({ canvas: nextCanvas, cutLeftPx, srcIndex: i + 1 });
-        seamMethods.push('ocr');
-      } else if (seam.method === 'pixel') {
-        parts.push({ canvas: nextCanvas, cutLeftPx: seam.overlap.overlapPx, srcIndex: i + 1 });
-        seamMethods.push('pixel');
+      if (seam.method === 'ocr' || seam.method === 'pixel') {
+        // seam.cutLeftPx is already converted to the ORIGINAL (uncropped) canvas B's coordinate
+        // space — see the border/content-crop conversion where each seam was built above
+        parts.push({ canvas: nextCanvas, cutLeftPx: seam.cutLeftPx, srcIndex: i + 1 });
+        seamMethods.push(seam.method);
       } else {
         const choice = seamChoices[i] || 'concat';
         if (choice === 'concat') {
@@ -800,10 +933,10 @@ async function stitchImages(files, opts, onProgress) {
       // jumping up/down at every seam. Align every segment's staff band to the first segment's
       // (using the same staffBands already computed above — no extra detection work here), falling
       // back to y=0 alignment for any segment whose staff band wasn't detected.
-      const refBand = staffBands[group[0].srcIndex];
+      const refTop = originalStaffTop(group[0].srcIndex);
       const offsets = group.map(p => {
-        const band = staffBands[p.srcIndex];
-        return (refBand && band) ? (refBand.staffTop - band.staffTop) : 0;
+        const t = originalStaffTop(p.srcIndex);
+        return (refTop != null && t != null) ? (refTop - t) : 0;
       });
       const minOffset = Math.min(0, ...offsets);
       const maxOffset = Math.max(0, ...offsets);
