@@ -9,6 +9,8 @@
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
 <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <style>
   :root{
     --bg:#faf8f3;
@@ -1172,7 +1174,10 @@ function effectiveImageSettings(item, defaults) {
 // produce a canvas wide/tall enough to freeze the browser or take a very long time to render/encode.
 const EXPORT_MAX_WIDTH = 4500;
 
-async function composeScore(items, title, targetW, opts) {
+// Shared by composeScore (single-canvas export/preview) and composeScorePages (A4-split export) —
+// decodes + measures everything once, so page-break math can reuse the exact same per-item heights
+// the single-canvas renderer uses, instead of re-deriving them.
+async function buildScoreLayout(items, title, targetW, opts) {
   opts = opts || {};
   const defaults = opts.defaults || {};
 
@@ -1212,46 +1217,173 @@ async function composeScore(items, title, targetW, opts) {
     const tags = ((it.lyrics && it.lyrics.tags) || []).filter(t => (t.text || '').trim() !== '');
     const ratio = (it.lyrics && it.lyrics.areaHeightRatio != null) ? it.lyrics.areaHeightRatio : defaultLyricRatio;
     const laneH = tags.length > 0 ? Math.max(lyricLineH, Math.round(ratio * W)) : 0;
-    return { canvas: off, scaledH, tags, laneH };
+    return { canvas: off, scaledH, tags, laneH, groupH: scaledH + laneH };
   });
 
   let totalH = PAD + titleH;
-  for (const p of processed) totalH += p.scaledH + p.laneH + gapAfterImage;
+  for (const p of processed) totalH += p.groupH + gapAfterImage;
   totalH += PAD;
 
+  return { W, PAD, titleH, gapAfterImage, titleFont, lyricFont, lyricLineH, processed, totalH: Math.max(Math.round(totalH), titleH + PAD * 2) };
+}
+
+function drawScoreTitle(ctx, W, title, layout, y) {
+  ctx.fillStyle = '#1a1a1a';
+  ctx.textAlign = 'center';
+  ctx.font = layout.titleFont;
+  ctx.fillText(title.trim() || '제목 없음', W / 2, y + Math.round(layout.titleH * 0.55));
+}
+
+// Draws one item's image + (optional) lyric lane at y, returns the y position right after it
+// (caller adds gapAfterImage) — this is the single unbreakable unit a page break may never cut through.
+function drawScoreItem(ctx, W, p, y, layout) {
+  ctx.textAlign = 'left';
+  ctx.drawImage(p.canvas, 0, y, W, p.scaledH);
+  y += p.scaledH;
+  if (p.tags.length > 0) {
+    ctx.font = layout.lyricFont;
+    ctx.fillStyle = '#1a1a1a';
+    ctx.textBaseline = 'middle';
+    for (const t of p.tags) {
+      const tx = Math.min(W - 4, Math.max(4, (t.xPct / 100) * W));
+      const half = layout.lyricLineH / 2;
+      const cy = y + Math.min(p.laneH - half, Math.max(half, (t.yPct / 100) * p.laneH));
+      ctx.fillText(t.text, tx, cy);
+    }
+    ctx.textBaseline = 'alphabetic';
+    y += p.laneH;
+  }
+  return y;
+}
+
+async function composeScore(items, title, targetW, opts) {
+  const layout = await buildScoreLayout(items, title, targetW, opts);
   const canvas = document.createElement('canvas');
-  canvas.width = W; canvas.height = Math.max(Math.round(totalH), titleH + PAD * 2);
+  canvas.width = layout.W; canvas.height = layout.totalH;
   const ctx = canvas.getContext('2d');
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  let y = PAD;
-  ctx.fillStyle = '#1a1a1a';
-  ctx.textAlign = 'center';
-  ctx.font = titleFont;
-  ctx.fillText(title.trim() || '제목 없음', W / 2, y + Math.round(titleH * 0.55));
-  y += titleH;
+  let y = layout.PAD;
+  drawScoreTitle(ctx, layout.W, title, layout, y);
+  y += layout.titleH;
 
-  ctx.textAlign = 'left';
-  for (const p of processed) {
-    ctx.drawImage(p.canvas, 0, y, W, p.scaledH);
-    y += p.scaledH;
-    if (p.tags.length > 0) {
-      ctx.font = lyricFont;
-      ctx.fillStyle = '#1a1a1a';
-      ctx.textBaseline = 'middle';
-      for (const t of p.tags) {
-        const tx = Math.min(W - 4, Math.max(4, (t.xPct / 100) * W));
-        const half = lyricLineH / 2;
-        const cy = y + Math.min(p.laneH - half, Math.max(half, (t.yPct / 100) * p.laneH));
-        ctx.fillText(t.text, tx, cy);
-      }
-      ctx.textBaseline = 'alphabetic';
-      y += p.laneH;
-    }
-    y += gapAfterImage;
+  for (const p of layout.processed) {
+    y = drawScoreItem(ctx, layout.W, p, y, layout);
+    y += layout.gapAfterImage;
   }
   return canvas;
+}
+
+// A4 height:width ratio (sqrt(2)) — each split page targets this proportion at the export's own
+// (resolution-preserving) width, so pages look like real A4 sheets regardless of source resolution.
+const A4_HEIGHT_RATIO = 1.41421356;
+
+// Groups layout.processed items into pages, never splitting an item (image + its lyric lane) across
+// a page boundary — a break can only happen in the gap BETWEEN items. If a single item is taller than
+// a whole A4 page on its own, it is kept whole on its own page (that one page is allowed to exceed
+// maxPageH) rather than silently cutting it, per the "never cut mid-line" requirement.
+function paginateScoreLayout(layout, maxPageH) {
+  const pages = [];
+  const overflowIdx = [];
+  let current = [];
+  let pageIsFirst = true;
+  let curH = layout.PAD + layout.titleH;
+
+  function startNewPage() {
+    pages.push({ items: current, hasTitle: pageIsFirst });
+    current = [];
+    pageIsFirst = false;
+    curH = layout.PAD;
+  }
+
+  for (let i = 0; i < layout.processed.length; i++) {
+    const p = layout.processed[i];
+    const lineH = p.groupH + layout.gapAfterImage;
+    if (current.length > 0 && curH + lineH + layout.PAD > maxPageH) {
+      startNewPage();
+    }
+    if (current.length === 0 && curH + lineH + layout.PAD > maxPageH) {
+      overflowIdx.push(i);
+    }
+    current.push(p);
+    curH += lineH;
+  }
+  if (current.length > 0) pages.push({ items: current, hasTitle: pageIsFirst });
+  return { pages, overflowIdx };
+}
+
+function renderScorePageCanvas(layout, title, page, W, H) {
+  const canvas = document.createElement('canvas');
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, W, H);
+
+  let y = layout.PAD;
+  if (page.hasTitle) {
+    drawScoreTitle(ctx, W, title, layout, y);
+    y += layout.titleH;
+  }
+  for (const p of page.items) {
+    y = drawScoreItem(ctx, W, p, y, layout);
+    y += layout.gapAfterImage;
+  }
+  return canvas;
+}
+
+// Splits the score into A4-proportioned page canvases, always at natural (resolution-preserving)
+// width — the same 'auto' sizing used by the single-file PNG export, so splitting never loses quality.
+async function composeScorePages(items, title, opts) {
+  const layout = await buildScoreLayout(items, title, 'auto', opts);
+  const maxPageH = Math.round(layout.W * A4_HEIGHT_RATIO);
+  const { pages, overflowIdx } = paginateScoreLayout(layout, maxPageH);
+  const canvases = pages.map(page => {
+    const headerH = page.hasTitle ? (layout.PAD + layout.titleH) : layout.PAD;
+    let contentH = headerH;
+    for (const p of page.items) contentH += p.groupH + layout.gapAfterImage;
+    contentH += layout.PAD;
+    const H = Math.max(maxPageH, Math.round(contentH));
+    return renderScorePageCanvas(layout, title, page, layout.W, H);
+  });
+  return { canvases, overflowCount: overflowIdx.length };
+}
+
+async function exportPagesAsPdf(canvases, title) {
+  const { jsPDF } = window.jspdf;
+  const pageWmm = 210;
+  let pdf = null;
+  for (let i = 0; i < canvases.length; i++) {
+    const c = canvases[i];
+    const pageHmm = pageWmm * (c.height / c.width);
+    if (i === 0) {
+      pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: [pageWmm, pageHmm] });
+    } else {
+      pdf.addPage([pageWmm, pageHmm], 'portrait');
+    }
+    // PNG (not JPEG) to avoid re-introducing the exact quality loss this whole feature exists to fix.
+    pdf.addImage(c.toDataURL('image/png'), 'PNG', 0, 0, pageWmm, pageHmm);
+  }
+  pdf.save((title.trim() || 'tab_score') + '.pdf');
+}
+
+async function exportPagesAsZip(canvases, title, format) {
+  const zip = new JSZip();
+  const ext = format === 'jpeg' ? 'jpg' : 'png';
+  const mime = format === 'jpeg' ? 'image/jpeg' : 'image/png';
+  const baseName = title.trim() || 'tab_score';
+  for (let i = 0; i < canvases.length; i++) {
+    const blob = await new Promise(resolve => canvases[i].toBlob(resolve, mime, format === 'jpeg' ? 0.92 : undefined));
+    zip.file(baseName + '_' + (i + 1) + '.' + ext, blob);
+  }
+  const zipBlob = await zip.generateAsync({ type: 'blob' });
+  const url = URL.createObjectURL(zipBlob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = baseName + '.zip';
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults, lyricFontSize, defaultLyricAreaHeight, onChange, onDelete, onMove }) {
@@ -1971,6 +2103,8 @@ function TabScoreBuilder() {
   const [titleFontSize, setTitleFontSize] = useState(44);
   const [lyricFontSize, setLyricFontSize] = useState(26);
   const [exporting, setExporting] = useState(false);
+  const [pagedFormat, setPagedFormat] = useState('pdf');
+  const [pagedExporting, setPagedExporting] = useState(false);
   const [savedList, setSavedList] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [saveMsg, setSaveMsg] = useState('');
@@ -2111,6 +2245,30 @@ function TabScoreBuilder() {
     }
   }
 
+  async function handleExportPaged() {
+    if (items.length === 0) return;
+    setPagedExporting(true);
+    try {
+      const { canvases, overflowCount } = await composeScorePages(items, title, {
+        titleFontSize, referenceWidth: getReferenceWidth(), imageGap: defaults.imageGap,
+        lyricFontSize, lyricAreaHeight: defaults.lyricAreaHeight, defaults,
+      });
+      if (pagedFormat === 'pdf') {
+        await exportPagesAsPdf(canvases, title);
+      } else {
+        await exportPagesAsZip(canvases, title, pagedFormat);
+      }
+      if (overflowCount > 0) {
+        alert('일부 줄(' + overflowCount + '개)이 A4 한 페이지보다 길어서 해당 페이지는 A4 비율보다 길게 내보내졌습니다.');
+      }
+    } catch (err) {
+      console.error(err);
+      alert('분할 내보내기에 실패했습니다.');
+    } finally {
+      setPagedExporting(false);
+    }
+  }
+
   async function handleFinalSave() {
     const name = title.trim();
     if (!name) { alert('저장하려면 먼저 제목을 입력해주세요.'); return; }
@@ -2190,6 +2348,14 @@ function TabScoreBuilder() {
         <button className="icon-btn" onClick={() => setShowStitchModal(true)}>여러 장 이어붙이기</button>
         <button onClick={handleExport} disabled={items.length === 0 || exporting}>
           {exporting ? '내보내는 중...' : 'PNG로 내보내기'}
+        </button>
+        <select value={pagedFormat} onChange={e => setPagedFormat(e.target.value)} title="A4 자동 분할 내보내기 형식" disabled={pagedExporting} style={{ width: 'auto' }}>
+          <option value="pdf">PDF (여러 페이지)</option>
+          <option value="png">PNG (여러 파일, zip)</option>
+          <option value="jpeg">JPEG (여러 파일, zip)</option>
+        </select>
+        <button className="icon-btn" onClick={handleExportPaged} disabled={items.length === 0 || pagedExporting}>
+          {pagedExporting ? '분할 내보내는 중...' : 'A4로 분할 저장'}
         </button>
         <button onClick={handleFinalSave} disabled={items.length === 0}>최종 저장</button>
         <button onClick={handleReset} disabled={items.length === 0 && !title}>초기화</button>
