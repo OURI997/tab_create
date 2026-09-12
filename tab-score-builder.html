@@ -290,18 +290,23 @@ async function dbAllKeys() {
   });
 }
 
-// Per-side crop cap. Was 40 (UI) / 45 (compute, inconsistent) — raised so a capture where the real
-// content is a small fraction of the frame (e.g. a YouTube page screenshot) can still be cropped down
-// far enough on one side alone.
-const CROP_MAX_PCT = 48;
 // Same-axis floor: top+bottom (and left+right) may never eat more than 100-this, guaranteeing at
-// least CROP_MIN_REMAIN_PCT of the image survives along that axis.
+// least CROP_MIN_REMAIN_PCT of the image survives along that axis. This is the ONLY limit on either
+// side individually — there is deliberately no separate flat per-side cap, since real content is
+// often lopsided (e.g. only the bottom 15% of a capture), and a flat cap on one side would prevent an
+// asymmetric crop like top=80%/bottom=2% just as much as it prevents a runaway top=98%/bottom=98%.
 const CROP_MIN_REMAIN_PCT = 10;
+// The most any single side could ever take, i.e. when its sibling is 0 — used only to size the UI
+// slider's track; the real ceiling for a given slider is always (100 - CROP_MIN_REMAIN_PCT - sibling).
+const CROP_MAX_PCT = 100 - CROP_MIN_REMAIN_PCT;
 
-function clampPct(v) { return Math.min(CROP_MAX_PCT, Math.max(0, v || 0)); }
+function clampPct(v) { return Math.min(100, Math.max(0, v || 0)); }
 
 // Clamps a same-axis crop pair (top/bottom or left/right) so their sum never exceeds
-// 100 - CROP_MIN_REMAIN_PCT. Applied both when the user drags a slider (via clampCropSlider below)
+// 100 - CROP_MIN_REMAIN_PCT, WITHOUT forcing the pair toward any particular balance — an already
+// asymmetric pair (e.g. 80/2) that fits under the sum cap passes through completely untouched, and
+// only a pair that together exceeds the cap gets scaled down (preserving its ratio, so it stays just
+// as asymmetric, only smaller). Applied both when the user drags a slider (via clampCropSlider below)
 // and again here at crop-compute time, so even a saved draft with an old/unsafe combination can't
 // collapse an image to nothing.
 function clampCropPair(a, b) {
@@ -315,12 +320,19 @@ function clampCropPair(a, b) {
   return [a, b];
 }
 
-// Clamps the value a single crop slider may take given its sibling's current value, so dragging one
-// slider can never push the pair's sum past the safe maximum — the slider visibly stops there instead
-// of silently being renormalized later at compute time.
+// Clamps the value a single crop slider may take given its sibling's CURRENT value — the sibling
+// itself is never touched here, so this can only ever restrict THIS slider, never silently move the
+// other one. The allowed ceiling is purely "however much room the sibling hasn't already used" (up to
+// 100 - CROP_MIN_REMAIN_PCT), so a near-zero sibling lets this slider run all the way up near that cap.
 function clampCropSlider(value, otherValue) {
-  const maxAllowed = Math.max(0, Math.min(CROP_MAX_PCT, (100 - CROP_MIN_REMAIN_PCT) - clampPct(otherValue)));
+  const maxAllowed = Math.max(0, (100 - CROP_MIN_REMAIN_PCT) - clampPct(otherValue));
   return Math.min(maxAllowed, Math.max(0, value || 0));
+}
+
+// Slider `max` attribute for one side, given its sibling's current value — kept in sync with
+// clampCropSlider's real ceiling so the native slider's track always matches what's actually reachable.
+function cropSliderMax(otherValue) {
+  return Math.max(0, (100 - CROP_MIN_REMAIN_PCT) - clampPct(otherValue));
 }
 
 function sampleAvgLuminance(img) {
@@ -1843,22 +1855,22 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
             <div className="grid2">
               <div>
                 <div className="slider-label">위쪽 자르기 ({eff.cropTop}%)</div>
-                <input type="range" min="0" max={CROP_MAX_PCT} step="1" value={eff.cropTop}
+                <input type="range" min="0" max={cropSliderMax(eff.cropBottom)} step="1" value={eff.cropTop}
                   onChange={e => updateOverride({ cropTop: clampCropSlider(Number(e.target.value), eff.cropBottom) })} />
               </div>
               <div>
                 <div className="slider-label">아래쪽 자르기 ({eff.cropBottom}%)</div>
-                <input type="range" min="0" max={CROP_MAX_PCT} step="1" value={eff.cropBottom}
+                <input type="range" min="0" max={cropSliderMax(eff.cropTop)} step="1" value={eff.cropBottom}
                   onChange={e => updateOverride({ cropBottom: clampCropSlider(Number(e.target.value), eff.cropTop) })} />
               </div>
               <div>
                 <div className="slider-label">왼쪽 자르기 ({eff.cropLeft}%)</div>
-                <input type="range" min="0" max={CROP_MAX_PCT} step="1" value={eff.cropLeft}
+                <input type="range" min="0" max={cropSliderMax(eff.cropRight)} step="1" value={eff.cropLeft}
                   onChange={e => updateOverride({ cropLeft: clampCropSlider(Number(e.target.value), eff.cropRight) })} />
               </div>
               <div>
                 <div className="slider-label">오른쪽 자르기 ({eff.cropRight}%)</div>
-                <input type="range" min="0" max={CROP_MAX_PCT} step="1" value={eff.cropRight}
+                <input type="range" min="0" max={cropSliderMax(eff.cropLeft)} step="1" value={eff.cropRight}
                   onChange={e => updateOverride({ cropRight: clampCropSlider(Number(e.target.value), eff.cropLeft) })} />
               </div>
             </div>
@@ -1980,22 +1992,22 @@ function GlobalSettings({ defaults, setDefaults, titleFontSize, setTitleFontSize
           <div className="grid2">
             <div>
               <div className="slider-label">위쪽 자르기 ({defaults.cropTop}%)</div>
-              <input type="range" min="0" max={CROP_MAX_PCT} step="1" value={defaults.cropTop}
+              <input type="range" min="0" max={cropSliderMax(defaults.cropBottom)} step="1" value={defaults.cropTop}
                 onChange={e => update({ cropTop: clampCropSlider(Number(e.target.value), defaults.cropBottom) })} />
             </div>
             <div>
               <div className="slider-label">아래쪽 자르기 ({defaults.cropBottom}%)</div>
-              <input type="range" min="0" max={CROP_MAX_PCT} step="1" value={defaults.cropBottom}
+              <input type="range" min="0" max={cropSliderMax(defaults.cropTop)} step="1" value={defaults.cropBottom}
                 onChange={e => update({ cropBottom: clampCropSlider(Number(e.target.value), defaults.cropTop) })} />
             </div>
             <div>
               <div className="slider-label">왼쪽 자르기 ({defaults.cropLeft}%)</div>
-              <input type="range" min="0" max={CROP_MAX_PCT} step="1" value={defaults.cropLeft}
+              <input type="range" min="0" max={cropSliderMax(defaults.cropRight)} step="1" value={defaults.cropLeft}
                 onChange={e => update({ cropLeft: clampCropSlider(Number(e.target.value), defaults.cropRight) })} />
             </div>
             <div>
               <div className="slider-label">오른쪽 자르기 ({defaults.cropRight}%)</div>
-              <input type="range" min="0" max={CROP_MAX_PCT} step="1" value={defaults.cropRight}
+              <input type="range" min="0" max={cropSliderMax(defaults.cropLeft)} step="1" value={defaults.cropRight}
                 onChange={e => update({ cropRight: clampCropSlider(Number(e.target.value), defaults.cropLeft) })} />
             </div>
           </div>
