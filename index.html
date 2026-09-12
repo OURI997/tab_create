@@ -713,6 +713,11 @@ function drawChordNameOnly(ctx, chord, x, baselineY, fontPx) {
   ctx.restore();
 }
 
+// Safety cap on export width: an intentionally large export-scale multiplier combined with a wide
+// browser window and many chart lines could otherwise produce a canvas large enough to be slow to
+// render/encode or risk running out of memory.
+const EXPORT_MAX_WIDTH = 4500;
+
 // ---------- Compose export canvas ----------
 async function composeChart(title, lines, library, opts) {
   opts = opts || {};
@@ -932,6 +937,7 @@ function ChordChartBuilder() {
   const [selection, setSelection] = useState({ lineId: null, ids: [] });
   const [hideAllGrids, setHideAllGrids] = useState(false);
   const [transposeSemitones, setTransposeSemitones] = useState(0);
+  const [exportScale, setExportScale] = useState(2);
   const listRef = useRef(null);
 
   function getReferenceWidth() {
@@ -1131,8 +1137,17 @@ function ChordChartBuilder() {
 
   async function handleExport() {
     if (lines.length === 0) return;
+    // This chart is drawn entirely with vector canvas calls (lines/arcs/text) — there's no source
+    // raster image whose natural resolution could set the export size, unlike tab-score-builder.html.
+    // A fixed 1400px width here meant the actual scale factor (relative to the on-screen container's
+    // real CSS width) varied with the browser's window size and was often smaller than 1 on wide
+    // screens — silently exporting everything smaller/lower-resolution than it appeared on screen.
+    // Basing width on the on-screen container width times a user-chosen multiplier makes 1x match
+    // on-screen size exactly and 2x/3x scale up from there, same idea as a Retina/HiDPI render.
+    const referenceWidth = getReferenceWidth();
+    const exportWidth = Math.min(Math.round(referenceWidth * exportScale), EXPORT_MAX_WIDTH);
     const canvas = await composeChart(title, lines, library, {
-      width: 1400, referenceWidth: getReferenceWidth(), chordSize: laneHeight, lyricFontSize, hideAllGrids,
+      width: exportWidth, referenceWidth, chordSize: laneHeight, lyricFontSize, hideAllGrids,
     });
     canvas.toBlob(blob => {
       const url = URL.createObjectURL(blob);
@@ -1244,6 +1259,10 @@ function ChordChartBuilder() {
       </div>
 
       <div className="toolbar">
+        <span style={{ fontSize: '13px', color: 'var(--text2)' }}>내보내기 배율</span>
+        {[1, 2, 3].map(s => (
+          <button key={s} className={exportScale === s ? '' : 'icon-btn'} onClick={() => setExportScale(s)} title={s + '배 해상도로 PNG 내보내기'}>{s}x</button>
+        ))}
         <button onClick={handleExport} disabled={lines.length === 0}>PNG로 내보내기</button>
         <button onClick={handleFinalSave} disabled={lines.length === 0}>최종 저장</button>
         <button onClick={handleReset} disabled={lines.length === 0 && !title}>초기화</button>

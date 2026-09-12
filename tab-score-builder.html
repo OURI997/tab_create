@@ -1168,9 +1168,34 @@ function effectiveImageSettings(item, defaults) {
   };
 }
 
-async function composeScore(items, title, W, opts) {
+// Safety cap for 'auto'-width export: without one, stitching several very large originals could
+// produce a canvas wide/tall enough to freeze the browser or take a very long time to render/encode.
+const EXPORT_MAX_WIDTH = 4500;
+
+async function composeScore(items, title, targetW, opts) {
   opts = opts || {};
   const defaults = opts.defaults || {};
+
+  // First pass: decode + process each item at its own NATIVE (post-crop) resolution — this is also
+  // where we learn each item's actual width, needed below when targetW is 'auto'.
+  const rawProcessed = [];
+  for (const it of items) {
+    const img = await loadImage(resolvedSrc(it));
+    const off = document.createElement('canvas');
+    drawProcessed(off, img, effectiveImageSettings(it, defaults));
+    rawProcessed.push({ item: it, canvas: off });
+  }
+
+  // targetW === 'auto' (used for the real export) picks the largest original's own resolution as the
+  // canvas width, instead of a fixed value smaller than most real captures — which was silently
+  // downscaling (blurring) every export regardless of how high-res the source images actually were.
+  // A plain number (used for the small live preview) is kept as an explicit fixed width, unchanged.
+  let W = targetW;
+  if (W === 'auto' || W == null) {
+    const maxNaturalWidth = rawProcessed.reduce((m, p) => Math.max(m, p.canvas.width), 1);
+    W = Math.min(maxNaturalWidth, EXPORT_MAX_WIDTH);
+  }
+
   const scale = W / (opts.referenceWidth || 780);
   const PAD = Math.round(50 * scale);
   const titleH = Math.round(90 * scale);
@@ -1182,17 +1207,13 @@ async function composeScore(items, title, W, opts) {
   const lyricLineH = Math.round(lyricFontPx * 1.3);
   const defaultLyricRatio = (opts.lyricAreaHeight != null ? opts.lyricAreaHeight : 90) / (opts.referenceWidth || 780);
 
-  const processed = [];
-  for (const it of items) {
-    const img = await loadImage(resolvedSrc(it));
-    const off = document.createElement('canvas');
-    drawProcessed(off, img, effectiveImageSettings(it, defaults));
+  const processed = rawProcessed.map(({ item: it, canvas: off }) => {
     const scaledH = Math.round(off.height * W / off.width);
     const tags = ((it.lyrics && it.lyrics.tags) || []).filter(t => (t.text || '').trim() !== '');
     const ratio = (it.lyrics && it.lyrics.areaHeightRatio != null) ? it.lyrics.areaHeightRatio : defaultLyricRatio;
     const laneH = tags.length > 0 ? Math.max(lyricLineH, Math.round(ratio * W)) : 0;
-    processed.push({ canvas: off, scaledH, tags, laneH });
-  }
+    return { canvas: off, scaledH, tags, laneH };
+  });
 
   let totalH = PAD + titleH;
   for (const p of processed) totalH += p.scaledH + p.laneH + gapAfterImage;
@@ -2068,7 +2089,10 @@ function TabScoreBuilder() {
     if (items.length === 0) return;
     setExporting(true);
     try {
-      const canvas = await composeScore(items, title, 1400, {
+      // 'auto': use the largest original image's own resolution as the export width, instead of a
+      // fixed 1400px that was silently downscaling (blurring) exports whenever a source capture was
+      // wider than that — which real screenshots/scans commonly are. Capped by EXPORT_MAX_WIDTH.
+      const canvas = await composeScore(items, title, 'auto', {
         titleFontSize, referenceWidth: getReferenceWidth(), imageGap: defaults.imageGap,
         lyricFontSize, lyricAreaHeight: defaults.lyricAreaHeight, defaults,
       });
