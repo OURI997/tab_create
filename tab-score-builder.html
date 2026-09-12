@@ -197,6 +197,25 @@ const DB_NAME = 'tab_score_builder_db';
 const STORE_NAME = 'scores';
 const DRAFT_KEY = '__draft__';
 
+// ---- timeout guard for async steps with no built-in completion guarantee ----
+// Reproduced (both from a real user report and independently via headless-browser testing on the
+// same real files) that "여러 장 이어붙이기" could hang the WHOLE PAGE — not just fail, but freeze
+// solid enough that even the browser's own reload/close stopped responding. Root cause: several
+// steps in this pipeline (image decode via FileReader+Image, the OCR worker's startup, a single OCR
+// recognize() call, one ORB feature-match pair) are awaited directly with no timeout at all — if
+// any ONE of them never settles for any reason, the whole async chain (and everything chained after
+// it, including UI state updates) stays pending forever. This wraps a promise so that instead, it
+// rejects with a clear, diagnosable message after a bounded wait — turning "the browser is dead" into
+// "here's exactly which step, and which image, got stuck," while the rest of the app stays usable.
+class TimeoutError extends Error {}
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new TimeoutError('시간 초과: ' + label + ' (' + (ms / 1000) + '초 내에 끝나지 않음)')), ms);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+}
+
 const DEFAULTS_INIT = {
   removeBg: true,
   invertMode: 'auto',
@@ -460,9 +479,11 @@ async function getOcrWorker() {
   return _ocrWorkerPromise;
 }
 
-async function recognizeBarNumbers(stripCanvas, ocrWorker) {
+const OCR_RECOGNIZE_TIMEOUT_MS = 20000;
+
+async function recognizeBarNumbers(stripCanvas, ocrWorker, label) {
   try {
-    const { data } = await ocrWorker.recognize(stripCanvas);
+    const { data } = await withTimeout(ocrWorker.recognize(stripCanvas), OCR_RECOGNIZE_TIMEOUT_MS, label || 'OCR 인식(worker.recognize)');
     const words = (data.words || []);
     const candidates = [];
     for (const w of words) {
@@ -474,6 +495,11 @@ async function recognizeBarNumbers(stripCanvas, ocrWorker) {
     }
     return { candidates };
   } catch (e) {
+    // a genuine OCR failure (bad image, no text found, etc.) is expected and already has a graceful
+    // fallback (empty candidates → the caller falls through to ORB feature matching) — but a TIMEOUT
+    // means something is actually stuck, not just "OCR found nothing", so let it propagate instead of
+    // silently swallowing it, per the diagnostic goal of this timeout-guard pass
+    if (e instanceof TimeoutError) throw e;
     return { candidates: [] };
   }
 }
@@ -875,10 +901,16 @@ function canvasFromImage(img) {
   return c;
 }
 
+const IMAGE_LOAD_TIMEOUT_MS = 20000;
+const OCR_WORKER_TIMEOUT_MS = 20000;
+const FEATURE_MATCH_TIMEOUT_MS = 20000;
+
 async function stitchImages(files, opts, onProgress) {
   opts = opts || {};
   const total = files.length;
-  const imgs = await Promise.all(files.map(f => loadFileAsImage(f)));
+  const imgs = await Promise.all(files.map((f, idx) =>
+    withTimeout(loadFileAsImage(f), IMAGE_LOAD_TIMEOUT_MS, '이미지 로딩 — ' + (idx + 1) + '번째 파일 (' + (f.name || '이름없음') + ')')
+  ));
   let canvases = imgs.map(img => canvasFromImage(img));
 
   if (opts.playheadRemove) {
@@ -918,7 +950,7 @@ async function stitchImages(files, opts, onProgress) {
 
   const ocrResults = [];
   if (total > 1) {
-    const worker = await getOcrWorker();
+    const worker = await withTimeout(getOcrWorker(), OCR_WORKER_TIMEOUT_MS, 'OCR 워커 생성 (getOcrWorker)');
     for (let i = 0; i < contentCanvases.length; i++) {
       onProgress && onProgress({ stage: 'ocr', i: i + 1, total });
       // OCR the (possibly playhead-cleaned, border-cropped) canvas's bar-number strip
@@ -932,7 +964,7 @@ async function stitchImages(files, opts, onProgress) {
             aboveMarginPx: Math.max(40, Math.round(((band.staffBottom - band.staffTop) / 5) * 3)),
           })
         : extractTopStripCanvas(contentCanvases[i], { heightPct: 0.15 });
-      const { candidates } = await recognizeBarNumbers(stripFromCanvas, worker);
+      const { candidates } = await recognizeBarNumbers(stripFromCanvas, worker, 'OCR 인식 — ' + (i + 1) + '번째 이미지');
       ocrResults[i] = validateBarNumberSequence(candidates);
     }
   }
@@ -956,7 +988,11 @@ async function stitchImages(files, opts, onProgress) {
     // only needs enough LOCAL keypoints (chord-diagram dots, glyphs, line intersections) to survive
     // whatever differs between captures (a moving playhead highlight, compression noise), and works
     // whether or not bar numbers are printed at all (unlike the OCR path above).
-    const featureOverlap = await findOverlapByFeatureMatching(contentCanvases[i], contentCanvases[i + 1], {});
+    const featureOverlap = await withTimeout(
+      findOverlapByFeatureMatching(contentCanvases[i], contentCanvases[i + 1], {}),
+      FEATURE_MATCH_TIMEOUT_MS,
+      '겹침 탐지(ORB) — ' + (i + 1) + '번째↔' + (i + 2) + '번째 이미지'
+    );
     if (featureOverlap) {
       // featureOverlap.overlapPx is in contentCanvases[i+1]'s own coordinate space (counted from its
       // own left edge) — convert to the original canvas B's coordinate space the same way as above
