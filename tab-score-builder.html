@@ -209,11 +209,18 @@ const DRAFT_KEY = '__draft__';
 // "here's exactly which step, and which image, got stuck," while the rest of the app stays usable.
 class TimeoutError extends Error {}
 function withTimeout(promise, ms, label) {
+  console.log('[withTimeout] scheduled: "' + label + '" (' + ms + 'ms)');
   let timer;
   const timeoutPromise = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new TimeoutError('시간 초과: ' + label + ' (' + (ms / 1000) + '초 내에 끝나지 않음)')), ms);
+    timer = setTimeout(() => {
+      console.log('[withTimeout] FIRED: "' + label + '" — the guarded promise did not settle within ' + ms + 'ms');
+      reject(new TimeoutError('시간 초과: ' + label + ' (' + (ms / 1000) + '초 내에 끝나지 않음)'));
+    }, ms);
   });
-  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    clearTimeout(timer);
+    console.log('[withTimeout] settled (either way): "' + label + '"');
+  });
 }
 
 const DEFAULTS_INIT = {
@@ -442,6 +449,18 @@ function detectBarLinesByPixels(imageData, w, h) {
 }
 
 // ---- bar-number OCR (feature 2) ----
+// Caps the strip's OUTPUT width. Previously this always scaled the FULL source width by a flat 3x
+// regardless of how wide the source was, which for a ~1100-1400px-wide content-cropped image produces
+// a ~3300-4200px-wide canvas handed to Tesseract — most of it blank (bar numbers are sparse), but
+// still real pixels Tesseract has to scan. Suspected (not yet confirmed live) contributor to a report
+// of "여러 장 이어붙이기" hanging on the SECOND image's OCR step for over a minute with no console
+// output and the Promise-based timeout guard never firing — which points at a synchronous main-thread
+// stall (e.g. inside recognize()'s canvas→pixel handoff before it ever reaches the async worker call),
+// since setTimeout-based timeouts can only fire between synchronous tasks, never preempt one already
+// running. This doesn't fix that possibility outright, but removes a plausible way this step could
+// scale unboundedly with source image width, and cuts typical strip size by roughly half either way.
+const OCR_STRIP_MAX_WIDTH = 2400;
+
 function extractTopStripCanvas(source, opts) {
   // source: an <img> (naturalWidth/naturalHeight) or a <canvas> (width/height) — either works
   opts = opts || {};
@@ -459,7 +478,7 @@ function extractTopStripCanvas(source, opts) {
     stripBottom = Math.max(1, Math.round(H * (opts.heightPct || 0.15)));
   }
   const stripH = Math.max(1, stripBottom - stripTop);
-  const scale = 3;
+  const scale = Math.max(1, Math.min(3, Math.floor(OCR_STRIP_MAX_WIDTH / W)));
   const c = document.createElement('canvas');
   c.width = W * scale; c.height = stripH * scale;
   const ctx = c.getContext('2d');
@@ -950,9 +969,12 @@ async function stitchImages(files, opts, onProgress) {
 
   const ocrResults = [];
   if (total > 1) {
+    console.log('[stitch] requesting OCR worker...');
     const worker = await withTimeout(getOcrWorker(), OCR_WORKER_TIMEOUT_MS, 'OCR 워커 생성 (getOcrWorker)');
+    console.log('[stitch] OCR worker ready');
     for (let i = 0; i < contentCanvases.length; i++) {
       onProgress && onProgress({ stage: 'ocr', i: i + 1, total });
+      console.log('[stitch] OCR loop i=' + (i + 1) + '/' + total + ': starting (contentCanvas ' + contentCanvases[i].width + 'x' + contentCanvases[i].height + ')');
       // OCR the (possibly playhead-cleaned, border-cropped) canvas's bar-number strip
       const band = staffBands[i];
       // scale the "how far above the staff" margin to the staff's OWN line spacing rather than a
@@ -964,7 +986,9 @@ async function stitchImages(files, opts, onProgress) {
             aboveMarginPx: Math.max(40, Math.round(((band.staffBottom - band.staffTop) / 5) * 3)),
           })
         : extractTopStripCanvas(contentCanvases[i], { heightPct: 0.15 });
+      console.log('[stitch] OCR loop i=' + (i + 1) + '/' + total + ': strip extracted (' + stripFromCanvas.width + 'x' + stripFromCanvas.height + '), calling recognizeBarNumbers...');
       const { candidates } = await recognizeBarNumbers(stripFromCanvas, worker, 'OCR 인식 — ' + (i + 1) + '번째 이미지');
+      console.log('[stitch] OCR loop i=' + (i + 1) + '/' + total + ': recognizeBarNumbers returned, ' + candidates.length + ' candidate(s)');
       ocrResults[i] = validateBarNumberSequence(candidates);
     }
   }
