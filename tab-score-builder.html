@@ -1224,34 +1224,49 @@ async function buildScoreLayout(items, title, targetW, opts) {
   for (const p of processed) totalH += p.groupH + gapAfterImage;
   totalH += PAD;
 
-  return { W, PAD, titleH, gapAfterImage, titleFont, lyricFont, lyricLineH, processed, totalH: Math.max(Math.round(totalH), titleH + PAD * 2) };
+  return { W, PAD, titleH, gapAfterImage, titleFont, titleFontPx, lyricFont, lyricFontPx, lyricLineH, processed, totalH: Math.max(Math.round(totalH), titleH + PAD * 2) };
+}
+
+function drawScoreTitleCustom(ctx, W, title, titleFont, titleH, y) {
+  ctx.fillStyle = '#1a1a1a';
+  ctx.textAlign = 'center';
+  ctx.font = titleFont;
+  ctx.fillText(title.trim() || '제목 없음', W / 2, y + Math.round(titleH * 0.55));
 }
 
 function drawScoreTitle(ctx, W, title, layout, y) {
-  ctx.fillStyle = '#1a1a1a';
-  ctx.textAlign = 'center';
-  ctx.font = layout.titleFont;
-  ctx.fillText(title.trim() || '제목 없음', W / 2, y + Math.round(layout.titleH * 0.55));
+  drawScoreTitleCustom(ctx, W, title, layout.titleFont, layout.titleH, y);
 }
 
 // Draws one item's image + (optional) lyric lane at y, returns the y position right after it
-// (caller adds gapAfterImage) — this is the single unbreakable unit a page break may never cut through.
-function drawScoreItem(ctx, W, p, y, layout) {
+// (caller adds the page's gap) — this is the single unbreakable unit a page break may never cut
+// through. `scale` (default 1) uniformly shrinks the image + lyric text/lane for THIS page only
+// (step-2 "A" fallback below) — the image is centered so the shrink reads as a print margin, not a
+// left-aligned resize.
+function drawScoreItem(ctx, W, p, y, layout, scale) {
+  scale = scale || 1;
+  const dw = Math.round(W * scale);
+  const dx = Math.round((W - dw) / 2);
+  const dh = Math.round(p.scaledH * scale);
   ctx.textAlign = 'left';
-  ctx.drawImage(p.canvas, 0, y, W, p.scaledH);
-  y += p.scaledH;
+  ctx.drawImage(p.canvas, dx, y, dw, dh);
+  y += dh;
   if (p.tags.length > 0) {
-    ctx.font = layout.lyricFont;
+    const lyricFontPx = Math.max(8, Math.round(layout.lyricFontPx * scale));
+    const lyricFont = lyricFontPx + 'px Georgia, "Noto Serif KR", serif';
+    const lyricLineH = Math.round(layout.lyricLineH * scale);
+    const laneH = Math.round(p.laneH * scale);
+    ctx.font = lyricFont;
     ctx.fillStyle = '#1a1a1a';
     ctx.textBaseline = 'middle';
     for (const t of p.tags) {
       const tx = Math.min(W - 4, Math.max(4, (t.xPct / 100) * W));
-      const half = layout.lyricLineH / 2;
-      const cy = y + Math.min(p.laneH - half, Math.max(half, (t.yPct / 100) * p.laneH));
+      const half = lyricLineH / 2;
+      const cy = y + Math.min(laneH - half, Math.max(half, (t.yPct / 100) * laneH));
       ctx.fillText(t.text, tx, cy);
     }
     ctx.textBaseline = 'alphabetic';
-    y += p.laneH;
+    y += laneH;
   }
   return y;
 }
@@ -1279,38 +1294,128 @@ async function composeScore(items, title, targetW, opts) {
 // (resolution-preserving) width, so pages look like real A4 sheets regardless of source resolution.
 const A4_HEIGHT_RATIO = 1.41421356;
 
+// Step 1: the title-only page's header (top margin + title box) is noticeably roomier than it needs
+// to be, which was the main reason a page-1 export left a big trailing gap — shrink it toward this
+// ratio, but never past a floor that still leaves the title legible and lightly padded.
+const PAGE1_HEADER_SHRINK = 0.75;
+// Step 2B floor: a page may narrow its own image-to-image gaps to reclaim room for one more line,
+// but never past half the normal gap (avoids a cramped, dida-dida look).
+const PAGE_GAP_MIN_RATIO = 0.5;
+// Step 2A floor: a page may shrink its whole content (images + text) to pull in one more line, but
+// never by more than 5% — beyond that the size difference between pages would become noticeable.
+const PAGE_SCALE_MIN = 0.95;
+
+function computePagedTitleMetrics(layout) {
+  const headerFull = layout.PAD + layout.titleH;
+  // Floor: enough room for the title glyphs themselves (titleFontPx) plus a little breathing room,
+  // plus a reduced-but-nonzero top margin — this is the "최소 여백" the shrink may never go below.
+  const floor = Math.round(layout.titleFontPx * 1.8 + layout.PAD * 0.5);
+  const headerH = Math.max(floor, Math.round(headerFull * PAGE1_HEADER_SHRINK));
+  const ratio = headerH / headerFull;
+  const pad = Math.round(layout.PAD * ratio);
+  const titleH = headerH - pad;
+  return { pad, titleH };
+}
+
 // Groups layout.processed items into pages, never splitting an item (image + its lyric lane) across
 // a page boundary — a break can only happen in the gap BETWEEN items. If a single item is taller than
 // a whole A4 page on its own, it is kept whole on its own page (that one page is allowed to exceed
 // maxPageH) rather than silently cutting it, per the "never cut mid-line" requirement.
+//
+// After the greedy normal-spacing fill, each page gets ONE attempt to additionally pull in the next
+// line so pages read as "full" instead of leaving a dangling gap at the bottom: first by narrowing
+// this page's own gaps (step 2B), and only if that isn't enough, by uniformly shrinking this page's
+// content by up to 5% (step 2A). A page that already fills up on its own is left untouched by either.
 function paginateScoreLayout(layout, maxPageH) {
   const pages = [];
   const overflowIdx = [];
-  let current = [];
+  const n = layout.processed.length;
+  const pagedTitle = computePagedTitleMetrics(layout);
+  let idx = 0;
   let pageIsFirst = true;
-  let curH = layout.PAD + layout.titleH;
 
-  function startNewPage() {
-    pages.push({ items: current, hasTitle: pageIsFirst });
-    current = [];
+  while (idx < n) {
+    const headerPad = pageIsFirst ? pagedTitle.pad : layout.PAD;
+    const titleH = pageIsFirst ? pagedTitle.titleH : 0;
+    const headerH = headerPad + titleH;
+
+    // Greedy fill at normal spacing/scale.
+    const items = [];
+    let sumGroupH = 0;
+    let i = idx;
+    let forcedOverflow = false;
+    while (i < n) {
+      const p = layout.processed[i];
+      const count = items.length + 1;
+      const neededH = headerH + sumGroupH + p.groupH + count * layout.gapAfterImage + layout.PAD;
+      if (items.length > 0 && neededH > maxPageH) break;
+      items.push(p);
+      sumGroupH += p.groupH;
+      i++;
+      if (items.length === 1 && neededH > maxPageH) {
+        overflowIdx.push(i - 1);
+        forcedOverflow = true;
+        break;
+      }
+    }
+
+    const page = {
+      items, hasTitle: pageIsFirst, headerPad, titleH, titleFontPx: layout.titleFontPx,
+      gap: layout.gapAfterImage, scale: 1,
+    };
+
+    if (!forcedOverflow && i < n) {
+      const nextP = layout.processed[i];
+      const m = items.length + 1;
+      const sumWithNext = sumGroupH + nextP.groupH;
+
+      // Step 2B: narrow this page's own gaps just enough to fit the next line.
+      const requiredGap = (maxPageH - headerH - sumWithNext - layout.PAD) / m;
+      const minGap = layout.gapAfterImage * PAGE_GAP_MIN_RATIO;
+      let pulledIn = false;
+      if (requiredGap >= minGap) {
+        const gapUsed = Math.max(minGap, Math.min(layout.gapAfterImage, Math.floor(requiredGap)));
+        if (headerH + sumWithNext + m * gapUsed + layout.PAD <= maxPageH) {
+          page.items = [...items, nextP];
+          page.gap = gapUsed;
+          i++;
+          pulledIn = true;
+        }
+      }
+
+      // Step 2A: only if 2B alone wasn't enough — shrink this page's whole content by up to 5%.
+      if (!pulledIn) {
+        const titlePortion = pageIsFirst ? titleH : 0;
+        const scalableBase = sumWithNext + m * layout.gapAfterImage + titlePortion;
+        const fixedBase = headerPad + layout.PAD;
+        const neededScalable = maxPageH - fixedBase;
+        if (scalableBase > 0 && neededScalable > 0) {
+          const s = Math.min(1, neededScalable / scalableBase);
+          if (s >= PAGE_SCALE_MIN) {
+            page.items = [...items, nextP];
+            page.scale = s;
+            i++;
+          }
+        }
+      }
+    }
+
+    pages.push(page);
     pageIsFirst = false;
-    curH = layout.PAD;
+    idx = i;
   }
-
-  for (let i = 0; i < layout.processed.length; i++) {
-    const p = layout.processed[i];
-    const lineH = p.groupH + layout.gapAfterImage;
-    if (current.length > 0 && curH + lineH + layout.PAD > maxPageH) {
-      startNewPage();
-    }
-    if (current.length === 0 && curH + lineH + layout.PAD > maxPageH) {
-      overflowIdx.push(i);
-    }
-    current.push(p);
-    curH += lineH;
-  }
-  if (current.length > 0) pages.push({ items: current, hasTitle: pageIsFirst });
   return { pages, overflowIdx };
+}
+
+function computePageContentHeight(layout, page) {
+  let h = page.hasTitle ? (page.headerPad + Math.round(page.titleH * page.scale)) : layout.PAD;
+  for (const p of page.items) {
+    h += Math.round(p.scaledH * page.scale);
+    if (p.tags.length > 0) h += Math.round(p.laneH * page.scale);
+    h += Math.round(page.gap * page.scale);
+  }
+  h += layout.PAD;
+  return h;
 }
 
 function renderScorePageCanvas(layout, title, page, W, H) {
@@ -1321,14 +1426,17 @@ function renderScorePageCanvas(layout, title, page, W, H) {
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, W, H);
 
-  let y = layout.PAD;
+  let y = page.hasTitle ? page.headerPad : layout.PAD;
   if (page.hasTitle) {
-    drawScoreTitle(ctx, W, title, layout, y);
-    y += layout.titleH;
+    const titleFontPx = Math.max(10, Math.round(page.titleFontPx * page.scale));
+    const titleFont = 'bold ' + titleFontPx + 'px serif';
+    const titleH = Math.round(page.titleH * page.scale);
+    drawScoreTitleCustom(ctx, W, title, titleFont, titleH, y);
+    y += titleH;
   }
   for (const p of page.items) {
-    y = drawScoreItem(ctx, W, p, y, layout);
-    y += layout.gapAfterImage;
+    y = drawScoreItem(ctx, W, p, y, layout, page.scale);
+    y += Math.round(page.gap * page.scale);
   }
   return canvas;
 }
@@ -1340,11 +1448,7 @@ async function composeScorePages(items, title, opts) {
   const maxPageH = Math.round(layout.W * A4_HEIGHT_RATIO);
   const { pages, overflowIdx } = paginateScoreLayout(layout, maxPageH);
   const canvases = pages.map(page => {
-    const headerH = page.hasTitle ? (layout.PAD + layout.titleH) : layout.PAD;
-    let contentH = headerH;
-    for (const p of page.items) contentH += p.groupH + layout.gapAfterImage;
-    contentH += layout.PAD;
-    const H = Math.max(maxPageH, Math.round(contentH));
+    const H = Math.max(maxPageH, computePageContentHeight(layout, page));
     return renderScorePageCanvas(layout, title, page, layout.W, H);
   });
   return { canvases, overflowCount: overflowIdx.length };
