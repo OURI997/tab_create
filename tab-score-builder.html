@@ -2427,6 +2427,8 @@ function TabScoreBuilder() {
   const [mergeGapPct, setMergeGapPct] = useState(0);
   const [mergePreviewSrc, setMergePreviewSrc] = useState(null);
   const [mergePreviewBusy, setMergePreviewBusy] = useState(false);
+  const [batchGroupSize, setBatchGroupSize] = useState(2);
+  const [batchMerging, setBatchMerging] = useState(false);
   const fileInputRef = useRef(null);
   const listRef = useRef(null);
   function getReferenceWidth() {
@@ -2583,6 +2585,65 @@ function TabScoreBuilder() {
       alert('이미지를 합치는 중 오류가 발생했습니다.');
     } finally {
       setMerging(false);
+    }
+  }
+
+  // Splits `list` into consecutive chunks of `n` — only the LAST chunk can end up shorter than n
+  // (whatever's left over after grouping front-to-back), never any earlier one.
+  function chunkForBatchMerge(list, n) {
+    const groups = [];
+    for (let i = 0; i < list.length; i += n) groups.push(list.slice(i, i + n));
+    return groups;
+  }
+
+  async function handleBatchMerge() {
+    const n = Math.max(2, Math.floor(batchGroupSize) || 2);
+    if (items.length < 2) { alert('합칠 이미지가 2장 이상 있어야 합니다.'); return; }
+
+    const groups = chunkForBatchMerge(items, n);
+    const mergeableCount = groups.filter(g => g.length >= 2).length;
+    const leftover = groups.length > 0 && groups[groups.length - 1].length === 1 ? groups[groups.length - 1] : null;
+
+    let confirmMsg = '총 ' + items.length + '장을 ' + n + '장씩 묶어서 ' + mergeableCount + '개 그룹으로 합칩니다.';
+    if (leftover) confirmMsg += ' 마지막 1장은 짝이 없어 개별 블록으로 남습니다.';
+    confirmMsg += ' 원래 이미지들은 사라지고 되돌릴 수 없습니다. 계속할까요?';
+    if (!window.confirm(confirmMsg)) return;
+
+    setBatchMerging(true);
+    try {
+      const newItems = [];
+      let mergedGroupCount = 0;
+      let staffMissingGroupCount = 0;
+      for (const group of groups) {
+        if (group.length >= 2) {
+          const result = await mergeImagesIntoRow(group, defaults, mergeGapPct);
+          mergedGroupCount++;
+          if (result.anyStaffMissing) staffMissingGroupCount++;
+          newItems.push({
+            id: Date.now() + '_' + Math.random().toString(36).slice(2) + '_' + mergedGroupCount,
+            type: 'image', src: result.canvas.toDataURL('image/png'),
+            invert: false, override: { ...MERGED_ROW_NEUTRAL_OVERRIDE },
+            lyrics: result.lyrics,
+            playheadExcluded: [], barLayout: null, stitchMeta: null,
+          });
+        } else {
+          newItems.push(group[0]);
+        }
+      }
+      setItems(newItems);
+      setMergeSelectedIds(new Set());
+
+      let summary = n + '장씩 묶어서 총 ' + mergedGroupCount + '개 그룹으로 합쳐졌습니다.';
+      if (leftover) summary += ' 마지막 1장은 짝이 없어 개별 블록으로 남았습니다.';
+      if (staffMissingGroupCount > 0) {
+        summary += ' (' + staffMissingGroupCount + '개 그룹은 일부 이미지의 보표선 간격을 인식하지 못해 크기 보정 없이 합쳐졌습니다 — 결과를 확인해주세요.)';
+      }
+      alert(summary);
+    } catch (err) {
+      console.error(err);
+      alert('일괄 합치기 중 오류가 발생했습니다.');
+    } finally {
+      setBatchMerging(false);
     }
   }
 
@@ -2766,6 +2827,24 @@ function TabScoreBuilder() {
         <button onClick={handleReset} disabled={items.length === 0 && !title}>초기화</button>
         {saveMsg && <span className="save-msg">{saveMsg}</span>}
       </div>
+
+      {items.length >= 2 && (
+        <div className="toolbar">
+          <span className="slider-label" style={{ margin: 0 }}>이미지</span>
+          <input type="number" min="2" max={Math.max(2, items.length)} step="1" value={batchGroupSize}
+            style={{ width: '60px', border: '1px solid var(--border-strong)', borderRadius: '8px', padding: '5px 6px', fontSize: '13px' }}
+            onChange={e => setBatchGroupSize(Math.max(2, Number(e.target.value) || 2))} />
+          <span className="slider-label" style={{ margin: 0 }}>장씩 순서대로 일괄 합치기</span>
+          <span className="slider-label" style={{ margin: 0 }}>· 조각 사이 간격</span>
+          <input type="number" min={MERGE_GAP_MIN_PCT} max={MERGE_GAP_MAX_PCT} step="0.5" value={mergeGapPct}
+            style={{ width: '60px', border: '1px solid var(--border-strong)', borderRadius: '8px', padding: '5px 6px', fontSize: '13px' }}
+            onChange={e => setMergeGapPct(Math.min(MERGE_GAP_MAX_PCT, Math.max(MERGE_GAP_MIN_PCT, Number(e.target.value) || 0)))} />
+          <span className="slider-label" style={{ margin: 0 }}>%</span>
+          <button className="icon-btn" onClick={handleBatchMerge} disabled={batchMerging || merging}>
+            {batchMerging ? '일괄 합치는 중...' : '일괄 합치기 실행'}
+          </button>
+        </div>
+      )}
 
       {savedList.length > 0 && (
         <div className="saved-list">
