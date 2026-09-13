@@ -1253,6 +1253,10 @@ async function buildScoreLayout(items, title, targetW, opts) {
   const lyricFontPx = Math.max(8, Math.round((opts.lyricFontSize || 26) * scale));
   const lyricFont = lyricFontPx + 'px Georgia, "Noto Serif KR", serif';
   const lyricLineH = Math.round(lyricFontPx * 1.3);
+  // Scales with resolution the same way lyricFontPx does, so letter-spacing stays visually
+  // proportional at any export size instead of looking wider/narrower relative to the text at
+  // different resolutions.
+  const lyricLetterSpacingPx = (opts.lyricLetterSpacing || 0) * scale;
   const defaultLyricRatio = (opts.lyricAreaHeight != null ? opts.lyricAreaHeight : 90) / (opts.referenceWidth || 780);
 
   const processed = rawProcessed.map(({ item: it, canvas: off }) => {
@@ -1267,7 +1271,23 @@ async function buildScoreLayout(items, title, targetW, opts) {
   for (const p of processed) totalH += p.groupH + gapAfterImage;
   totalH += PAD;
 
-  return { W, PAD, titleH, gapAfterImage, titleFont, titleFontPx, lyricFont, lyricFontPx, lyricLineH, processed, totalH: Math.max(Math.round(totalH), titleH + PAD * 2) };
+  return {
+    W, PAD, titleH, gapAfterImage, titleFont, titleFontPx, lyricFont, lyricFontPx, lyricLineH,
+    lyricLetterSpacingPx, processed, totalH: Math.max(Math.round(totalH), titleH + PAD * 2),
+  };
+}
+
+// Canvas fillText has no letter-spacing support portable across browsers, so a nonzero spacing draws
+// the string one character at a time, advancing by each glyph's measured width plus the spacing —
+// zero spacing falls back to a single fillText call, identical to the previous behavior/positioning.
+// Only textAlign 'left' is needed here (lyric tags are always left-aligned), so that's all this supports.
+function fillTextWithSpacing(ctx, text, x, y, spacing) {
+  if (!spacing) { ctx.fillText(text, x, y); return; }
+  let cx = x;
+  for (const ch of text) {
+    ctx.fillText(ch, cx, y);
+    cx += ctx.measureText(ch).width + spacing;
+  }
 }
 
 function drawScoreTitleCustom(ctx, W, title, titleFont, titleH, y) {
@@ -1298,6 +1318,7 @@ function drawScoreItem(ctx, W, p, y, layout, scale) {
     const lyricFontPx = Math.max(8, Math.round(layout.lyricFontPx * scale));
     const lyricFont = lyricFontPx + 'px Georgia, "Noto Serif KR", serif';
     const lyricLineH = Math.round(layout.lyricLineH * scale);
+    const lyricLetterSpacingPx = layout.lyricLetterSpacingPx * scale;
     const laneH = Math.round(p.laneH * scale);
     ctx.font = lyricFont;
     ctx.fillStyle = '#1a1a1a';
@@ -1306,7 +1327,7 @@ function drawScoreItem(ctx, W, p, y, layout, scale) {
       const tx = Math.min(W - 4, Math.max(4, (t.xPct / 100) * W));
       const half = lyricLineH / 2;
       const cy = y + Math.min(laneH - half, Math.max(half, (t.yPct / 100) * laneH));
-      ctx.fillText(t.text, tx, cy);
+      fillTextWithSpacing(ctx, t.text, tx, cy, lyricLetterSpacingPx);
     }
     ctx.textBaseline = 'alphabetic';
     y += laneH;
@@ -1533,7 +1554,7 @@ async function exportPagesAsZip(canvases, title, format) {
   URL.revokeObjectURL(url);
 }
 
-const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults, lyricFontSize, defaultLyricAreaHeight, onChange, onDelete, onMove }) {
+const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults, lyricFontSize, lyricLetterSpacing, defaultLyricAreaHeight, onChange, onDelete, onMove }) {
   const canvasRef = useRef(null);
   const imgRef = useRef(null);
   const laneRef = useRef(null);
@@ -1743,7 +1764,8 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     if (!measureCtxRef.current) measureCtxRef.current = document.createElement('canvas').getContext('2d');
     const mctx = measureCtxRef.current;
     mctx.font = lyricFontSize + 'px Georgia, "Noto Serif KR", serif';
-    const w = mctx.measureText(text || ' ').width;
+    const t = text || ' ';
+    const w = mctx.measureText(t).width + lyricLetterSpacing * Math.max(0, t.length - 1);
     el.style.width = Math.max(20, w + 12) + 'px';
   }
 
@@ -1892,7 +1914,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
               <div className="lane-empty">"+ 가사 추가"로 가사를 추가한 뒤 원하는 위치로 끌어서 놓으세요.</div>
             )}
             {tags.map(t => (
-              <div className="lyric-tag" key={t.id} style={{ left: t.xPct + '%', top: t.yPct + '%', fontSize: lyricFontSize + 'px' }}>
+              <div className="lyric-tag" key={t.id} style={{ left: t.xPct + '%', top: t.yPct + '%', fontSize: lyricFontSize + 'px', letterSpacing: lyricLetterSpacing + 'px' }}>
                 <span className="tag-handle" onPointerDown={e => startDrag(e, t.id)}>⠿</span>
                 <div className="lyric-tag-row">
                   <input
@@ -1938,7 +1960,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
 });
 
 
-function GlobalSettings({ defaults, setDefaults, titleFontSize, setTitleFontSize, lyricFontSize, setLyricFontSize, onApplyAll, onApplyLyricAreaHeight, hasItems }) {
+function GlobalSettings({ defaults, setDefaults, titleFontSize, setTitleFontSize, lyricFontSize, setLyricFontSize, lyricLetterSpacing, setLyricLetterSpacing, onApplyAll, onApplyLyricAreaHeight, hasItems }) {
   const [open, setOpen] = useState(true);
   function update(patch) { setDefaults(prev => ({ ...prev, ...patch })); }
 
@@ -2037,6 +2059,18 @@ function GlobalSettings({ defaults, setDefaults, titleFontSize, setTitleFontSize
           </div>
 
           <div>
+            <div className="slider-label">가사 자간 ({lyricLetterSpacing}px) — 음수면 좁게, 양수면 넓게</div>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <input type="range" min="-2" max="6" step="0.5" value={lyricLetterSpacing}
+                style={{ flex: 1 }}
+                onChange={e => setLyricLetterSpacing(Number(e.target.value))} />
+              <input type="number" min="-2" max="6" step="0.5" value={lyricLetterSpacing}
+                style={{ width: '70px', border: '1px solid var(--border-strong)', borderRadius: '8px', padding: '5px 6px', fontSize: '13px' }}
+                onChange={e => setLyricLetterSpacing(Number(e.target.value) || 0)} />
+            </div>
+          </div>
+
+          <div>
             <div className="slider-label">가사 입력 영역 기본 높이 ({defaults.lyricAreaHeight}px, 악보 이미지 아래부터 기준)</div>
             <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
               <input type="range" min="20" max="400" step="10" value={defaults.lyricAreaHeight}
@@ -2068,7 +2102,7 @@ function GlobalSettings({ defaults, setDefaults, titleFontSize, setTitleFontSize
   );
 }
 
-function FloatingPreview({ title, items, titleFontSize, referenceWidth, imageGap, lyricFontSize, lyricAreaHeight, defaults }) {
+function FloatingPreview({ title, items, titleFontSize, referenceWidth, imageGap, lyricFontSize, lyricLetterSpacing, lyricAreaHeight, defaults }) {
   const [previewSrc, setPreviewSrc] = useState(null);
   const [busy, setBusy] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
@@ -2080,7 +2114,7 @@ function FloatingPreview({ title, items, titleFontSize, referenceWidth, imageGap
     setBusy(true);
     const timer = setTimeout(async () => {
       try {
-        const canvas = await composeScore(items, title, 800, { titleFontSize, referenceWidth, imageGap, lyricFontSize, lyricAreaHeight, defaults });
+        const canvas = await composeScore(items, title, 800, { titleFontSize, referenceWidth, imageGap, lyricFontSize, lyricLetterSpacing, lyricAreaHeight, defaults });
         if (cancelled) return;
         setPreviewSrc(canvas.toDataURL('image/png'));
       } finally {
@@ -2088,7 +2122,7 @@ function FloatingPreview({ title, items, titleFontSize, referenceWidth, imageGap
       }
     }, 450);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [title, items, titleFontSize, referenceWidth, imageGap, lyricFontSize, lyricAreaHeight, defaults]);
+  }, [title, items, titleFontSize, referenceWidth, imageGap, lyricFontSize, lyricLetterSpacing, lyricAreaHeight, defaults]);
 
   if (items.length === 0) return null;
 
@@ -2249,6 +2283,7 @@ function TabScoreBuilder() {
   const [defaults, setDefaults] = useState(DEFAULTS_INIT);
   const [titleFontSize, setTitleFontSize] = useState(44);
   const [lyricFontSize, setLyricFontSize] = useState(26);
+  const [lyricLetterSpacing, setLyricLetterSpacing] = useState(0);
   const [exporting, setExporting] = useState(false);
   const [pagedFormat, setPagedFormat] = useState('pdf');
   const [pagedExporting, setPagedExporting] = useState(false);
@@ -2283,6 +2318,7 @@ function TabScoreBuilder() {
           if (draft.defaults) setDefaults({ ...DEFAULTS_INIT, ...draft.defaults });
           if (draft.titleFontSize) setTitleFontSize(draft.titleFontSize);
           if (draft.lyricFontSize) setLyricFontSize(draft.lyricFontSize);
+          if (draft.lyricLetterSpacing) setLyricLetterSpacing(draft.lyricLetterSpacing);
         }
         const keys = await dbAllKeys();
         setSavedList(keys.filter(k => k !== DRAFT_KEY));
@@ -2296,10 +2332,10 @@ function TabScoreBuilder() {
   useEffect(() => {
     if (!loaded) return;
     const t = setTimeout(() => {
-      dbPut(DRAFT_KEY, { title, items, defaults, titleFontSize, lyricFontSize }).catch(() => {});
+      dbPut(DRAFT_KEY, { title, items, defaults, titleFontSize, lyricFontSize, lyricLetterSpacing }).catch(() => {});
     }, 800);
     return () => clearTimeout(t);
-  }, [title, items, defaults, titleFontSize, lyricFontSize, loaded]);
+  }, [title, items, defaults, titleFontSize, lyricFontSize, lyricLetterSpacing, loaded]);
 
   function handleFiles(e) {
     const files = Array.from(e.target.files || []);
@@ -2375,7 +2411,7 @@ function TabScoreBuilder() {
       // wider than that — which real screenshots/scans commonly are. Capped by EXPORT_MAX_WIDTH.
       const canvas = await composeScore(items, title, 'auto', {
         titleFontSize, referenceWidth: getReferenceWidth(), imageGap: defaults.imageGap,
-        lyricFontSize, lyricAreaHeight: defaults.lyricAreaHeight, defaults,
+        lyricFontSize, lyricLetterSpacing, lyricAreaHeight: defaults.lyricAreaHeight, defaults,
       });
       canvas.toBlob(blob => {
         const url = URL.createObjectURL(blob);
@@ -2398,7 +2434,7 @@ function TabScoreBuilder() {
     try {
       const { canvases, overflowCount } = await composeScorePages(items, title, {
         titleFontSize, referenceWidth: getReferenceWidth(), imageGap: defaults.imageGap,
-        lyricFontSize, lyricAreaHeight: defaults.lyricAreaHeight, defaults,
+        lyricFontSize, lyricLetterSpacing, lyricAreaHeight: defaults.lyricAreaHeight, defaults,
       });
       if (pagedFormat === 'pdf') {
         await exportPagesAsPdf(canvases, title);
@@ -2420,7 +2456,7 @@ function TabScoreBuilder() {
     const name = title.trim();
     if (!name) { alert('저장하려면 먼저 제목을 입력해주세요.'); return; }
     try {
-      await dbPut(name, { title, items, defaults, titleFontSize, lyricFontSize });
+      await dbPut(name, { title, items, defaults, titleFontSize, lyricFontSize, lyricLetterSpacing });
       const keys = await dbAllKeys();
       setSavedList(keys.filter(k => k !== DRAFT_KEY));
       setSaveMsg('"' + name + '" 저장됨');
@@ -2439,6 +2475,7 @@ function TabScoreBuilder() {
         if (data.defaults) setDefaults({ ...DEFAULTS_INIT, ...data.defaults });
         if (data.titleFontSize) setTitleFontSize(data.titleFontSize);
         if (data.lyricFontSize) setLyricFontSize(data.lyricFontSize);
+        if (data.lyricLetterSpacing) setLyricLetterSpacing(data.lyricLetterSpacing);
       }
     } catch (e) {}
   }
@@ -2484,6 +2521,8 @@ function TabScoreBuilder() {
         setTitleFontSize={setTitleFontSize}
         lyricFontSize={lyricFontSize}
         setLyricFontSize={setLyricFontSize}
+        lyricLetterSpacing={lyricLetterSpacing}
+        setLyricLetterSpacing={setLyricLetterSpacing}
         onApplyAll={applyDefaultsToAll}
         onApplyLyricAreaHeight={applyLyricAreaHeightToAll}
         hasItems={items.length > 0}
@@ -2533,6 +2572,7 @@ function TabScoreBuilder() {
           <ImageBlock key={item.id} item={item} index={idx} total={items.length}
             defaults={defaults}
             lyricFontSize={lyricFontSize}
+            lyricLetterSpacing={lyricLetterSpacing}
             defaultLyricAreaHeight={defaults.lyricAreaHeight}
             onChange={next => updateItem(item.id, next)}
             onDelete={() => deleteItem(item.id)}
@@ -2542,7 +2582,8 @@ function TabScoreBuilder() {
 
       <FloatingPreview title={title} items={items} titleFontSize={titleFontSize}
         referenceWidth={getReferenceWidth()} imageGap={defaults.imageGap}
-        lyricFontSize={lyricFontSize} lyricAreaHeight={defaults.lyricAreaHeight} defaults={defaults} />
+        lyricFontSize={lyricFontSize} lyricLetterSpacing={lyricLetterSpacing}
+        lyricAreaHeight={defaults.lyricAreaHeight} defaults={defaults} />
 
       {showStitchModal && (
         <StitchUploadModal defaults={defaults} onComplete={handleStitchComplete} onClose={() => setShowStitchModal(false)} />
