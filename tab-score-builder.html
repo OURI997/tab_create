@@ -1339,6 +1339,21 @@ async function mergeImagesIntoRow(sourceItems, defaults, gapPct) {
   };
 }
 
+// Cap on how far a too-short trailing batch-merge row may be blown up to match the other rows'
+// average width (requirement: don't let text/bars grow unnaturally large just to hit that average).
+const MERGE_LAST_ROW_MAX_SCALE = 2;
+
+// Uniformly scales a canvas (both dimensions by the same factor, so aspect ratio — and every lyric
+// tag's %-based position — is unaffected) and returns a new canvas at that size.
+function scaleCanvasUniform(canvas, scale) {
+  const w = Math.max(1, Math.round(canvas.width * scale));
+  const h = Math.max(1, Math.round(canvas.height * scale));
+  const out = document.createElement('canvas');
+  out.width = w; out.height = h;
+  out.getContext('2d').drawImage(canvas, 0, 0, w, h);
+  return out;
+}
+
 // Safety cap for 'auto'-width export: without one, stitching several very large originals could
 // produce a canvas wide/tall enough to freeze the browser or take a very long time to render/encode.
 const EXPORT_MAX_WIDTH = 4500;
@@ -1680,7 +1695,7 @@ async function exportPagesAsZip(canvases, title, format) {
   URL.revokeObjectURL(url);
 }
 
-const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults, lyricFontSize, lyricLetterSpacing, defaultLyricAreaHeight, onChange, onDelete, onMove, mergeSelected, onToggleMergeSelect, batchExcluded, onToggleBatchExclude }) {
+const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults, lyricFontSize, lyricLetterSpacing, defaultLyricAreaHeight, onChange, onDelete, onMove, mergeSelected, onToggleMergeSelect }) {
   const canvasRef = useRef(null);
   const imgRef = useRef(null);
   const laneRef = useRef(null);
@@ -1693,6 +1708,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   const [barEditOpen, setBarEditOpen] = useState(!!item.stitchMeta);
   const [barsPerRowInput, setBarsPerRowInput] = useState((item.barLayout && item.barLayout.barsPerRow) || '');
   const [barLayoutBusy, setBarLayoutBusy] = useState(false);
+  const [processedSrc, setProcessedSrc] = useState(null);
 
   const eff = effectiveImageSettings(item, defaults);
   const resolvedItemSrc = resolvedSrc(item);
@@ -1718,6 +1734,11 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     if (!imgRef.current || !canvasRef.current) return;
     const result = drawProcessed(canvasRef.current, imgRef.current, effectiveImageSettings(item, defaults));
     setPlayheadRuns((result && result.playheadRuns) || []);
+    // The lyric-placement background strip below should show the same PROCESSED (background-removed/
+    // cropped/despeckled) image the TAB preview above shows — not the raw upload — so lyric positions
+    // are set against what will actually be exported, not an image whose cropped/removed regions won't
+    // even be there in the final result.
+    setProcessedSrc(canvasRef.current.toDataURL('image/png'));
   }
 
   function updateOverride(patch) {
@@ -1902,10 +1923,6 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
           <input type="checkbox" checked={mergeSelected} onChange={onToggleMergeSelect} />
           합치기 선택
         </label>
-        <label className="merge-select-label" title="이 이미지는 'N장씩 일괄 합치기' 실행 시 그룹 묶기에서 제외되고, 원래 자리에 그대로 남습니다.">
-          <input type="checkbox" checked={batchExcluded} onChange={onToggleBatchExclude} />
-          일괄 합치기 제외
-        </label>
         <span>TAB 이미지 {index + 1}</span>
         <div className="block-actions">
           <button className="icon-btn" onClick={() => onMove(-1)} disabled={index === 0}>위</button>
@@ -2040,8 +2057,8 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
           <button className="icon-btn" onClick={addTag}>+ 가사 추가</button>
         </div>
         <div className="lane-wrap">
-          {refStripHeight > 0 && (
-            <div className="lane-ref-strip-standalone" style={{ height: refStripHeight + 'px', backgroundImage: 'url(' + item.src + ')' }} />
+          {refStripHeight > 0 && processedSrc && (
+            <div className="lane-ref-strip-standalone" style={{ height: refStripHeight + 'px', backgroundImage: 'url(' + processedSrc + ')' }} />
           )}
           <div className={refStripHeight > 0 ? 'lyric-lane' : 'lyric-lane no-ref'} ref={laneRef} style={{ height: laneHeight + 'px' }}>
             {tags.length === 0 && (
@@ -2433,7 +2450,11 @@ function TabScoreBuilder() {
   const [mergePreviewBusy, setMergePreviewBusy] = useState(false);
   const [batchGroupSize, setBatchGroupSize] = useState(2);
   const [batchMerging, setBatchMerging] = useState(false);
-  const [batchExcludedIds, setBatchExcludedIds] = useState(new Set());
+  const [batchPanelOpen, setBatchPanelOpen] = useState(false);
+  const [batchExcludeStart, setBatchExcludeStart] = useState('');
+  const [batchExcludeEnd, setBatchExcludeEnd] = useState('');
+  const [batchPreviewSrc, setBatchPreviewSrc] = useState(null);
+  const [batchPreviewBusy, setBatchPreviewBusy] = useState(false);
   const fileInputRef = useRef(null);
   const listRef = useRef(null);
   function getReferenceWidth() {
@@ -2523,14 +2544,6 @@ function TabScoreBuilder() {
     });
   }
 
-  function toggleBatchExclude(id) {
-    setBatchExcludedIds(prev => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id); else next.add(id);
-      return next;
-    });
-  }
-
   // Shared by the live preview effect and the final merge, so both always agree on exactly which
   // items are being merged and in what order.
   function getContiguousMergeIndices() {
@@ -2609,72 +2622,125 @@ function TabScoreBuilder() {
     return groups;
   }
 
+  // Resolves the (optional) 1-indexed start/end exclude range against the current item count.
+  // Returns null whenever the range doesn't apply — both fields blank (no exclusion requested) and
+  // an invalid range (out of bounds, end before start, non-numeric) are treated identically as "no
+  // exclusion", so a half-typed or stale range value never silently blocks the whole batch action.
+  function resolveBatchExcludeRange(itemCount, startStr, endStr) {
+    const start = parseInt(startStr, 10);
+    const end = parseInt(endStr, 10);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || start > itemCount) {
+      return null;
+    }
+    return { startIdx: start - 1, endIdx: Math.min(end, itemCount) - 1 };
+  }
+
+  // Splits the full item list into the untouched "before" and "excluded" ranges plus the "after"
+  // range that batch-merge actually groups — shared by the live preview and the real run so they
+  // always agree on exactly which images are in play.
+  function splitBatchTargets(list) {
+    const range = resolveBatchExcludeRange(list.length, batchExcludeStart, batchExcludeEnd);
+    if (!range) return { before: [], excluded: [], after: list, range: null };
+    return {
+      before: list.slice(0, range.startIdx),
+      excluded: list.slice(range.startIdx, range.endIdx + 1),
+      after: list.slice(range.endIdx + 1),
+      range,
+    };
+  }
+
+  // Live preview of just the first 2 images that would actually be grouped, so the gap/overlap
+  // setting can be sanity-checked without waiting on the full (irreversible) batch run.
+  useEffect(() => {
+    let cancelled = false;
+    if (!batchPanelOpen) { setBatchPreviewSrc(null); return; }
+    const { after } = splitBatchTargets(items);
+    if (after.length < 2) { setBatchPreviewSrc(null); return; }
+    setBatchPreviewBusy(true);
+    const timer = setTimeout(async () => {
+      try {
+        const result = await mergeImagesIntoRow(after.slice(0, 2), defaults, mergeGapPct);
+        if (cancelled) return;
+        setBatchPreviewSrc(result.canvas.toDataURL('image/png'));
+      } finally {
+        if (!cancelled) setBatchPreviewBusy(false);
+      }
+    }, 350);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [batchPanelOpen, items, batchExcludeStart, batchExcludeEnd, mergeGapPct, defaults]);
+
   async function handleBatchMerge() {
     const n = Math.max(2, Math.floor(batchGroupSize) || 2);
-    const excludedCount = items.filter(it => batchExcludedIds.has(it.id)).length;
-    const includedItems = items.filter(it => !batchExcludedIds.has(it.id));
-    if (includedItems.length < 2) {
-      alert('일괄 합치기 대상 이미지가 2장 이상 있어야 합니다 (일괄 합치기 제외 표시된 이미지는 대상에서 빠집니다).');
+    const { before, excluded, after } = splitBatchTargets(items);
+    if (after.length < 2) {
+      alert('일괄 합치기 대상 이미지가 2장 이상 있어야 합니다 (제외 범위를 확인해주세요).');
       return;
     }
 
-    // Grouping runs over the non-excluded items only, in their existing order — an excluded item
-    // never breaks up or counts toward a group, it just stays untouched wherever it already is.
-    const groups = chunkForBatchMerge(includedItems, n);
-    const mergeableCount = groups.filter(g => g.length >= 2).length;
-    const leftover = groups.length > 0 && groups[groups.length - 1].length === 1 ? groups[groups.length - 1] : null;
+    const groups = chunkForBatchMerge(after, n);
+    const lastGroup = groups[groups.length - 1];
+    const lastIsPartial = lastGroup.length < n;
 
-    let confirmMsg = '전체 ' + items.length + '장 중 ' + excludedCount + '장은 제외하고, 나머지 ' + includedItems.length + '장을 '
-      + n + '장씩 묶어서 ' + mergeableCount + '개 그룹으로 합칩니다.';
-    if (leftover) confirmMsg += ' (묶이지 않는 마지막 1장은 개별 블록으로 남습니다.)';
+    let confirmMsg = excluded.length > 0
+      ? ((before.length + 1) + '번째~' + (before.length + excluded.length) + '번째 제외, 나머지 ' + after.length + '장을 '
+          + n + '장씩 묶어 ' + groups.length + '개 그룹으로 합칩니다.')
+      : ('전체 ' + after.length + '장을 ' + n + '장씩 묶어 ' + groups.length + '개 그룹으로 합칩니다.');
+    if (lastIsPartial) {
+      confirmMsg += ' (마지막 그룹은 ' + lastGroup.length + '장으로, 다른 줄과 비슷한 폭이 되도록 확대됩니다.)';
+    }
     confirmMsg += ' 합쳐지는 이미지들은 원래 상태로 되돌릴 수 없습니다. 계속할까요?';
     if (!window.confirm(confirmMsg)) return;
 
     setBatchMerging(true);
     try {
-      // Merge every 2+ group first, keyed by the group's FIRST item's id — that id is where the
-      // merged block gets inserted below, so a group's other members can be non-contiguous in the
-      // original list (e.g. an excluded item sitting between two included ones) without breaking
-      // the merge itself; only the group's members are ever moved/removed.
-      const resultByFirstId = new Map();
-      const consumedIds = new Set();
-      let mergedGroupCount = 0;
+      const mergedResults = [];
       let staffMissingGroupCount = 0;
       for (const group of groups) {
-        if (group.length >= 2) {
-          const result = await mergeImagesIntoRow(group, defaults, mergeGapPct);
-          mergedGroupCount++;
-          if (result.anyStaffMissing) staffMissingGroupCount++;
-          resultByFirstId.set(group[0].id, result);
-          for (let i = 1; i < group.length; i++) consumedIds.add(group[i].id);
+        const result = await mergeImagesIntoRow(group, defaults, mergeGapPct);
+        if (result.anyStaffMissing) staffMissingGroupCount++;
+        mergedResults.push(result);
+      }
+
+      // Requirement: a too-short trailing group (1-2 leftover pieces) reads as visually thin/short
+      // next to the other (full-size) rows once composed — scale it up (uniformly, so aspect and
+      // every lyric tag's % position are unaffected) to roughly match the other rows' average width,
+      // capped so it never blows up unnaturally large.
+      if (lastIsPartial) {
+        const fullWidths = groups
+          .map((g, i) => (g.length === n ? mergedResults[i].canvas.width : null))
+          .filter(w => w != null);
+        if (fullWidths.length > 0) {
+          const avgFullWidth = fullWidths.reduce((a, b) => a + b, 0) / fullWidths.length;
+          const lastCanvas = mergedResults[mergedResults.length - 1].canvas;
+          if (avgFullWidth > lastCanvas.width) {
+            const scale = Math.min(avgFullWidth / lastCanvas.width, MERGE_LAST_ROW_MAX_SCALE);
+            if (scale > 1.01) {
+              mergedResults[mergedResults.length - 1] = {
+                ...mergedResults[mergedResults.length - 1],
+                canvas: scaleCanvasUniform(lastCanvas, scale),
+              };
+            }
+          }
         }
       }
 
-      let mergedIdx = 0;
-      const newItems = [];
-      for (const item of items) {
-        if (consumedIds.has(item.id)) continue; // absorbed into a merged block emitted below
-        const result = resultByFirstId.get(item.id);
-        if (result) {
-          mergedIdx++;
-          newItems.push({
-            id: Date.now() + '_' + Math.random().toString(36).slice(2) + '_' + mergedIdx,
-            type: 'image', src: result.canvas.toDataURL('image/png'),
-            invert: false, override: { ...MERGED_ROW_NEUTRAL_OVERRIDE },
-            lyrics: result.lyrics,
-            playheadExcluded: [], barLayout: null, stitchMeta: null,
-          });
-        } else {
-          newItems.push(item); // excluded item, or an unmerged leftover single — untouched
-        }
-      }
-      setItems(newItems);
+      const newBlocks = mergedResults.map((result, i) => ({
+        id: Date.now() + '_' + Math.random().toString(36).slice(2) + '_' + i,
+        type: 'image', src: result.canvas.toDataURL('image/png'),
+        invert: false, override: { ...MERGED_ROW_NEUTRAL_OVERRIDE },
+        lyrics: result.lyrics,
+        playheadExcluded: [], barLayout: null, stitchMeta: null,
+      }));
+
+      setItems([...before, ...excluded, ...newBlocks]);
       setMergeSelectedIds(new Set());
+      setBatchPanelOpen(false);
+      setBatchExcludeStart('');
+      setBatchExcludeEnd('');
 
-      let summary = excludedCount > 0
-        ? (excludedCount + '장 제외, 나머지 ' + includedItems.length + '장을 ' + n + '장씩 묶어서 총 ' + mergedGroupCount + '개 그룹으로 합쳐졌습니다.')
-        : (n + '장씩 묶어서 총 ' + mergedGroupCount + '개 그룹으로 합쳐졌습니다.');
-      if (leftover) summary += ' 묶이지 않은 마지막 1장은 개별 블록으로 남았습니다.';
+      let summary = excluded.length > 0
+        ? (excluded.length + '장 제외, 나머지 ' + after.length + '장을 ' + n + '장씩 묶어 총 ' + groups.length + '개 그룹으로 합쳐졌습니다.')
+        : (n + '장씩 묶어 총 ' + groups.length + '개 그룹으로 합쳐졌습니다.');
       if (staffMissingGroupCount > 0) {
         summary += ' (' + staffMissingGroupCount + '개 그룹은 일부 이미지의 보표선 간격을 인식하지 못해 크기 보정 없이 합쳐졌습니다 — 결과를 확인해주세요.)';
       }
@@ -2705,12 +2771,6 @@ function TabScoreBuilder() {
   function deleteItem(id) {
     setItems(prev => prev.filter(it => it.id !== id));
     setMergeSelectedIds(prev => {
-      if (!prev.has(id)) return prev;
-      const next = new Set(prev);
-      next.delete(id);
-      return next;
-    });
-    setBatchExcludedIds(prev => {
       if (!prev.has(id)) return prev;
       const next = new Set(prev);
       next.delete(id);
@@ -2874,23 +2934,57 @@ function TabScoreBuilder() {
         {saveMsg && <span className="save-msg">{saveMsg}</span>}
       </div>
 
-      {items.length >= 2 && (
+      {items.length >= 2 && !batchPanelOpen && (
         <div className="toolbar">
-          <span className="slider-label" style={{ margin: 0 }}>이미지</span>
-          <input type="number" min="2" max={Math.max(2, items.length)} step="1" value={batchGroupSize}
-            style={{ width: '60px', border: '1px solid var(--border-strong)', borderRadius: '8px', padding: '5px 6px', fontSize: '13px' }}
-            onChange={e => setBatchGroupSize(Math.max(2, Number(e.target.value) || 2))} />
-          <span className="slider-label" style={{ margin: 0 }}>장씩 순서대로 일괄 합치기</span>
-          <span className="slider-label" style={{ margin: 0 }}>· 조각 사이 간격</span>
-          <input type="number" min={MERGE_GAP_MIN_PCT} max={MERGE_GAP_MAX_PCT} step="0.5" value={mergeGapPct}
-            style={{ width: '60px', border: '1px solid var(--border-strong)', borderRadius: '8px', padding: '5px 6px', fontSize: '13px' }}
-            onChange={e => setMergeGapPct(Math.min(MERGE_GAP_MAX_PCT, Math.max(MERGE_GAP_MIN_PCT, Number(e.target.value) || 0)))} />
-          <span className="slider-label" style={{ margin: 0 }}>%</span>
-          <button className="icon-btn" onClick={handleBatchMerge} disabled={batchMerging || merging}>
-            {batchMerging ? '일괄 합치는 중...' : '일괄 합치기 실행'}
-          </button>
-          {batchExcludedIds.size > 0 && (
-            <span className="save-msg">{batchExcludedIds.size}장 제외됨 (각 이미지의 "일괄 합치기 제외" 표시)</span>
+          <button className="icon-btn" onClick={() => setBatchPanelOpen(true)}>일괄 합치기</button>
+        </div>
+      )}
+
+      {items.length >= 2 && batchPanelOpen && (
+        <div className="merge-panel">
+          <div className="toolbar merge-toolbar">
+            <span className="slider-label" style={{ margin: 0 }}>이미지</span>
+            <input type="number" min="2" max={Math.max(2, items.length)} step="1" value={batchGroupSize}
+              style={{ width: '60px', border: '1px solid var(--border-strong)', borderRadius: '8px', padding: '5px 6px', fontSize: '13px' }}
+              onChange={e => setBatchGroupSize(Math.max(2, Number(e.target.value) || 2))} />
+            <span className="slider-label" style={{ margin: 0 }}>장씩 순서대로 일괄 합치기</span>
+            <button onClick={handleBatchMerge} disabled={batchMerging || merging}>
+              {batchMerging ? '일괄 합치는 중...' : '일괄 합치기 진행'}
+            </button>
+            <button className="icon-btn" onClick={() => setBatchPanelOpen(false)} disabled={batchMerging}>접기</button>
+          </div>
+
+          <div className="toolbar">
+            <span className="slider-label" style={{ margin: 0 }}>제외할 범위 (선택)</span>
+            <input type="number" min="1" max={items.length} placeholder="시작" value={batchExcludeStart}
+              style={{ width: '64px', border: '1px solid var(--border-strong)', borderRadius: '8px', padding: '5px 6px', fontSize: '13px' }}
+              onChange={e => setBatchExcludeStart(e.target.value)} />
+            <span className="slider-label" style={{ margin: 0 }}>번째 ~</span>
+            <input type="number" min="1" max={items.length} placeholder="끝" value={batchExcludeEnd}
+              style={{ width: '64px', border: '1px solid var(--border-strong)', borderRadius: '8px', padding: '5px 6px', fontSize: '13px' }}
+              onChange={e => setBatchExcludeEnd(e.target.value)} />
+            <span className="slider-label" style={{ margin: 0 }}>번째 (비워두면 전체가 대상)</span>
+          </div>
+
+          <div>
+            <div className="slider-label">조각 사이 간격 ({mergeGapPct}%, 각 조각 폭 기준 — 음수면 겹쳐서 이어붙임)</div>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <input type="range" min={MERGE_GAP_MIN_PCT} max={MERGE_GAP_MAX_PCT} step="0.5" value={mergeGapPct}
+                style={{ flex: 1 }}
+                onChange={e => setMergeGapPct(Number(e.target.value))} />
+              <input type="number" min={MERGE_GAP_MIN_PCT} max={MERGE_GAP_MAX_PCT} step="0.5" value={mergeGapPct}
+                style={{ width: '70px', border: '1px solid var(--border-strong)', borderRadius: '8px', padding: '5px 6px', fontSize: '13px' }}
+                onChange={e => setMergeGapPct(Math.min(MERGE_GAP_MAX_PCT, Math.max(MERGE_GAP_MIN_PCT, Number(e.target.value) || 0)))} />
+            </div>
+          </div>
+
+          {(batchPreviewSrc || batchPreviewBusy) && (
+            <div className="merge-preview">
+              <div className="lyric-head-mini">
+                <span>대상 앞 2장 미리보기{batchPreviewBusy ? ' (갱신 중...)' : ''} — 겹치는 부분에 마디 내용이 가려지지 않는지 확인하세요</span>
+              </div>
+              {batchPreviewSrc && <img src={batchPreviewSrc} alt="일괄 합치기 미리보기" className="merge-preview-img" />}
+            </div>
           )}
         </div>
       )}
@@ -2958,9 +3052,7 @@ function TabScoreBuilder() {
             onDelete={() => deleteItem(item.id)}
             onMove={dir => moveItem(item.id, dir)}
             mergeSelected={mergeSelectedIds.has(item.id)}
-            onToggleMergeSelect={() => toggleMergeSelect(item.id)}
-            batchExcluded={batchExcludedIds.has(item.id)}
-            onToggleBatchExclude={() => toggleBatchExclude(item.id)} />
+            onToggleMergeSelect={() => toggleMergeSelect(item.id)} />
         ))}
       </div>
 
