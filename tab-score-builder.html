@@ -56,8 +56,9 @@
     border:1px dashed var(--border-strong);border-radius:12px;line-height:1.6;
   }
   .block{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;}
-  .block-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-size:13px;color:var(--text2);}
+  .block-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-size:13px;color:var(--text2);gap:10px;}
   .block-actions{display:flex;gap:6px;}
+  .merge-select-label{display:flex;align-items:center;gap:5px;white-space:nowrap;cursor:pointer;}
   canvas.preview{width:100%;display:block;background:#fff;border:1px solid var(--border);border-radius:8px;}
   .adv-toggle-row{display:flex;justify-content:space-between;align-items:center;font-size:12.5px;color:var(--text2);gap:8px;}
   .lyric-section{margin-top:14px;border-top:1px solid var(--border);padding-top:12px;}
@@ -1213,6 +1214,102 @@ function effectiveImageSettings(item, defaults) {
   };
 }
 
+// ---- merge already-processed images into one side-by-side row ----
+// Unlike stitchImages (which finds an OVERLAP between raw captures of the same content and trims the
+// duplicate), this takes items that are already fully processed (background removed, cropped, etc. —
+// each already rendered once via drawProcessed) and whose content does NOT overlap at all (different
+// bars), and simply places them next to each other to build one multi-bar row out of several
+// narrow single/two-bar captures. No overlap search of any kind is used here.
+
+// A neutral per-item override: crop 0 on all sides, every cleanup step off. Applied to the merged
+// result so it is never reprocessed — the merge draws from each source's ALREADY-drawProcessed pixels,
+// so re-running background removal/despeckle on top (e.g. via inherited global defaults) could alter
+// pixels the user already dialed in per-source-image, or double-threshold an already-binary image.
+const MERGED_ROW_NEUTRAL_OVERRIDE = {
+  removeBg: false, invert: false, threshold: 140, softness: 0,
+  despeckle: false, despeckleSize: 0,
+  playheadRemove: false, playheadColor: null,
+  cropTop: 0, cropBottom: 0, cropLeft: 0, cropRight: 0,
+};
+
+// Merges `sourceItems` (already in the order they should appear left-to-right) into one canvas plus
+// a remapped lyric-tag list. Each source's staff-line spacing (detectStaffBand) is measured on its own
+// drawProcessed output; every image is uniformly scaled (never stretched) to match the spacing of the
+// first source where a staff was actually detected, and then vertically shifted so the staffs line up
+// — otherwise two captures at slightly different zoom/DPI would merge into a row with jagged staff
+// lines. Returns null-safe metadata (`anyStaffMissing`) so the caller can warn without failing.
+async function mergeImagesIntoRow(sourceItems, defaults) {
+  const processed = [];
+  for (const it of sourceItems) {
+    const img = await loadImage(resolvedSrc(it));
+    const canvas = document.createElement('canvas');
+    drawProcessed(canvas, img, effectiveImageSettings(it, defaults));
+    const imageData = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height);
+    const staff = detectStaffBand(imageData, canvas.width, canvas.height);
+    processed.push({ item: it, canvas, staff });
+  }
+
+  const ref = processed.find(p => p.staff);
+  const refSpacing = ref ? (ref.staff.staffBottom - ref.staff.staffTop) / 5 : null;
+
+  const scaled = processed.map(p => {
+    let scale = 1;
+    if (refSpacing && p.staff) {
+      const spacing = (p.staff.staffBottom - p.staff.staffTop) / 5;
+      if (spacing > 0) scale = refSpacing / spacing;
+    }
+    const w = Math.max(1, Math.round(p.canvas.width * scale));
+    const h = Math.max(1, Math.round(p.canvas.height * scale));
+    const staffTopScaled = p.staff ? p.staff.staffTop * scale : null;
+    return { item: p.item, canvas: p.canvas, w, h, staffTopScaled };
+  });
+
+  // Shift each image down so every (scaled) staff top lands on the same y — images with no detected
+  // staff are simply top-aligned (offsetY 0), since there's nothing to align them to.
+  const knownTops = scaled.map(s => s.staffTopScaled).filter(v => v != null);
+  const refTop = knownTops.length ? Math.max(...knownTops) : 0;
+  const withOffsets = scaled.map(s => ({
+    ...s, offsetY: s.staffTopScaled != null ? Math.round(refTop - s.staffTopScaled) : 0,
+  }));
+
+  const totalW = withOffsets.reduce((sum, s) => sum + s.w, 0);
+  const totalH = Math.max(...withOffsets.map(s => s.offsetY + s.h));
+
+  const out = document.createElement('canvas');
+  out.width = Math.max(1, totalW);
+  out.height = Math.max(1, totalH);
+  const ctx = out.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, out.width, out.height);
+
+  let x = 0;
+  const mergedTags = [];
+  for (const s of withOffsets) {
+    ctx.drawImage(s.canvas, 0, 0, s.canvas.width, s.canvas.height, x, s.offsetY, s.w, s.h);
+    // Lyric tag xPct is "% across this item's own image width" — remap through this item's pixel
+    // position within the merged canvas. yPct is "% down the lyric lane" (a UI concept shared by
+    // whichever single item owns the lane), not tied to image width, so it carries over unchanged.
+    const tags = (s.item.lyrics && s.item.lyrics.tags) || [];
+    for (const t of tags) {
+      const localXPx = (t.xPct / 100) * s.w;
+      const globalXPct = ((x + localXPx) / totalW) * 100;
+      mergedTags.push({ ...t, id: Date.now() + '_' + Math.random().toString(36).slice(2), xPct: globalXPct });
+    }
+    x += s.w;
+  }
+
+  const areaHeightRatios = sourceItems
+    .map(it => (it.lyrics && it.lyrics.areaHeightRatio) || 0)
+    .filter(v => v > 0);
+  const areaHeightRatio = areaHeightRatios.length ? Math.max(...areaHeightRatios) : null;
+
+  return {
+    canvas: out,
+    lyrics: { tags: mergedTags, areaHeightRatio },
+    anyStaffMissing: processed.some(p => !p.staff),
+  };
+}
+
 // Safety cap for 'auto'-width export: without one, stitching several very large originals could
 // produce a canvas wide/tall enough to freeze the browser or take a very long time to render/encode.
 const EXPORT_MAX_WIDTH = 4500;
@@ -1554,7 +1651,7 @@ async function exportPagesAsZip(canvases, title, format) {
   URL.revokeObjectURL(url);
 }
 
-const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults, lyricFontSize, lyricLetterSpacing, defaultLyricAreaHeight, onChange, onDelete, onMove }) {
+const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults, lyricFontSize, lyricLetterSpacing, defaultLyricAreaHeight, onChange, onDelete, onMove, mergeSelected, onToggleMergeSelect }) {
   const canvasRef = useRef(null);
   const imgRef = useRef(null);
   const laneRef = useRef(null);
@@ -1772,6 +1869,10 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   return (
     <div className="block">
       <div className="block-head">
+        <label className="merge-select-label">
+          <input type="checkbox" checked={mergeSelected} onChange={onToggleMergeSelect} />
+          합치기 선택
+        </label>
         <span>TAB 이미지 {index + 1}</span>
         <div className="block-actions">
           <button className="icon-btn" onClick={() => onMove(-1)} disabled={index === 0}>위</button>
@@ -2292,6 +2393,8 @@ function TabScoreBuilder() {
   const [saveMsg, setSaveMsg] = useState('');
   const [noticeDismissed, setNoticeDismissed] = useState(true);
   const [showStitchModal, setShowStitchModal] = useState(false);
+  const [mergeSelectedIds, setMergeSelectedIds] = useState(new Set());
+  const [merging, setMerging] = useState(false);
   const fileInputRef = useRef(null);
   const listRef = useRef(null);
   function getReferenceWidth() {
@@ -2373,6 +2476,55 @@ function TabScoreBuilder() {
     setShowStitchModal(false);
   }
 
+  function toggleMergeSelect(id) {
+    setMergeSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  async function handleMergeSelected() {
+    const indices = items
+      .map((it, idx) => (mergeSelectedIds.has(it.id) ? idx : -1))
+      .filter(idx => idx !== -1);
+    if (indices.length < 2) { alert('합칠 이미지를 2개 이상 선택해주세요.'); return; }
+    const isContiguous = indices.every((idx, i) => i === 0 || idx === indices[i - 1] + 1);
+    if (!isContiguous) {
+      alert('선택한 이미지들이 목록에서 서로 떨어져 있습니다. 합치려면 연속된(붙어 있는) 이미지들만 선택해주세요.');
+      return;
+    }
+    if (!window.confirm(indices.length + '개의 이미지를 하나의 줄로 합칩니다. 원래 이미지들은 사라지고 되돌릴 수 없습니다. 계속할까요?')) return;
+
+    setMerging(true);
+    try {
+      const startIdx = indices[0];
+      const sourceItems = indices.map(idx => items[idx]);
+      const result = await mergeImagesIntoRow(sourceItems, defaults);
+      const newItem = {
+        id: Date.now() + '_' + Math.random().toString(36).slice(2),
+        type: 'image', src: result.canvas.toDataURL('image/png'),
+        invert: false, override: { ...MERGED_ROW_NEUTRAL_OVERRIDE },
+        lyrics: result.lyrics,
+        playheadExcluded: [], barLayout: null, stitchMeta: null,
+      };
+      setItems(prev => {
+        const next = [...prev];
+        next.splice(startIdx, indices.length, newItem);
+        return next;
+      });
+      setMergeSelectedIds(new Set());
+      if (result.anyStaffMissing) {
+        alert('일부 이미지에서 보표선 간격을 자동으로 인식하지 못해, 해당 이미지는 크기 보정 없이 그대로 합쳐졌습니다. 결과를 확인해주세요.');
+      }
+    } catch (err) {
+      console.error(err);
+      alert('이미지를 합치는 중 오류가 발생했습니다.');
+    } finally {
+      setMerging(false);
+    }
+  }
+
   function applyDefaultsToAll() {
     if (items.length === 0) return;
     if (!window.confirm('모든 이미지의 개별(고급) 설정을 지우고 위쪽 기본값을 따르도록 되돌립니다. 계속할까요?')) return;
@@ -2390,6 +2542,12 @@ function TabScoreBuilder() {
   }
   function deleteItem(id) {
     setItems(prev => prev.filter(it => it.id !== id));
+    setMergeSelectedIds(prev => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
   }
   function moveItem(id, dir) {
     setItems(prev => {
@@ -2567,6 +2725,16 @@ function TabScoreBuilder() {
         </div>
       )}
 
+      {mergeSelectedIds.size > 0 && (
+        <div className="toolbar merge-toolbar">
+          <span className="save-msg">{mergeSelectedIds.size}개 선택됨 (연속된 이미지만 합칠 수 있어요)</span>
+          <button onClick={handleMergeSelected} disabled={mergeSelectedIds.size < 2 || merging}>
+            {merging ? '합치는 중...' : '선택한 이미지 한 줄로 합치기'}
+          </button>
+          <button className="icon-btn" onClick={() => setMergeSelectedIds(new Set())} disabled={merging}>선택 해제</button>
+        </div>
+      )}
+
       <div className="list" ref={listRef}>
         {items.map((item, idx) => (
           <ImageBlock key={item.id} item={item} index={idx} total={items.length}
@@ -2576,7 +2744,9 @@ function TabScoreBuilder() {
             defaultLyricAreaHeight={defaults.lyricAreaHeight}
             onChange={next => updateItem(item.id, next)}
             onDelete={() => deleteItem(item.id)}
-            onMove={dir => moveItem(item.id, dir)} />
+            onMove={dir => moveItem(item.id, dir)}
+            mergeSelected={mergeSelectedIds.has(item.id)}
+            onToggleMergeSelect={() => toggleMergeSelect(item.id)} />
         ))}
       </div>
 
