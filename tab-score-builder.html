@@ -1680,7 +1680,7 @@ async function exportPagesAsZip(canvases, title, format) {
   URL.revokeObjectURL(url);
 }
 
-const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults, lyricFontSize, lyricLetterSpacing, defaultLyricAreaHeight, onChange, onDelete, onMove, mergeSelected, onToggleMergeSelect }) {
+const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults, lyricFontSize, lyricLetterSpacing, defaultLyricAreaHeight, onChange, onDelete, onMove, mergeSelected, onToggleMergeSelect, batchExcluded, onToggleBatchExclude }) {
   const canvasRef = useRef(null);
   const imgRef = useRef(null);
   const laneRef = useRef(null);
@@ -1901,6 +1901,10 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
         <label className="merge-select-label">
           <input type="checkbox" checked={mergeSelected} onChange={onToggleMergeSelect} />
           합치기 선택
+        </label>
+        <label className="merge-select-label" title="이 이미지는 'N장씩 일괄 합치기' 실행 시 그룹 묶기에서 제외되고, 원래 자리에 그대로 남습니다.">
+          <input type="checkbox" checked={batchExcluded} onChange={onToggleBatchExclude} />
+          일괄 합치기 제외
         </label>
         <span>TAB 이미지 {index + 1}</span>
         <div className="block-actions">
@@ -2429,6 +2433,7 @@ function TabScoreBuilder() {
   const [mergePreviewBusy, setMergePreviewBusy] = useState(false);
   const [batchGroupSize, setBatchGroupSize] = useState(2);
   const [batchMerging, setBatchMerging] = useState(false);
+  const [batchExcludedIds, setBatchExcludedIds] = useState(new Set());
   const fileInputRef = useRef(null);
   const listRef = useRef(null);
   function getReferenceWidth() {
@@ -2518,6 +2523,14 @@ function TabScoreBuilder() {
     });
   }
 
+  function toggleBatchExclude(id) {
+    setBatchExcludedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
   // Shared by the live preview effect and the final merge, so both always agree on exactly which
   // items are being merged and in what order.
   function getContiguousMergeIndices() {
@@ -2598,20 +2611,33 @@ function TabScoreBuilder() {
 
   async function handleBatchMerge() {
     const n = Math.max(2, Math.floor(batchGroupSize) || 2);
-    if (items.length < 2) { alert('합칠 이미지가 2장 이상 있어야 합니다.'); return; }
+    const excludedCount = items.filter(it => batchExcludedIds.has(it.id)).length;
+    const includedItems = items.filter(it => !batchExcludedIds.has(it.id));
+    if (includedItems.length < 2) {
+      alert('일괄 합치기 대상 이미지가 2장 이상 있어야 합니다 (일괄 합치기 제외 표시된 이미지는 대상에서 빠집니다).');
+      return;
+    }
 
-    const groups = chunkForBatchMerge(items, n);
+    // Grouping runs over the non-excluded items only, in their existing order — an excluded item
+    // never breaks up or counts toward a group, it just stays untouched wherever it already is.
+    const groups = chunkForBatchMerge(includedItems, n);
     const mergeableCount = groups.filter(g => g.length >= 2).length;
     const leftover = groups.length > 0 && groups[groups.length - 1].length === 1 ? groups[groups.length - 1] : null;
 
-    let confirmMsg = '총 ' + items.length + '장을 ' + n + '장씩 묶어서 ' + mergeableCount + '개 그룹으로 합칩니다.';
-    if (leftover) confirmMsg += ' 마지막 1장은 짝이 없어 개별 블록으로 남습니다.';
-    confirmMsg += ' 원래 이미지들은 사라지고 되돌릴 수 없습니다. 계속할까요?';
+    let confirmMsg = '전체 ' + items.length + '장 중 ' + excludedCount + '장은 제외하고, 나머지 ' + includedItems.length + '장을 '
+      + n + '장씩 묶어서 ' + mergeableCount + '개 그룹으로 합칩니다.';
+    if (leftover) confirmMsg += ' (묶이지 않는 마지막 1장은 개별 블록으로 남습니다.)';
+    confirmMsg += ' 합쳐지는 이미지들은 원래 상태로 되돌릴 수 없습니다. 계속할까요?';
     if (!window.confirm(confirmMsg)) return;
 
     setBatchMerging(true);
     try {
-      const newItems = [];
+      // Merge every 2+ group first, keyed by the group's FIRST item's id — that id is where the
+      // merged block gets inserted below, so a group's other members can be non-contiguous in the
+      // original list (e.g. an excluded item sitting between two included ones) without breaking
+      // the merge itself; only the group's members are ever moved/removed.
+      const resultByFirstId = new Map();
+      const consumedIds = new Set();
       let mergedGroupCount = 0;
       let staffMissingGroupCount = 0;
       for (const group of groups) {
@@ -2619,22 +2645,36 @@ function TabScoreBuilder() {
           const result = await mergeImagesIntoRow(group, defaults, mergeGapPct);
           mergedGroupCount++;
           if (result.anyStaffMissing) staffMissingGroupCount++;
+          resultByFirstId.set(group[0].id, result);
+          for (let i = 1; i < group.length; i++) consumedIds.add(group[i].id);
+        }
+      }
+
+      let mergedIdx = 0;
+      const newItems = [];
+      for (const item of items) {
+        if (consumedIds.has(item.id)) continue; // absorbed into a merged block emitted below
+        const result = resultByFirstId.get(item.id);
+        if (result) {
+          mergedIdx++;
           newItems.push({
-            id: Date.now() + '_' + Math.random().toString(36).slice(2) + '_' + mergedGroupCount,
+            id: Date.now() + '_' + Math.random().toString(36).slice(2) + '_' + mergedIdx,
             type: 'image', src: result.canvas.toDataURL('image/png'),
             invert: false, override: { ...MERGED_ROW_NEUTRAL_OVERRIDE },
             lyrics: result.lyrics,
             playheadExcluded: [], barLayout: null, stitchMeta: null,
           });
         } else {
-          newItems.push(group[0]);
+          newItems.push(item); // excluded item, or an unmerged leftover single — untouched
         }
       }
       setItems(newItems);
       setMergeSelectedIds(new Set());
 
-      let summary = n + '장씩 묶어서 총 ' + mergedGroupCount + '개 그룹으로 합쳐졌습니다.';
-      if (leftover) summary += ' 마지막 1장은 짝이 없어 개별 블록으로 남았습니다.';
+      let summary = excludedCount > 0
+        ? (excludedCount + '장 제외, 나머지 ' + includedItems.length + '장을 ' + n + '장씩 묶어서 총 ' + mergedGroupCount + '개 그룹으로 합쳐졌습니다.')
+        : (n + '장씩 묶어서 총 ' + mergedGroupCount + '개 그룹으로 합쳐졌습니다.');
+      if (leftover) summary += ' 묶이지 않은 마지막 1장은 개별 블록으로 남았습니다.';
       if (staffMissingGroupCount > 0) {
         summary += ' (' + staffMissingGroupCount + '개 그룹은 일부 이미지의 보표선 간격을 인식하지 못해 크기 보정 없이 합쳐졌습니다 — 결과를 확인해주세요.)';
       }
@@ -2665,6 +2705,12 @@ function TabScoreBuilder() {
   function deleteItem(id) {
     setItems(prev => prev.filter(it => it.id !== id));
     setMergeSelectedIds(prev => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+    setBatchExcludedIds(prev => {
       if (!prev.has(id)) return prev;
       const next = new Set(prev);
       next.delete(id);
@@ -2843,6 +2889,9 @@ function TabScoreBuilder() {
           <button className="icon-btn" onClick={handleBatchMerge} disabled={batchMerging || merging}>
             {batchMerging ? '일괄 합치는 중...' : '일괄 합치기 실행'}
           </button>
+          {batchExcludedIds.size > 0 && (
+            <span className="save-msg">{batchExcludedIds.size}장 제외됨 (각 이미지의 "일괄 합치기 제외" 표시)</span>
+          )}
         </div>
       )}
 
@@ -2909,7 +2958,9 @@ function TabScoreBuilder() {
             onDelete={() => deleteItem(item.id)}
             onMove={dir => moveItem(item.id, dir)}
             mergeSelected={mergeSelectedIds.has(item.id)}
-            onToggleMergeSelect={() => toggleMergeSelect(item.id)} />
+            onToggleMergeSelect={() => toggleMergeSelect(item.id)}
+            batchExcluded={batchExcludedIds.has(item.id)}
+            onToggleBatchExclude={() => toggleBatchExclude(item.id)} />
         ))}
       </div>
 
