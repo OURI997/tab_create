@@ -59,6 +59,9 @@
   .block-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-size:13px;color:var(--text2);gap:10px;}
   .block-actions{display:flex;gap:6px;}
   .merge-select-label{display:flex;align-items:center;gap:5px;white-space:nowrap;cursor:pointer;}
+  .merge-panel{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:14px;}
+  .merge-preview{border-top:1px solid var(--border);padding-top:10px;}
+  .merge-preview-img{max-width:100%;display:block;background:#fff;border:1px solid var(--border);border-radius:8px;margin-top:6px;}
   canvas.preview{width:100%;display:block;background:#fff;border:1px solid var(--border);border-radius:8px;}
   .adv-toggle-row{display:flex;justify-content:space-between;align-items:center;font-size:12.5px;color:var(--text2);gap:8px;}
   .lyric-section{margin-top:14px;border-top:1px solid var(--border);padding-top:12px;}
@@ -1238,7 +1241,33 @@ const MERGED_ROW_NEUTRAL_OVERRIDE = {
 // first source where a staff was actually detected, and then vertically shifted so the staffs line up
 // — otherwise two captures at slightly different zoom/DPI would merge into a row with jagged staff
 // lines. Returns null-safe metadata (`anyStaffMissing`) so the caller can warn without failing.
-async function mergeImagesIntoRow(sourceItems, defaults) {
+// Range for the inter-piece gap slider, as a % of the pieces' own (post-scale) width — negative
+// overlaps adjacent pieces to eat the padding many captures already have baked into their edges;
+// positive adds extra space. Capped well short of ±100% since either extreme would either overlap
+// past all the actual bar content or leave a visibly broken-looking gap.
+const MERGE_GAP_MIN_PCT = -10;
+const MERGE_GAP_MAX_PCT = 5;
+
+// Computes each piece's left-edge x position (and the resulting total width) given a uniform gapPct
+// applied at every seam — the seam's reference width is the average of its two neighboring (post-scale)
+// pieces, so the same % reads consistently regardless of which side is wider. Shared by the final
+// merge draw and the live preview so both always agree pixel-for-pixel.
+function computeMergeSeamPositions(pieces, gapPct) {
+  const xs = [];
+  let x = 0;
+  for (let i = 0; i < pieces.length; i++) {
+    if (i > 0) {
+      const refW = (pieces[i - 1].w + pieces[i].w) / 2;
+      x += Math.round((gapPct / 100) * refW);
+    }
+    xs.push(x);
+    x += pieces[i].w;
+  }
+  return { xs, totalW: x };
+}
+
+async function mergeImagesIntoRow(sourceItems, defaults, gapPct) {
+  gapPct = gapPct || 0;
   const processed = [];
   for (const it of sourceItems) {
     const img = await loadImage(resolvedSrc(it));
@@ -1272,19 +1301,20 @@ async function mergeImagesIntoRow(sourceItems, defaults) {
     ...s, offsetY: s.staffTopScaled != null ? Math.round(refTop - s.staffTopScaled) : 0,
   }));
 
-  const totalW = withOffsets.reduce((sum, s) => sum + s.w, 0);
+  const { xs, totalW: seamTotalW } = computeMergeSeamPositions(withOffsets, gapPct);
+  const totalW = Math.max(1, seamTotalW);
   const totalH = Math.max(...withOffsets.map(s => s.offsetY + s.h));
 
   const out = document.createElement('canvas');
-  out.width = Math.max(1, totalW);
+  out.width = totalW;
   out.height = Math.max(1, totalH);
   const ctx = out.getContext('2d');
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, out.width, out.height);
 
-  let x = 0;
   const mergedTags = [];
-  for (const s of withOffsets) {
+  withOffsets.forEach((s, i) => {
+    const x = xs[i];
     ctx.drawImage(s.canvas, 0, 0, s.canvas.width, s.canvas.height, x, s.offsetY, s.w, s.h);
     // Lyric tag xPct is "% across this item's own image width" — remap through this item's pixel
     // position within the merged canvas. yPct is "% down the lyric lane" (a UI concept shared by
@@ -1295,8 +1325,7 @@ async function mergeImagesIntoRow(sourceItems, defaults) {
       const globalXPct = ((x + localXPx) / totalW) * 100;
       mergedTags.push({ ...t, id: Date.now() + '_' + Math.random().toString(36).slice(2), xPct: globalXPct });
     }
-    x += s.w;
-  }
+  });
 
   const areaHeightRatios = sourceItems
     .map(it => (it.lyrics && it.lyrics.areaHeightRatio) || 0)
@@ -2395,6 +2424,9 @@ function TabScoreBuilder() {
   const [showStitchModal, setShowStitchModal] = useState(false);
   const [mergeSelectedIds, setMergeSelectedIds] = useState(new Set());
   const [merging, setMerging] = useState(false);
+  const [mergeGapPct, setMergeGapPct] = useState(0);
+  const [mergePreviewSrc, setMergePreviewSrc] = useState(null);
+  const [mergePreviewBusy, setMergePreviewBusy] = useState(false);
   const fileInputRef = useRef(null);
   const listRef = useRef(null);
   function getReferenceWidth() {
@@ -2484,13 +2516,41 @@ function TabScoreBuilder() {
     });
   }
 
-  async function handleMergeSelected() {
+  // Shared by the live preview effect and the final merge, so both always agree on exactly which
+  // items are being merged and in what order.
+  function getContiguousMergeIndices() {
     const indices = items
       .map((it, idx) => (mergeSelectedIds.has(it.id) ? idx : -1))
       .filter(idx => idx !== -1);
-    if (indices.length < 2) { alert('합칠 이미지를 2개 이상 선택해주세요.'); return; }
+    if (indices.length < 2) return null;
     const isContiguous = indices.every((idx, i) => i === 0 || idx === indices[i - 1] + 1);
-    if (!isContiguous) {
+    return isContiguous ? indices : null;
+  }
+
+  // Live preview of the merge result as the gap slider moves, so the user can see whether an overlap
+  // (negative gap) starts eating into actual bar content before committing to the irreversible merge.
+  useEffect(() => {
+    let cancelled = false;
+    const indices = getContiguousMergeIndices();
+    if (!indices) { setMergePreviewSrc(null); return; }
+    setMergePreviewBusy(true);
+    const timer = setTimeout(async () => {
+      try {
+        const sourceItems = indices.map(idx => items[idx]);
+        const result = await mergeImagesIntoRow(sourceItems, defaults, mergeGapPct);
+        if (cancelled) return;
+        setMergePreviewSrc(result.canvas.toDataURL('image/png'));
+      } finally {
+        if (!cancelled) setMergePreviewBusy(false);
+      }
+    }, 350);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [mergeSelectedIds, mergeGapPct, items, defaults]);
+
+  async function handleMergeSelected() {
+    const indices = getContiguousMergeIndices();
+    if (!indices) {
+      if (mergeSelectedIds.size < 2) { alert('합칠 이미지를 2개 이상 선택해주세요.'); return; }
       alert('선택한 이미지들이 목록에서 서로 떨어져 있습니다. 합치려면 연속된(붙어 있는) 이미지들만 선택해주세요.');
       return;
     }
@@ -2500,7 +2560,7 @@ function TabScoreBuilder() {
     try {
       const startIdx = indices[0];
       const sourceItems = indices.map(idx => items[idx]);
-      const result = await mergeImagesIntoRow(sourceItems, defaults);
+      const result = await mergeImagesIntoRow(sourceItems, defaults, mergeGapPct);
       const newItem = {
         id: Date.now() + '_' + Math.random().toString(36).slice(2),
         type: 'image', src: result.canvas.toDataURL('image/png'),
@@ -2514,6 +2574,7 @@ function TabScoreBuilder() {
         return next;
       });
       setMergeSelectedIds(new Set());
+      setMergeGapPct(0);
       if (result.anyStaffMissing) {
         alert('일부 이미지에서 보표선 간격을 자동으로 인식하지 못해, 해당 이미지는 크기 보정 없이 그대로 합쳐졌습니다. 결과를 확인해주세요.');
       }
@@ -2726,12 +2787,35 @@ function TabScoreBuilder() {
       )}
 
       {mergeSelectedIds.size > 0 && (
-        <div className="toolbar merge-toolbar">
-          <span className="save-msg">{mergeSelectedIds.size}개 선택됨 (연속된 이미지만 합칠 수 있어요)</span>
-          <button onClick={handleMergeSelected} disabled={mergeSelectedIds.size < 2 || merging}>
-            {merging ? '합치는 중...' : '선택한 이미지 한 줄로 합치기'}
-          </button>
-          <button className="icon-btn" onClick={() => setMergeSelectedIds(new Set())} disabled={merging}>선택 해제</button>
+        <div className="merge-panel">
+          <div className="toolbar merge-toolbar">
+            <span className="save-msg">{mergeSelectedIds.size}개 선택됨 (연속된 이미지만 합칠 수 있어요)</span>
+            <button onClick={handleMergeSelected} disabled={mergeSelectedIds.size < 2 || merging}>
+              {merging ? '합치는 중...' : '선택한 이미지 한 줄로 합치기'}
+            </button>
+            <button className="icon-btn" onClick={() => setMergeSelectedIds(new Set())} disabled={merging}>선택 해제</button>
+          </div>
+
+          <div>
+            <div className="slider-label">조각 사이 간격 ({mergeGapPct}%, 각 조각 폭 기준 — 음수면 겹쳐서 이어붙임)</div>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <input type="range" min={MERGE_GAP_MIN_PCT} max={MERGE_GAP_MAX_PCT} step="0.5" value={mergeGapPct}
+                style={{ flex: 1 }}
+                onChange={e => setMergeGapPct(Number(e.target.value))} />
+              <input type="number" min={MERGE_GAP_MIN_PCT} max={MERGE_GAP_MAX_PCT} step="0.5" value={mergeGapPct}
+                style={{ width: '70px', border: '1px solid var(--border-strong)', borderRadius: '8px', padding: '5px 6px', fontSize: '13px' }}
+                onChange={e => setMergeGapPct(Math.min(MERGE_GAP_MAX_PCT, Math.max(MERGE_GAP_MIN_PCT, Number(e.target.value) || 0)))} />
+            </div>
+          </div>
+
+          {(mergePreviewSrc || mergePreviewBusy) && (
+            <div className="merge-preview">
+              <div className="lyric-head-mini">
+                <span>미리보기{mergePreviewBusy ? ' (갱신 중...)' : ''} — 겹치는 부분에 마디 내용이 가려지지 않는지 확인하세요</span>
+              </div>
+              {mergePreviewSrc && <img src={mergePreviewSrc} alt="합치기 미리보기" className="merge-preview-img" />}
+            </div>
+          )}
         </div>
       )}
 
