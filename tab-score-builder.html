@@ -1377,18 +1377,19 @@ async function mergeImagesIntoRow(sourceItems, defaults, gapPct) {
   };
 }
 
-// Cap on how far a too-short trailing batch-merge row may be blown up to match the other rows'
-// average width (requirement: don't let text/bars grow unnaturally large just to hit that average).
-const MERGE_LAST_ROW_MAX_SCALE = 2;
-
-// Uniformly scales a canvas (both dimensions by the same factor, so aspect ratio — and every lyric
-// tag's %-based position — is unaffected) and returns a new canvas at that size.
-function scaleCanvasUniform(canvas, scale) {
-  const w = Math.max(1, Math.round(canvas.width * scale));
-  const h = Math.max(1, Math.round(canvas.height * scale));
+// Left-aligns a too-short trailing batch-merge row's already-merged canvas onto a wider blank canvas
+// matching the other rows' width — content stays at its own natural scale (no stretching/zooming;
+// that was tried and rejected, since scaling up made the last row's text/numbers visibly larger than
+// every other row instead of matching them) and any leftover width is plain white space on the right.
+// A no-op (returns the original canvas) if it's already at least as wide as targetWidth.
+function padCanvasRightTo(canvas, targetWidth) {
+  if (canvas.width >= targetWidth) return canvas;
   const out = document.createElement('canvas');
-  out.width = w; out.height = h;
-  out.getContext('2d').drawImage(canvas, 0, 0, w, h);
+  out.width = targetWidth; out.height = canvas.height;
+  const ctx = out.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, out.width, out.height);
+  ctx.drawImage(canvas, 0, 0);
   return out;
 }
 
@@ -2733,7 +2734,7 @@ function TabScoreBuilder() {
           + n + '장씩 묶어 ' + groups.length + '개 그룹으로 합칩니다.')
       : ('전체 ' + after.length + '장을 ' + n + '장씩 묶어 ' + groups.length + '개 그룹으로 합칩니다.');
     if (lastIsPartial) {
-      confirmMsg += ' (마지막 그룹은 ' + lastGroup.length + '장으로, 다른 줄과 비슷한 폭이 되도록 확대됩니다.)';
+      confirmMsg += ' (마지막 그룹은 ' + lastGroup.length + '장으로, 다른 줄과 같은 크기로 왼쪽 정렬되고 오른쪽에 여백이 남습니다.)';
     }
     confirmMsg += ' 합쳐지는 이미지들은 원래 상태로 되돌릴 수 없습니다. 계속할까요?';
     if (!window.confirm(confirmMsg)) return;
@@ -2748,26 +2749,22 @@ function TabScoreBuilder() {
         mergedResults.push(result);
       }
 
-      // Requirement: a too-short trailing group (1-2 leftover pieces) reads as visually thin/short
-      // next to the other (full-size) rows once composed — scale it up (uniformly, so aspect and
-      // every lyric tag's % position are unaffected) to roughly match the other rows' average width,
-      // capped so it never blows up unnaturally large.
+      // A too-short trailing group (1-2 leftover pieces) is kept at the EXACT SAME per-piece scale as
+      // every other row — scaling it up to match the other rows' width was tried and rejected (made
+      // its text/numbers visibly larger than every other row, which read as more wrong, not less).
+      // Instead its unscaled canvas is left-aligned onto a canvas as wide as the other (full) rows,
+      // with plain white space on the right filling whatever room the missing pieces would have used.
       if (lastIsPartial) {
         const fullWidths = groups
           .map((g, i) => (g.length === n ? mergedResults[i].canvas.width : null))
           .filter(w => w != null);
         if (fullWidths.length > 0) {
-          const avgFullWidth = fullWidths.reduce((a, b) => a + b, 0) / fullWidths.length;
+          const avgFullWidth = Math.round(fullWidths.reduce((a, b) => a + b, 0) / fullWidths.length);
           const lastCanvas = mergedResults[mergedResults.length - 1].canvas;
-          if (avgFullWidth > lastCanvas.width) {
-            const scale = Math.min(avgFullWidth / lastCanvas.width, MERGE_LAST_ROW_MAX_SCALE);
-            if (scale > 1.01) {
-              mergedResults[mergedResults.length - 1] = {
-                ...mergedResults[mergedResults.length - 1],
-                canvas: scaleCanvasUniform(lastCanvas, scale),
-              };
-            }
-          }
+          mergedResults[mergedResults.length - 1] = {
+            ...mergedResults[mergedResults.length - 1],
+            canvas: padCanvasRightTo(lastCanvas, avgFullWidth),
+          };
         }
       }
 
