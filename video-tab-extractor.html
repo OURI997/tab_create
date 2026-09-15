@@ -81,6 +81,15 @@
   .progress-bar-fill{position:absolute;top:0;left:0;bottom:0;background:var(--accent);transition:width 0.15s ease-out;}
   .progress-bar-label{position:relative;height:100%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;color:var(--text);}
 
+  .range-slider-track{position:relative;height:28px;background:var(--border);border-radius:999px;margin:10px 2px 18px;}
+  .range-slider-fill{position:absolute;top:0;bottom:0;background:var(--accent-bg);border:1px solid var(--accent);border-radius:999px;}
+  .range-slider-handle{
+    position:absolute;top:50%;width:22px;height:22px;border-radius:50%;
+    background:#ffffff;border:2px solid var(--accent);transform:translate(-50%,-50%);
+    cursor:grab;touch-action:none;box-shadow:0 1px 4px rgba(0,0,0,0.25);z-index:1;
+  }
+  .range-slider-handle:active{cursor:grabbing;}
+
   .thumb-grid{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0;}
   .thumb-card{position:relative;width:180px;border:1px solid var(--border-strong);border-radius:8px;padding:6px;background:var(--card);}
   .thumb-card.view-only{cursor:zoom-in;}
@@ -382,6 +391,11 @@ function CaptureStep({ videoRef, frames, setFrames, onNext }) {
   const roiRef = useRef(null);
   const seekBusyRef = useRef(false);
   const pendingSeekRef = useRef(null);
+  const rangeTrackRef = useRef(null);
+  const rangeDragRef = useRef(null); // 'start' | 'end' | null, which handle (if any) is being dragged
+  const rangeStartRef = useRef(0);
+  const rangeEndRef = useRef(0);
+  const durationRef = useRef(0);
 
   const [videoLoaded, setVideoLoaded] = useState(false);
   const [duration, setDuration] = useState(0);
@@ -417,6 +431,44 @@ function CaptureStep({ videoRef, frames, setFrames, onNext }) {
   useEffect(() => {
     window.addEventListener('resize', drawRoiBoxOverlay);
     return () => window.removeEventListener('resize', drawRoiBoxOverlay);
+  }, []);
+
+  useEffect(() => { rangeStartRef.current = rangeStart; }, [rangeStart]);
+  useEffect(() => { rangeEndRef.current = rangeEnd; }, [rangeEnd]);
+  useEffect(() => { durationRef.current = duration; }, [duration]);
+
+  function startRangeDrag(e, which) {
+    e.preventDefault();
+    rangeDragRef.current = which;
+  }
+  // Subscribed once (refs carry the live values) so dragging never has to re-attach listeners mid-drag.
+  // Reuses requestScrub — the SAME scrub path the "영상 상태 확인" slider uses — so previewing a handle's
+  // current position while dragging goes through the identical seekTo() call, never a second one.
+  useEffect(() => {
+    function onMove(e) {
+      const which = rangeDragRef.current;
+      const dur = durationRef.current;
+      if (!which || !rangeTrackRef.current || !dur) return;
+      const rect = rangeTrackRef.current.getBoundingClientRect();
+      const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      let t = pct * dur;
+      if (which === 'start') {
+        t = Math.max(0, Math.min(t, rangeEndRef.current - 0.1));
+        setRangeStart(t);
+      } else {
+        t = Math.min(dur, Math.max(t, rangeStartRef.current + 0.1));
+        setRangeEnd(t);
+      }
+      setSeekT(t);
+      requestScrub(t);
+    }
+    function onUp() { rangeDragRef.current = null; }
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
   }, []);
 
   function drawChart(times, diffs, th) {
@@ -650,15 +702,22 @@ function CaptureStep({ videoRef, frames, setFrames, onNext }) {
           </label>
         </div>
 
-        <div className="slider-label" style={{ marginTop: '10px' }}>악보를 추출할 구간 선택 (비워두면 영상 전체가 대상)</div>
+        <div className="slider-label" style={{ marginTop: '10px' }}>
+          악보를 추출할 구간 선택 — {rangeStart.toFixed(1)}s ~ {rangeEnd.toFixed(1)}s (비워두면 영상 전체가 대상)
+        </div>
+        {videoLoaded && (
+          <div className="range-slider-track" ref={rangeTrackRef}>
+            <div className="range-slider-fill" style={{
+              left: (rangeStart / duration * 100) + '%',
+              width: ((rangeEnd - rangeStart) / duration * 100) + '%',
+            }} />
+            <div className="range-slider-handle" style={{ left: (rangeStart / duration * 100) + '%' }}
+              onPointerDown={e => startRangeDrag(e, 'start')} title={'시작: ' + rangeStart.toFixed(1) + 's'} />
+            <div className="range-slider-handle" style={{ left: (rangeEnd / duration * 100) + '%' }}
+              onPointerDown={e => startRangeDrag(e, 'end')} title={'끝: ' + rangeEnd.toFixed(1) + 's'} />
+          </div>
+        )}
         <div className="toolbar">
-          <span className="slider-label" style={{ margin: 0 }}>시작</span>
-          <input type="number" value={rangeStart} step="0.5" min="0" max={duration || 0} disabled={!videoLoaded}
-            onChange={e => setRangeStart(Math.max(0, Math.min(parseFloat(e.target.value) || 0, duration)))} />
-          <span className="slider-label" style={{ margin: 0 }}>초 ~ 끝</span>
-          <input type="number" value={rangeEnd} step="0.5" min="0" max={duration || 0} disabled={!videoLoaded}
-            onChange={e => setRangeEnd(Math.max(0, Math.min(parseFloat(e.target.value) || 0, duration)))} />
-          <span className="slider-label" style={{ margin: 0 }}>초</span>
           <button className="icon-btn" onClick={() => { setRangeStart(0); setRangeEnd(duration); }} disabled={!videoLoaded}>구간 초기화(전체)</button>
         </div>
 
