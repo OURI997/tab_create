@@ -328,9 +328,28 @@ function captureRoiNative(video, roi) {
   return { dataUrl: roiCaptureCanvas.toDataURL('image/png'), w, h };
 }
 
+// After 'seeked' fires, the decoder has not always actually PRESENTED the new frame's pixels yet —
+// confirmed by direct testing here: drawImage(video,...) right after 'seeked' can still read the
+// PREVIOUS frame's content, especially on videos with long static holds (sparse keyframes), which TAB
+// captures — the exact target content for this page — commonly are. requestVideoFrameCallback fires
+// precisely when a new frame is composited (including from a programmatic seek while paused), so it's
+// preferred; a bounded timeout fallback guarantees this never hangs even if rVFC is unsupported or
+// doesn't fire for some edge case.
+function waitForFramePresented(video) {
+  return new Promise(resolve => {
+    let done = false;
+    const finish = () => { if (done) return; done = true; resolve(); };
+    if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(finish);
+    setTimeout(finish, 150);
+  });
+}
+
 function seekTo(video, t) {
   return new Promise(resolve => {
-    const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
+    const onSeeked = () => {
+      video.removeEventListener('seeked', onSeeked);
+      waitForFramePresented(video).then(resolve);
+    };
     video.addEventListener('seeked', onSeeked);
     video.currentTime = t;
   });
