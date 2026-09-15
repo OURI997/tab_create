@@ -1252,17 +1252,24 @@ const MERGED_ROW_NEUTRAL_OVERRIDE = {
 const MERGE_GAP_MIN_PCT = -10;
 const MERGE_GAP_MAX_PCT = 5;
 
-// Computes each piece's left-edge x position (and the resulting total width) given a uniform gapPct
-// applied at every seam — the seam's reference width is the average of its two neighboring (post-scale)
-// pieces, so the same % reads consistently regardless of which side is wider. Shared by the final
-// merge draw and the live preview so both always agree pixel-for-pixel.
+// Computes each piece's draw x-position (and the resulting total width) given a uniform gapPct
+// applied at every seam. Each piece's `.w`/`.contentRight` here are already POST-TRIM (see
+// mergeImagesIntoRow below — a piece's own blank lead-in margin, if any, is cropped away entirely
+// before it ever reaches this function), so a piece's own local x=0 always means "where its content
+// starts" and `.contentRight` means "how far its content extends from there". At gapPct=0 a seam
+// lands exactly where the previous piece's content ends and the next piece's content begins — no
+// visible gap, and nothing left to accidentally paint a margin over the previous piece's content with.
+// Negative gapPct then intentionally overlaps CONTENT with content (by that literal percentage of the
+// two pieces' average content width), never margin-over-content, since margin was never drawn at all.
+// Shared by the final merge draw and the live preview so both always agree pixel-for-pixel.
 function computeMergeSeamPositions(pieces, gapPct) {
   const xs = [];
   let x = 0;
   for (let i = 0; i < pieces.length; i++) {
     if (i > 0) {
-      const refW = (pieces[i - 1].w + pieces[i].w) / 2;
-      x += Math.round((gapPct / 100) * refW);
+      const prev = pieces[i - 1], cur = pieces[i];
+      const refW = (prev.contentRight + cur.contentRight) / 2;
+      x = (xs[i - 1] + prev.contentRight) + Math.round((gapPct / 100) * refW);
     }
     xs.push(x);
     x += pieces[i].w;
@@ -1294,7 +1301,16 @@ async function mergeImagesIntoRow(sourceItems, defaults, gapPct) {
     const w = Math.max(1, Math.round(p.canvas.width * scale));
     const h = Math.max(1, Math.round(p.canvas.height * scale));
     const staffTopScaled = p.staff ? p.staff.staffTop * scale : null;
-    return { item: p.item, canvas: p.canvas, w, h, staffTopScaled };
+    // The staff line span, not raw ink, is what marks real bar content — detectStaffBand already
+    // requires 6 evenly-spaced unbroken lines to match, which decorative shading/watermarks/chord
+    // boxes (common in YouTube captures) don't produce, so this stays reliable where a naive
+    // ink-density scan would mistake those for content. staffLeftNative stays in the ORIGINAL
+    // (pre-scale) canvas's own pixel coordinates since that's what the drawImage source rect below
+    // needs; contentLeft/contentRight are the scaled equivalents used for seam layout math.
+    const staffLeftNative = p.staff ? p.staff.staffLeft : null;
+    const contentLeft = p.staff ? p.staff.staffLeft * scale : null;
+    const contentRight = p.staff ? p.staff.staffRight * scale : null;
+    return { item: p.item, canvas: p.canvas, w, h, staffTopScaled, staffLeftNative, contentLeft, contentRight };
   });
 
   // Shift each image down so every (scaled) staff top lands on the same y — images with no detected
@@ -1305,9 +1321,23 @@ async function mergeImagesIntoRow(sourceItems, defaults, gapPct) {
     ...s, offsetY: s.staffTopScaled != null ? Math.round(refTop - s.staffTopScaled) : 0,
   }));
 
-  const { xs, totalW: seamTotalW } = computeMergeSeamPositions(withOffsets, gapPct);
+  // Crop away every non-first piece's own blank lead-in margin (from its left edge to its detected
+  // content start) BEFORE it's ever composited — this is what guarantees that margin can never be
+  // drawn on top of the previous piece's real content, no matter how wide it is or how much overlap
+  // the user dials in. The first piece keeps its own leading margin (nothing precedes it to protect).
+  // Falls back to "no trim, content-right = full width" whenever staff detection failed for a piece,
+  // reproducing the old plain edge-to-edge behavior for exactly that piece.
+  const trimmed = withOffsets.map((s, i) => {
+    const trimNative = (i > 0 && s.staffLeftNative != null) ? s.staffLeftNative : 0;
+    const trimScaled = (i > 0 && s.contentLeft != null) ? s.contentLeft : 0;
+    const w = s.w - trimScaled;
+    const contentRight = s.contentRight != null ? (s.contentRight - trimScaled) : w;
+    return { ...s, fullW: s.w, w, contentRight, trimNative, trimScaled };
+  });
+
+  const { xs, totalW: seamTotalW } = computeMergeSeamPositions(trimmed, gapPct);
   const totalW = Math.max(1, seamTotalW);
-  const totalH = Math.max(...withOffsets.map(s => s.offsetY + s.h));
+  const totalH = Math.max(...trimmed.map(s => s.offsetY + s.h));
 
   const out = document.createElement('canvas');
   out.width = totalW;
@@ -1317,16 +1347,20 @@ async function mergeImagesIntoRow(sourceItems, defaults, gapPct) {
   ctx.fillRect(0, 0, out.width, out.height);
 
   const mergedTags = [];
-  withOffsets.forEach((s, i) => {
+  trimmed.forEach((s, i) => {
     const x = xs[i];
-    ctx.drawImage(s.canvas, 0, 0, s.canvas.width, s.canvas.height, x, s.offsetY, s.w, s.h);
-    // Lyric tag xPct is "% across this item's own image width" — remap through this item's pixel
-    // position within the merged canvas. yPct is "% down the lyric lane" (a UI concept shared by
-    // whichever single item owns the lane), not tied to image width, so it carries over unchanged.
+    const srcW = s.canvas.width - s.trimNative;
+    ctx.drawImage(s.canvas, s.trimNative, 0, srcW, s.canvas.height, x, s.offsetY, s.w, s.h);
+    // Lyric tag xPct is "% across this item's own ORIGINAL (pre-trim) image width" — remap through
+    // where that original image's x=0 would fall in the merged canvas (conceptually, even though the
+    // cropped-away margin portion of it, if any, is never actually drawn there). yPct is "% down the
+    // lyric lane" (a UI concept shared by whichever single item owns the lane), not tied to image
+    // width, so it carries over unchanged.
+    const conceptualFullX = x - s.trimScaled;
     const tags = (s.item.lyrics && s.item.lyrics.tags) || [];
     for (const t of tags) {
-      const localXPx = (t.xPct / 100) * s.w;
-      const globalXPct = ((x + localXPx) / totalW) * 100;
+      const localXPx = (t.xPct / 100) * s.fullW;
+      const globalXPct = ((conceptualFullX + localXPx) / totalW) * 100;
       mergedTags.push({ ...t, id: Date.now() + '_' + Math.random().toString(36).slice(2), xPct: globalXPct });
     }
   });
