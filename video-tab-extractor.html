@@ -1,0 +1,950 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>영상에서 TAB 추출</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  :root{
+    --bg:#faf8f3;
+    --card:#ffffff;
+    --border:#ddd8cc;
+    --border-strong:#bdb6a4;
+    --text:#1a1a1a;
+    --text2:#6b6b63;
+    --accent:#3c3489;
+    --accent-bg:#eeedfe;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans KR",sans-serif;
+    background:var(--bg);
+    color:var(--text);
+    padding:24px;
+  }
+  .app{max-width:900px;margin:0 auto;display:flex;flex-direction:column;gap:20px;}
+  .titlebar{display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border);padding-bottom:12px;}
+  .titlebar h1{flex:1;font-family:Georgia,"Noto Serif KR",serif;font-size:22px;font-weight:600;margin:0;}
+  .toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
+  button{
+    border:1px solid var(--border-strong);background:var(--card);color:var(--text);
+    border-radius:8px;padding:8px 14px;font-size:14px;cursor:pointer;
+  }
+  button:hover{background:var(--accent-bg);}
+  button:disabled{opacity:0.4;cursor:default;}
+  .icon-btn{padding:6px 8px;font-size:13px;}
+  .nav-link{border:1px solid var(--border-strong);background:var(--card);color:var(--text);border-radius:8px;padding:6px 10px;font-size:13px;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;white-space:nowrap;}
+  .nav-link:hover{background:var(--accent-bg);}
+  .save-msg{font-size:13px;color:var(--accent);}
+  .block{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;}
+  .block-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-size:13px;color:var(--text2);gap:10px;}
+  canvas.preview{width:100%;display:block;background:#fff;border:1px solid var(--border);border-radius:8px;}
+  .adv-toggle-row{display:flex;justify-content:space-between;align-items:center;font-size:12.5px;color:var(--text2);gap:8px;}
+  .controls{display:flex;flex-direction:column;gap:10px;margin-top:12px;}
+  .controls label{display:flex;align-items:center;gap:8px;font-size:13px;}
+  .slider-label{font-size:12px;color:var(--text2);margin-bottom:4px;}
+  input[type=range]{width:100%;}
+  input[type=number]{border:1px solid var(--border-strong);border-radius:8px;padding:5px 6px;font-size:13px;width:70px;}
+  select{border:1px solid var(--border-strong);border-radius:8px;padding:6px 8px;font-size:13px;background:var(--card);color:var(--text);width:100%;}
+  .list{display:flex;flex-direction:column;gap:12px;}
+  .hr{border:none;border-top:1px solid var(--border);margin:4px 0;}
+
+  .notice-banner{
+    display:flex;align-items:flex-start;gap:10px;
+    background:var(--accent-bg);border:1px solid var(--accent);border-radius:10px;
+    padding:12px 14px;font-size:12.5px;line-height:1.6;color:var(--text);
+  }
+  .notice-banner b{color:var(--accent);}
+
+  .step-nav{display:flex;gap:6px;align-items:center;font-size:12.5px;color:var(--text2);}
+  .step-nav .step{padding:4px 10px;border-radius:999px;border:1px solid var(--border);}
+  .step-nav .step.active{border-color:var(--accent);color:var(--accent);background:var(--accent-bg);font-weight:600;}
+  .step-nav .arrow{color:var(--border-strong);}
+
+  .hint-text{font-size:12.5px;color:var(--text2);line-height:1.6;margin:0 0 8px;}
+
+  /* Kept in the layout (not display:none) so hidden-video frame decoding still works in Safari etc —
+     only visually hidden via near-zero size/opacity. Always rendered at the App root so it is never
+     nested inside a step wrapper that gets hidden during step navigation. */
+  video.hidden-video{position:fixed;top:0;left:0;width:2px;height:2px;opacity:0.01;pointer-events:none;}
+
+  .roi-wrap{position:relative;display:inline-block;margin:10px 0;border:1px solid var(--border-strong);border-radius:8px;overflow:hidden;max-width:100%;}
+  .roi-canvas{display:block;max-width:100%;cursor:crosshair;background:#000;}
+  .roi-box{position:absolute;border:2px solid #e74c3c;background:rgba(231,76,60,0.15);display:none;pointer-events:none;}
+  .chart-canvas{width:100%;height:120px;border:1px solid var(--border);border-radius:8px;margin:10px 0;background:#fff;display:block;}
+
+  .thumb-grid{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0;}
+  .thumb-card{position:relative;width:180px;border:1px solid var(--border-strong);border-radius:8px;padding:6px;background:var(--card);}
+  .thumb-card.view-only{cursor:zoom-in;}
+  .thumb-card.view-only:hover{border-color:var(--accent);}
+  .thumb-card.selectable{display:block;cursor:pointer;}
+  .thumb-card.selected{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-bg);}
+  .thumb-card img{width:100%;display:block;border-radius:4px;background:#fff;}
+  .thumb-card input[type=checkbox]{position:absolute;top:10px;left:10px;width:18px;height:18px;z-index:2;}
+  .thumb-meta{font-size:11px;color:var(--text2);margin-top:4px;text-align:center;}
+
+  .preview-modal-backdrop{
+    position:fixed;inset:0;background:rgba(0,0,0,0.5);
+    display:flex;align-items:center;justify-content:center;z-index:100;padding:24px;
+  }
+  .preview-modal{
+    background:var(--card);border-radius:12px;box-shadow:0 8px 40px rgba(0,0,0,0.3);
+    width:min(900px,100%);max-height:90vh;display:flex;flex-direction:column;overflow:hidden;
+  }
+  .preview-modal-head{
+    display:flex;justify-content:space-between;align-items:center;
+    padding:12px 16px;border-bottom:1px solid var(--border);font-size:13px;color:var(--text2);
+  }
+  .preview-modal-body{overflow:auto;padding:12px;background:#f4f2ea;}
+  .preview-modal-body img{width:100%;display:block;background:#fff;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useEffect } = React;
+
+// ==== copied (near-)verbatim from tab-score-builder.html so preprocessing here reproduces exactly
+// what will happen after handoff — these two files are fully independent static pages with no shared
+// module system, so duplication is the deliberate architecture (same pattern index.html already uses). ====
+
+const DB_NAME = 'tab_score_builder_db';
+const STORE_NAME = 'scores';
+// Matches tab-score-builder.html's own VIDEO_IMPORT_KEY exactly — same database, same store, this
+// page only ever writes this one key right before navigating over.
+const VIDEO_IMPORT_KEY = '__video_import__';
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) { reject(new Error('IndexedDB unavailable')); return; }
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(STORE_NAME)) {
+        req.result.createObjectStore(STORE_NAME);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function dbPut(key, value) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.objectStore(STORE_NAME).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src;
+  });
+}
+
+function sampleAvgLuminance(img) {
+  const c = document.createElement('canvas');
+  const w = 60;
+  const h = Math.max(1, Math.round((60 * img.naturalHeight) / img.naturalWidth));
+  c.width = w; c.height = h;
+  const ctx = c.getContext('2d');
+  ctx.drawImage(img, 0, 0, w, h);
+  const d = ctx.getImageData(0, 0, w, h).data;
+  let sum = 0, n = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    sum += 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
+    n++;
+  }
+  return sum / n;
+}
+
+function smoothstep(edge0, edge1, x) {
+  if (edge0 === edge1) return x < edge0 ? 0 : 1;
+  const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
+  return t * t * (3 - 2 * t);
+}
+
+function applyThreshold(imageData, threshold, invert, softness) {
+  const d = imageData.data;
+  const lo = threshold - softness;
+  const hi = threshold + softness;
+  for (let i = 0; i < d.length; i += 4) {
+    const lum = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
+    const t = smoothstep(lo, hi, lum);
+    const v = invert ? 255 * (1 - t) : 255 * t;
+    d[i] = v; d[i+1] = v; d[i+2] = v; d[i+3] = 255;
+  }
+}
+
+function despeckleBinary(imageData, w, h, maxArea) {
+  if (!maxArea || maxArea <= 0) return;
+  const data = imageData.data;
+  const total = w * h;
+  const visited = new Uint8Array(total);
+  const stack = new Int32Array(total);
+  const isInk = (idx) => data[idx*4] < 128;
+  for (let start = 0; start < total; start++) {
+    if (visited[start] || !isInk(start)) continue;
+    let sp = 0;
+    stack[sp++] = start; visited[start] = 1;
+    let head = 0;
+    while (head < sp) {
+      const p = stack[head++];
+      const x = p % w, y = (p - x) / w | 0;
+      if (x > 0) { const n = p-1; if (!visited[n] && isInk(n)) { visited[n]=1; stack[sp++]=n; } }
+      if (x < w-1) { const n = p+1; if (!visited[n] && isInk(n)) { visited[n]=1; stack[sp++]=n; } }
+      if (y > 0) { const n = p-w; if (!visited[n] && isInk(n)) { visited[n]=1; stack[sp++]=n; } }
+      if (y < h-1) { const n = p+w; if (!visited[n] && isInk(n)) { visited[n]=1; stack[sp++]=n; } }
+    }
+    if (sp <= maxArea) {
+      for (let i = 0; i < sp; i++) {
+        const idx = stack[i]*4;
+        data[idx]=255; data[idx+1]=255; data[idx+2]=255;
+      }
+    }
+  }
+}
+
+function clampPct(v) { return Math.min(100, Math.max(0, v || 0)); }
+function clampCropPair(a, b) {
+  a = clampPct(a); b = clampPct(b);
+  const maxSum = 90;
+  if (a + b > maxSum) {
+    const ratio = maxSum / (a + b);
+    a = Math.floor(a * ratio);
+    b = Math.floor(b * ratio);
+  }
+  return [a, b];
+}
+
+// drawProcessed itself is copied verbatim from tab-score-builder.html. Its s.playheadRemove branch
+// is dead code here (this page's settings always set playheadRemove:false, since playhead removal
+// isn't exposed in this page's UI — out of this task's scope), so detectPlayheadRuns/removePlayheadRuns
+// are intentionally NOT copied; that branch is simply never entered.
+function drawProcessed(canvas, img, s) {
+  const W = img.naturalWidth, H = img.naturalHeight;
+  const [cropTop, cropBottom] = clampCropPair(s.cropTop, s.cropBottom);
+  const [cropLeft, cropRight] = clampCropPair(s.cropLeft, s.cropRight);
+  const sx = Math.floor(W * cropLeft / 100);
+  const sy = Math.floor(H * cropTop / 100);
+  const sw = Math.max(1, Math.floor(W * (100 - cropLeft - cropRight) / 100));
+  const sh = Math.max(1, Math.floor(H * (100 - cropTop - cropBottom) / 100));
+  canvas.width = sw; canvas.height = sh;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+  if (s.playheadRemove) {
+    // unreachable in this page — see comment above
+  }
+  if (s.removeBg) {
+    const imageData = ctx.getImageData(0, 0, sw, sh);
+    applyThreshold(imageData, s.threshold, s.invert, s.softness || 0);
+    if (s.despeckle) despeckleBinary(imageData, sw, sh, s.despeckleSize || 0);
+    ctx.putImageData(imageData, 0, 0);
+  }
+}
+
+// Same shape/logic as tab-score-builder.html's effectiveImageSettings — crop and playhead removal
+// are fixed at "off" since this page doesn't expose UI for them (out of scope for this task); the
+// fields still exist so drawProcessed's contract matches exactly.
+function effectiveImageSettings(item, defaults) {
+  const o = item.override;
+  if (o) {
+    return {
+      removeBg: o.removeBg, invert: o.invert, threshold: o.threshold, softness: o.softness,
+      despeckle: o.despeckle, despeckleSize: o.despeckleSize,
+      playheadRemove: false, playheadColor: null,
+      cropTop: 0, cropBottom: 0, cropLeft: 0, cropRight: 0,
+    };
+  }
+  return {
+    removeBg: defaults.removeBg, invert: item.invert, threshold: defaults.threshold, softness: defaults.softness,
+    despeckle: defaults.despeckle, despeckleSize: defaults.despeckleSize,
+    playheadRemove: false, playheadColor: null,
+    cropTop: 0, cropBottom: 0, cropLeft: 0, cropRight: 0,
+  };
+}
+
+const VIDEO_DEFAULTS_INIT = {
+  removeBg: true, invertMode: 'auto', threshold: 140, softness: 18,
+  despeckle: true, despeckleSize: 3,
+};
+
+// ==== new for this page: video capture / ROI diff detection ====
+
+// Diff sampling stays small+downscaled (cheap, noise-tolerant). Representative-frame capture below
+// uses a SEPARATE canvas at the ROI's own native resolution — no downscaling — since that becomes the
+// actual TAB source image handed off to tab-score-builder.
+const DIFF_SAMPLE_MAXDIM = 160;
+const diffSampleCanvas = document.createElement('canvas');
+const diffSampleCtx = diffSampleCanvas.getContext('2d', { willReadFrequently: true });
+const roiCaptureCanvas = document.createElement('canvas');
+const roiCaptureCtx = roiCaptureCanvas.getContext('2d');
+
+function roiRectPx(video, roi) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const rx0 = roi ? roi.x0 * vw : 0;
+  const ry0 = roi ? roi.y0 * vh : 0;
+  const rw = roi ? (roi.x1 - roi.x0) * vw : vw;
+  const rh = roi ? (roi.y1 - roi.y0) * vh : vh;
+  return { rx0, ry0, rw, rh };
+}
+
+function getRoiPixelsForDiff(video, roi) {
+  const { rx0, ry0, rw, rh } = roiRectPx(video, roi);
+  const scale = Math.min(1, DIFF_SAMPLE_MAXDIM / Math.max(rw, rh));
+  const outW = Math.max(1, Math.round(rw * scale));
+  const outH = Math.max(1, Math.round(rh * scale));
+  diffSampleCanvas.width = outW; diffSampleCanvas.height = outH;
+  diffSampleCtx.drawImage(video, rx0, ry0, rw, rh, 0, 0, outW, outH);
+  return diffSampleCtx.getImageData(0, 0, outW, outH).data;
+}
+
+function diffScore(a, b) {
+  let sum = 0;
+  const n = a.length / 4;
+  for (let i = 0; i < a.length; i += 4) {
+    const lumA = 0.299*a[i] + 0.587*a[i+1] + 0.114*a[i+2];
+    const lumB = 0.299*b[i] + 0.587*b[i+1] + 0.114*b[i+2];
+    sum += Math.abs(lumA - lumB);
+  }
+  return sum / n;
+}
+
+// Requirement: representative frames are the ROI cropped at the video's OWN native resolution, no
+// downscaling — this is the actual image handed off to tab-score-builder, so quality matters here.
+function captureRoiNative(video, roi) {
+  const { rx0, ry0, rw, rh } = roiRectPx(video, roi);
+  const w = Math.max(1, Math.round(rw)), h = Math.max(1, Math.round(rh));
+  roiCaptureCanvas.width = w; roiCaptureCanvas.height = h;
+  roiCaptureCtx.drawImage(video, rx0, ry0, rw, rh, 0, 0, w, h);
+  return { dataUrl: roiCaptureCanvas.toDataURL('image/png'), w, h };
+}
+
+function seekTo(video, t) {
+  return new Promise(resolve => {
+    const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
+    video.addEventListener('seeked', onSeeked);
+    video.currentTime = t;
+  });
+}
+
+function Lightbox({ src, onClose }) {
+  if (!src) return null;
+  return (
+    <div className="preview-modal-backdrop" onClick={onClose}>
+      <div className="preview-modal" onClick={e => e.stopPropagation()}>
+        <div className="preview-modal-head">
+          <span>프레임 크게 보기</span>
+          <button className="icon-btn" onClick={onClose}>닫기</button>
+        </div>
+        <div className="preview-modal-body"><img src={src} alt="프레임 크게 보기" /></div>
+      </div>
+    </div>
+  );
+}
+
+function CaptureStep({ videoRef, frames, setFrames, onNext }) {
+  const roiCanvasRef = useRef(null);
+  const roiBoxRef = useRef(null);
+  const chartRef = useRef(null);
+  const dragStartRef = useRef(null);
+  const roiRef = useRef(null);
+  const seekBusyRef = useRef(false);
+  const pendingSeekRef = useRef(null);
+
+  const [videoLoaded, setVideoLoaded] = useState(false);
+  const [duration, setDuration] = useState(0);
+  const [seekT, setSeekT] = useState(0);
+  const [roi, setRoi] = useState(null);
+  const [stepSec, setStepSec] = useState(0.3);
+  const [analysis, setAnalysis] = useState(null);
+  const [threshold, setThreshold] = useState(0);
+  const [thresholdRange, setThresholdRange] = useState({ min: 0, max: 50, step: 0.1 });
+  const [analyzing, setAnalyzing] = useState(false);
+  const [extracting, setExtracting] = useState(false);
+  const [statusMsg, setStatusMsg] = useState('영상 파일을 선택하세요.');
+  const [lightboxSrc, setLightboxSrc] = useState(null);
+
+  function log(msg) { setStatusMsg(msg); }
+
+  function drawRoiBoxOverlay() {
+    const box = roiBoxRef.current, canvas = roiCanvasRef.current;
+    if (!box || !canvas) return;
+    const r = roiRef.current;
+    if (!r) { box.style.display = 'none'; return; }
+    const rect = canvas.getBoundingClientRect();
+    box.style.left = (r.x0 * rect.width) + 'px';
+    box.style.top = (r.y0 * rect.height) + 'px';
+    box.style.width = ((r.x1 - r.x0) * rect.width) + 'px';
+    box.style.height = ((r.y1 - r.y0) * rect.height) + 'px';
+    box.style.display = 'block';
+  }
+  useEffect(() => { roiRef.current = roi; drawRoiBoxOverlay(); }, [roi]);
+  useEffect(() => {
+    window.addEventListener('resize', drawRoiBoxOverlay);
+    return () => window.removeEventListener('resize', drawRoiBoxOverlay);
+  }, []);
+
+  function drawChart(times, diffs, th) {
+    const canvas = chartRef.current;
+    if (!canvas || !diffs || diffs.length === 0) return;
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width = canvas.clientWidth;
+    const h = canvas.height = 120;
+    ctx.clearRect(0, 0, w, h);
+    // Always scaled to the actual observed max — never to the threshold — so the graph stays honest
+    // regardless of where the threshold slider currently sits.
+    const maxDiff = Math.max(...diffs, 1) * 1.15;
+    ctx.strokeStyle = '#3c3489';
+    ctx.beginPath();
+    diffs.forEach((d, i) => {
+      const x = (i / Math.max(1, diffs.length - 1)) * w;
+      const y = h - (d / maxDiff) * h;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    const ty = h - (th / maxDiff) * h;
+    ctx.strokeStyle = '#cc3333';
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(0, ty); ctx.lineTo(w, ty); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  useEffect(() => { if (analysis) drawChart(analysis.times, analysis.diffs, threshold); }, [threshold, analysis]);
+
+  async function showFrameAt(t) {
+    const video = videoRef.current;
+    await seekTo(video, Math.min(t, Math.max(0, video.duration - 0.05)));
+    const canvas = roiCanvasRef.current;
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0);
+    drawRoiBoxOverlay();
+  }
+
+  function requestScrub(t) {
+    pendingSeekRef.current = t;
+    if (seekBusyRef.current) return;
+    seekBusyRef.current = true;
+    (async () => {
+      while (pendingSeekRef.current != null) {
+        const target = pendingSeekRef.current;
+        pendingSeekRef.current = null;
+        await showFrameAt(target);
+      }
+      seekBusyRef.current = false;
+    })();
+  }
+
+  function handleFileChange(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const video = videoRef.current;
+    video.src = URL.createObjectURL(file);
+    setVideoLoaded(false);
+    setRoi(null);
+    setAnalysis(null);
+    setFrames([]);
+    video.onloadedmetadata = async () => {
+      setVideoLoaded(true);
+      setDuration(video.duration);
+      setSeekT(0);
+      log('영상 로드됨: ' + video.duration.toFixed(2) + '초, ' + video.videoWidth + 'x' + video.videoHeight);
+      // Wakes the decoder — without this, a video that's only ever been visually hidden can fail to
+      // decode frames on first seek in some browsers (Safari in particular).
+      try { await video.play(); video.pause(); } catch (err) { /* autoplay policy — safe to ignore */ }
+      await showFrameAt(0);
+    };
+  }
+
+  function onSeekSliderChange(e) {
+    const t = parseFloat(e.target.value);
+    setSeekT(t);
+    requestScrub(t);
+  }
+
+  function canvasPoint(e) {
+    const canvas = roiCanvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width, scaleY = canvas.height / rect.height;
+    return { x: (e.clientX - rect.left) * scaleX, y: (e.clientY - rect.top) * scaleY, scaleX, scaleY };
+  }
+  function onRoiMouseDown(e) { dragStartRef.current = canvasPoint(e); }
+  function onRoiMouseMove(e) {
+    if (!dragStartRef.current) return;
+    const cur = canvasPoint(e);
+    const box = roiBoxRef.current;
+    const x0 = Math.min(dragStartRef.current.x, cur.x) / cur.scaleX;
+    const y0 = Math.min(dragStartRef.current.y, cur.y) / cur.scaleY;
+    const w = Math.abs(cur.x - dragStartRef.current.x) / cur.scaleX;
+    const h = Math.abs(cur.y - dragStartRef.current.y) / cur.scaleY;
+    box.style.left = x0 + 'px'; box.style.top = y0 + 'px';
+    box.style.width = w + 'px'; box.style.height = h + 'px';
+    box.style.display = 'block';
+  }
+  useEffect(() => {
+    function onUp(e) {
+      if (!dragStartRef.current) return;
+      const canvas = roiCanvasRef.current;
+      const start = dragStartRef.current;
+      dragStartRef.current = null;
+      const cur = canvasPoint(e);
+      const curX = Math.max(0, Math.min(canvas.width, cur.x));
+      const curY = Math.max(0, Math.min(canvas.height, cur.y));
+      const x0 = Math.min(start.x, curX), x1 = Math.max(start.x, curX);
+      const y0 = Math.min(start.y, curY), y1 = Math.max(start.y, curY);
+      if (x1 - x0 < 5 || y1 - y0 < 5) return; // too small — treat as an accidental click, not a drag
+      setRoi({ x0: x0 / canvas.width, y0: y0 / canvas.height, x1: x1 / canvas.width, y1: y1 / canvas.height });
+    }
+    window.addEventListener('mouseup', onUp);
+    return () => window.removeEventListener('mouseup', onUp);
+  }, []);
+
+  async function analyze() {
+    if (!videoLoaded) { log('영상을 먼저 선택하세요.'); return; }
+    setAnalyzing(true);
+    setFrames([]);
+    const video = videoRef.current;
+    const step = parseFloat(stepSec) || 0.3;
+    const duration = video.duration;
+    const times = [], diffs = [];
+    let prevSample = null;
+    try {
+      let t = 0, idx = 0;
+      while (t < duration) {
+        await seekTo(video, t);
+        const sample = getRoiPixelsForDiff(video, roiRef.current);
+        if (prevSample) { diffs.push(diffScore(prevSample, sample)); times.push(t); }
+        prevSample = sample;
+        idx++;
+        if (idx % 10 === 0) log('분석 중... ' + t.toFixed(1) + 's / ' + duration.toFixed(1) + 's');
+        t += step;
+      }
+      setAnalysis({ times, diffs });
+      const maxObserved = Math.max(...diffs, 0.1);
+      setThresholdRange({ min: 0, max: maxObserved * 1.3, step: Math.max(0.001, maxObserved / 200) });
+      const initialThreshold = maxObserved * 0.5;
+      setThreshold(initialThreshold);
+      log('diff 계산 완료. 관측된 값 범위: 최소 ' + Math.min(...diffs).toFixed(2) + ' ~ 최대 ' + maxObserved.toFixed(2)
+        + '. 아래 슬라이더로 임계값을 조절하고 "대표 프레임 다시 뽑기"를 눌러보세요.');
+    } catch (err) {
+      log('분석 중 오류: ' + err.message);
+    } finally {
+      setAnalyzing(false);
+    }
+  }
+
+  function extractSegments(th) {
+    const { times, diffs } = analysis;
+    const cutIndices = [];
+    for (let i = 0; i < diffs.length; i++) if (diffs[i] > th) cutIndices.push(i);
+    const segments = [];
+    let segStart = 0;
+    for (const ci of cutIndices) { if (ci > segStart) segments.push([segStart, ci]); segStart = ci + 1; }
+    if (segStart < times.length) segments.push([segStart, times.length - 1]);
+    return segments;
+  }
+
+  async function reextract() {
+    if (!analysis) { log('먼저 "분석 시작"으로 diff를 계산하세요.'); return; }
+    setExtracting(true);
+    try {
+      const { times } = analysis;
+      const segments = extractSegments(threshold);
+      log('임계값 ' + threshold.toFixed(2) + ' 적용: 안정 구간 ' + segments.length + '개. 대표 프레임(지정 영역, 원본 해상도)을 추출합니다...');
+      const video = videoRef.current;
+      const newFrames = [];
+      for (let s = 0; s < segments.length; s++) {
+        const [segStartIdx, segEndIdx] = segments[s];
+        const repIdx = Math.max(segStartIdx, segEndIdx - 1);
+        const repTime = times[repIdx] != null ? times[repIdx] : times[segStartIdx];
+        await seekTo(video, repTime);
+        const captured = captureRoiNative(video, roiRef.current);
+        newFrames.push({
+          id: 'f_' + Date.now() + '_' + s,
+          dataUrl: captured.dataUrl, w: captured.w, h: captured.h,
+          segStartT: times[segStartIdx], segEndT: times[segEndIdx], repT: repTime,
+        });
+      }
+      setFrames(newFrames);
+      log('완료. 임계값 ' + threshold.toFixed(2) + ' 기준, 대표 프레임 ' + newFrames.length + '장 추출됨. 결과가 마음에 안 들면 슬라이더를 조절해서 다시 뽑아보세요.');
+    } catch (err) {
+      log('추출 중 오류: ' + err.message);
+    } finally {
+      setExtracting(false);
+    }
+  }
+
+  return (
+    <div>
+      <div className="block">
+        <div className="block-head"><span>1단계 — 영상에서 TAB 영역 지정 및 대표 프레임 추출</span></div>
+        <p className="hint-text">
+          영상 파일을 선택하면 첫 프레임이 아래에 표시됩니다. 그 위에서 <b>TAB 숫자/코드가 나오는 영역을 마우스로 드래그해서 지정</b>하세요
+          (영상마다 TAB 위치 비율이 다르므로 직접 지정해야 합니다 — 지정하지 않으면 화면 전체를 사용합니다).
+          아래 "영상 위치" 슬라이더로 다른 시점도 확인하며 영역을 잡을 수 있습니다.
+        </p>
+        <div className="controls">
+          <label>영상 파일: <input type="file" accept="video/*" onChange={handleFileChange} /></label>
+        </div>
+
+        <div className="roi-wrap">
+          <canvas ref={roiCanvasRef} className="roi-canvas" onMouseDown={onRoiMouseDown} onMouseMove={onRoiMouseMove} />
+          <div ref={roiBoxRef} className="roi-box" />
+        </div>
+        <div className="slider-label">
+          {roi
+            ? ('지정된 영역: 가로 ' + (roi.x0*100).toFixed(0) + '%~' + (roi.x1*100).toFixed(0) + '%, 세로 ' + (roi.y0*100).toFixed(0) + '%~' + (roi.y1*100).toFixed(0) + '%')
+            : '아직 영역을 지정하지 않았습니다. (지정하지 않으면 화면 전체로 분석합니다)'}
+        </div>
+
+        <div className="toolbar">
+          <label style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
+            영상 위치:
+            <input type="range" min="0" max={duration || 0} step="0.1" value={seekT} disabled={!videoLoaded}
+              style={{ flex: 1 }} onChange={onSeekSliderChange} />
+            <span className="slider-label" style={{ margin: 0, whiteSpace: 'nowrap' }}>{seekT.toFixed(1)}s / {duration.toFixed(1)}s</span>
+          </label>
+        </div>
+        <div className="toolbar">
+          <button className="icon-btn" onClick={() => setRoi(null)} disabled={!roi}>영역 초기화</button>
+          <span className="slider-label" style={{ margin: 0 }}>샘플링 간격(초)</span>
+          <input type="number" value={stepSec} step="0.1" min="0.05" onChange={e => setStepSec(e.target.value)} />
+          <button onClick={analyze} disabled={!videoLoaded || analyzing}>{analyzing ? '분석 중...' : '분석 시작 (diff 계산)'}</button>
+        </div>
+
+        {analysis && (
+          <div className="toolbar">
+            <label style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span className="slider-label" style={{ margin: 0, whiteSpace: 'nowrap' }}>전환 판정 임계값</span>
+              <input type="range" min={thresholdRange.min} max={thresholdRange.max} step={thresholdRange.step}
+                value={threshold} style={{ flex: 1 }} onChange={e => setThreshold(parseFloat(e.target.value))} />
+              <span className="slider-label" style={{ margin: 0 }}>{threshold.toFixed(2)}</span>
+            </label>
+            <button className="icon-btn" onClick={reextract} disabled={extracting}>
+              {extracting ? '추출 중...' : '이 임계값으로 대표 프레임 다시 뽑기'}
+            </button>
+          </div>
+        )}
+
+        <div className="slider-label" style={{ whiteSpace: 'pre-wrap' }}>{statusMsg}</div>
+        <canvas ref={chartRef} className="chart-canvas" />
+      </div>
+
+      {frames.length > 0 && (
+        <div className="block">
+          <div className="block-head"><span>추출된 대표 프레임 ({frames.length}장) — 클릭하면 크게 볼 수 있습니다</span></div>
+          <div className="thumb-grid">
+            {frames.map((f, i) => (
+              <div key={f.id} className="thumb-card view-only" onClick={() => setLightboxSrc(f.dataUrl)}>
+                <img src={f.dataUrl} alt={'프레임 ' + (i + 1)} />
+                <div className="thumb-meta">#{i + 1} · {f.repT.toFixed(1)}s · {f.w}×{f.h}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="toolbar">
+        <button onClick={onNext} disabled={frames.length === 0 || extracting}>다음 →</button>
+      </div>
+
+      <Lightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />
+    </div>
+  );
+}
+
+function SelectStep({ frames, selectedFrameIds, setSelectedFrameIds, onBack, onNext }) {
+  function toggle(id) {
+    setSelectedFrameIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+  return (
+    <div>
+      <div className="block">
+        <div className="block-head"><span>2단계 — 악보로 쓸 프레임 선택</span></div>
+        <p className="hint-text">실제로 악보에 쓸 프레임만 체크하세요. 필요 없는 프레임(장면 전환 중 어중간한 프레임 등)은 해제하면 됩니다.</p>
+        <div className="toolbar">
+          <button className="icon-btn" onClick={() => setSelectedFrameIds(new Set(frames.map(f => f.id)))}>전체 선택</button>
+          <button className="icon-btn" onClick={() => setSelectedFrameIds(new Set())}>전체 해제</button>
+          <span className="save-msg">{selectedFrameIds.size} / {frames.length}장 선택됨</span>
+        </div>
+        <div className="thumb-grid">
+          {frames.map((f, i) => (
+            <label key={f.id} className={selectedFrameIds.has(f.id) ? 'thumb-card selectable selected' : 'thumb-card selectable'}>
+              <input type="checkbox" checked={selectedFrameIds.has(f.id)} onChange={() => toggle(f.id)} />
+              <img src={f.dataUrl} alt={'프레임 ' + (i + 1)} />
+              <div className="thumb-meta">#{i + 1} · {f.repT.toFixed(1)}s</div>
+            </label>
+          ))}
+        </div>
+      </div>
+      <div className="toolbar">
+        <button className="icon-btn" onClick={onBack}>← 이전</button>
+        <button onClick={onNext} disabled={selectedFrameIds.size === 0}>선택한 {selectedFrameIds.size}장으로 전처리 계속 →</button>
+      </div>
+    </div>
+  );
+}
+
+const FrameCard = React.memo(function FrameCard({ item, index, defaults, onChange }) {
+  const canvasRef = useRef(null);
+  const imgRef = useRef(null);
+  const [advanced, setAdvanced] = useState(!!item.override);
+  const eff = effectiveImageSettings(item, defaults);
+
+  useEffect(() => {
+    let active = true;
+    loadImage(item.src).then(img => {
+      if (!active) return;
+      imgRef.current = img;
+      redraw();
+    });
+    return () => { active = false; };
+  }, [item.src]);
+
+  useEffect(() => { redraw(); });
+
+  function redraw() {
+    if (!imgRef.current || !canvasRef.current) return;
+    drawProcessed(canvasRef.current, imgRef.current, effectiveImageSettings(item, defaults));
+  }
+
+  function updateOverride(patch) {
+    const base = item.override || eff;
+    onChange({ ...item, override: { ...base, ...patch } });
+  }
+  function enableAdvanced() {
+    setAdvanced(true);
+    if (!item.override) onChange({ ...item, override: { ...eff } });
+  }
+  function clearOverride() {
+    setAdvanced(false);
+    onChange({ ...item, override: null });
+  }
+
+  return (
+    <div className="block">
+      <div className="block-head"><span>프레임 {index + 1}</span></div>
+      <canvas ref={canvasRef} className="preview" />
+      <div className="controls">
+        {!advanced ? (
+          <div className="adv-toggle-row">
+            <span>기본 설정을 따르는 중</span>
+            <button className="icon-btn" onClick={enableAdvanced}>고급 설정 사용</button>
+          </div>
+        ) : (
+          <React.Fragment>
+            <div className="adv-toggle-row">
+              <span>이 프레임만의 고급 설정 사용 중</span>
+              <button className="icon-btn" onClick={clearOverride}>기본값 따르기로 되돌리기</button>
+            </div>
+            <label>
+              <input type="checkbox" checked={eff.removeBg} onChange={e => updateOverride({ removeBg: e.target.checked })} />
+              배경 제거 (사진 배경 → 흰색)
+            </label>
+            {eff.removeBg && (
+              <React.Fragment>
+                <label>
+                  <input type="checkbox" checked={eff.invert} onChange={e => updateOverride({ invert: e.target.checked })} />
+                  어두운 배경 (밝은 글씨/선을 검정으로 변환)
+                </label>
+                <div>
+                  <div className="slider-label">배경 제거 강도 ({eff.threshold})</div>
+                  <input type="range" min="0" max="255" step="1" value={eff.threshold}
+                    onChange={e => updateOverride({ threshold: Number(e.target.value) })} />
+                </div>
+                <div>
+                  <div className="slider-label">부드러운 경계 — 안티앨리어싱 유지 ({eff.softness})</div>
+                  <input type="range" min="0" max="60" step="1" value={eff.softness}
+                    onChange={e => updateOverride({ softness: Number(e.target.value) })} />
+                </div>
+                <label>
+                  <input type="checkbox" checked={eff.despeckle} onChange={e => updateOverride({ despeckle: e.target.checked })} />
+                  잡티(고립 노이즈) 제거
+                </label>
+                {eff.despeckle && (
+                  <div>
+                    <div className="slider-label">제거할 잡티 크기 ({eff.despeckleSize}px 이하)</div>
+                    <input type="range" min="1" max="12" step="1" value={eff.despeckleSize}
+                      onChange={e => updateOverride({ despeckleSize: Number(e.target.value) })} />
+                  </div>
+                )}
+              </React.Fragment>
+            )}
+          </React.Fragment>
+        )}
+      </div>
+    </div>
+  );
+});
+
+function PreprocessStep({ items, setItems, defaults, setDefaults, onBack }) {
+  const [sending, setSending] = useState(false);
+  function update(patch) { setDefaults(prev => ({ ...prev, ...patch })); }
+  function updateItem(id, next) { setItems(prev => prev.map(it => it.id === id ? next : it)); }
+
+  async function handleSend() {
+    setSending(true);
+    try {
+      // Bake each item's RESOLVED settings (global default or override, whichever applies) into a
+      // concrete override — so what was previewed here is exactly what appears after handoff,
+      // regardless of whatever tab-score-builder.html's OWN global defaults happen to be set to.
+      const finalItems = items.map(it => {
+        const eff = effectiveImageSettings(it, defaults);
+        return {
+          id: it.id, type: 'image', src: it.src,
+          invert: eff.invert, override: { ...eff },
+          lyrics: { tags: [], areaHeightRatio: null },
+          playheadExcluded: [], barLayout: null, stitchMeta: null,
+        };
+      });
+      await dbPut(VIDEO_IMPORT_KEY, { items: finalItems, importedAt: Date.now() });
+      window.location.href = 'tab-score-builder.html';
+    } catch (err) {
+      alert('전달 중 오류가 발생했습니다: ' + err.message);
+      setSending(false);
+    }
+  }
+
+  return (
+    <div>
+      <div className="block">
+        <div className="block-head"><span>3단계 — 전처리 (배경 제거 · 부드러운 경계 · 잡티 제거)</span></div>
+        <p className="hint-text">tab-score-builder.html과 동일한 방식입니다 — 아래 기본값이 모든 프레임에 실시간 적용되고, 특정 프레임만 다르게 하려면 그 프레임의 "고급 설정 사용"을 누르세요.</p>
+        <div className="controls">
+          <label>
+            <input type="checkbox" checked={defaults.removeBg} onChange={e => update({ removeBg: e.target.checked })} />
+            배경 제거 기본 사용
+          </label>
+          <div>
+            <div className="slider-label">어두운 배경 처리</div>
+            <select value={defaults.invertMode} onChange={e => update({ invertMode: e.target.value })}>
+              <option value="auto">자동 감지</option>
+              <option value="on">항상 반전 (어두운 사진 배경)</option>
+              <option value="off">항상 일반 (밝은/흰 배경)</option>
+            </select>
+          </div>
+          <div>
+            <div className="slider-label">배경 제거 강도 ({defaults.threshold})</div>
+            <input type="range" min="0" max="255" step="1" value={defaults.threshold}
+              onChange={e => update({ threshold: Number(e.target.value) })} />
+          </div>
+          <div>
+            <div className="slider-label">부드러운 경계 — 안티앨리어싱 유지 ({defaults.softness})</div>
+            <input type="range" min="0" max="60" step="1" value={defaults.softness}
+              onChange={e => update({ softness: Number(e.target.value) })} />
+          </div>
+          <label>
+            <input type="checkbox" checked={defaults.despeckle} onChange={e => update({ despeckle: e.target.checked })} />
+            잡티(고립 노이즈) 제거
+          </label>
+          {defaults.despeckle && (
+            <div>
+              <div className="slider-label">제거할 잡티 크기 ({defaults.despeckleSize}px 이하)</div>
+              <input type="range" min="1" max="12" step="1" value={defaults.despeckleSize}
+                onChange={e => update({ despeckleSize: Number(e.target.value) })} />
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="list">
+        {items.map((it, i) => (
+          <FrameCard key={it.id} item={it} index={i} defaults={defaults} onChange={next => updateItem(it.id, next)} />
+        ))}
+      </div>
+
+      <div className="toolbar">
+        <button className="icon-btn" onClick={onBack} disabled={sending}>← 이전</button>
+        <button onClick={handleSend} disabled={sending || items.length === 0}>
+          {sending ? '전달 중...' : 'TAB 악보 만들기로 보내기 (' + items.length + '장) →'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const videoRef = useRef(null);
+  const [step, setStep] = useState('capture');
+  const [frames, setFrames] = useState([]);
+  const [selectedFrameIds, setSelectedFrameIds] = useState(new Set());
+  const [items, setItems] = useState([]);
+  const [defaults, setDefaults] = useState(VIDEO_DEFAULTS_INIT);
+
+  async function goToPreprocess() {
+    const selected = frames.filter(f => selectedFrameIds.has(f.id));
+    const built = await Promise.all(selected.map(async f => {
+      const img = await loadImage(f.dataUrl);
+      const avg = sampleAvgLuminance(img);
+      return {
+        id: f.id, type: 'image', src: f.dataUrl,
+        invert: avg < 128, override: null,
+        lyrics: { tags: [], areaHeightRatio: null },
+        playheadExcluded: [], barLayout: null, stitchMeta: null,
+      };
+    }));
+    setItems(built);
+    setStep('preprocess');
+  }
+
+  return (
+    <div className="app">
+      {/* Always rendered here at the App root (never inside a step wrapper that gets hidden) — a
+          <video> nested inside a display:none ancestor can fail to decode frames in Safari even
+          when the video element's own styles only make it visually tiny/transparent. */}
+      <video ref={videoRef} muted className="hidden-video" />
+
+      <div className="titlebar">
+        <h1>영상에서 TAB 추출</h1>
+        <a className="nav-link" href="tab-score-builder.html">TAB 악보 결합 도구 →</a>
+      </div>
+
+      <div className="notice-banner">
+        <div>
+          <b>안내:</b> 이 도구는 화면이 통째로 바뀌는 <b>"페이지 전환형"</b> TAB 영상만 지원합니다 — 스크롤형·투명 오버레이형 영상은
+          아직 감지되지 않으며 지원하지 않습니다. 모든 처리는 이 브라우저 안에서만 이뤄지고, 영상이나 이미지를 서버로 전송하지 않습니다.
+        </div>
+      </div>
+
+      <div className="step-nav">
+        <span className={step === 'capture' ? 'step active' : 'step'}>1. 영역 지정 · 추출</span>
+        <span className="arrow">→</span>
+        <span className={step === 'select' ? 'step active' : 'step'}>2. 프레임 선택</span>
+        <span className="arrow">→</span>
+        <span className={step === 'preprocess' ? 'step active' : 'step'}>3. 전처리 · 전달</span>
+      </div>
+
+      {/* Each step stays mounted (display:none when inactive, not unmounted) so its state — loaded
+          video, ROI, diff analysis, per-frame overrides — survives moving back and forth. */}
+      <div style={{ display: step === 'capture' ? 'block' : 'none' }}>
+        <CaptureStep videoRef={videoRef} frames={frames} setFrames={setFrames}
+          onNext={() => { setSelectedFrameIds(new Set(frames.map(f => f.id))); setStep('select'); }} />
+      </div>
+      <div style={{ display: step === 'select' ? 'block' : 'none' }}>
+        <SelectStep frames={frames} selectedFrameIds={selectedFrameIds} setSelectedFrameIds={setSelectedFrameIds}
+          onBack={() => setStep('capture')} onNext={goToPreprocess} />
+      </div>
+      <div style={{ display: step === 'preprocess' ? 'block' : 'none' }}>
+        <PreprocessStep items={items} setItems={setItems} defaults={defaults} setDefaults={setDefaults}
+          onBack={() => setStep('select')} />
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

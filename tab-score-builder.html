@@ -202,6 +202,10 @@ const { useState, useRef, useEffect } = React;
 const DB_NAME = 'tab_score_builder_db';
 const STORE_NAME = 'scores';
 const DRAFT_KEY = '__draft__';
+// Same IndexedDB database/store, a separate key — video-tab-extractor.html (a fully independent
+// static page) writes a batch of extracted+preprocessed items here right before navigating to this
+// page, so the handoff needs no server and no localStorage size risk for many/large frames.
+const VIDEO_IMPORT_KEY = '__video_import__';
 
 // ---- timeout guard for async steps with no built-in completion guarantee ----
 // Reproduced (both from a real user report and independently via headless-browser testing on the
@@ -2483,8 +2487,17 @@ function TabScoreBuilder() {
           if (draft.lyricFontSize) setLyricFontSize(draft.lyricFontSize);
           if (draft.lyricLetterSpacing) setLyricLetterSpacing(draft.lyricLetterSpacing);
         }
+        // Consumed once, right after the draft above (so it appends on top rather than racing it) —
+        // deleted immediately after reading so a page refresh never re-imports the same batch.
+        const imported = await dbGet(VIDEO_IMPORT_KEY);
+        if (imported && Array.isArray(imported.items) && imported.items.length > 0) {
+          setItems(prev => [...prev, ...imported.items]);
+          await dbDelete(VIDEO_IMPORT_KEY);
+          setSaveMsg('영상에서 추출한 이미지 ' + imported.items.length + '장을 불러왔습니다.');
+          setTimeout(() => setSaveMsg(''), 3000);
+        }
         const keys = await dbAllKeys();
-        setSavedList(keys.filter(k => k !== DRAFT_KEY));
+        setSavedList(keys.filter(k => k !== DRAFT_KEY && k !== VIDEO_IMPORT_KEY));
       } catch (e) {
         console.warn('IndexedDB 사용 불가:', e);
       }
@@ -2886,6 +2899,7 @@ function TabScoreBuilder() {
     <div className="app">
       <div className="titlebar">
         <input type="text" value={title} onChange={e => setTitle(e.target.value)} placeholder="악보 제목을 입력하세요" />
+        <a className="nav-link" href="video-tab-extractor.html">영상에서 추출 →</a>
         <a className="nav-link" href="index.html">코드보 만들기 →</a>
       </div>
 
