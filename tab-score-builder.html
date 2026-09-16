@@ -63,6 +63,21 @@
   canvas.preview{width:100%;display:block;background:#fff;border:1px solid var(--border);border-radius:8px;}
   .adv-toggle-row{display:flex;justify-content:space-between;align-items:center;font-size:12.5px;color:var(--text2);gap:8px;}
   .lyric-section{margin-top:14px;border-top:1px solid var(--border);padding-top:12px;}
+  .hint-text{font-size:12.5px;color:var(--text2);line-height:1.6;margin:0 0 8px;}
+  video.hidden-video{position:fixed;top:0;left:0;width:2px;height:2px;opacity:0.01;pointer-events:none;}
+  .onset-lyric-panel{border:1px solid var(--border-strong);border-radius:10px;padding:10px;margin-bottom:12px;background:#fdfdfb;}
+  .onset-lyric-panel:focus{outline:2px solid var(--accent);outline-offset:2px;}
+  .onset-line-input{width:100%;box-sizing:border-box;font-size:13px;padding:6px 8px;border:1px solid var(--border-strong);border-radius:8px;resize:vertical;margin-bottom:8px;font-family:inherit;}
+  .onset-syllable-queue{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;}
+  .syllable-chip{display:inline-block;padding:2px 7px;border-radius:6px;font-size:13px;background:var(--card);border:1px solid var(--border);color:var(--text2);}
+  .syllable-chip.active{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600;}
+  .syllable-chip.done{opacity:0.4;text-decoration:line-through;}
+  .onset-wave-wrap{position:relative;width:100%;margin-bottom:6px;}
+  .onset-wave-canvas{width:100%;display:block;border:1px solid var(--border);border-radius:8px;}
+  .onset-cursor-canvas{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;}
+  .onset-status-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;}
+  .onset-guidance{color:#c0392b;}
+  .onset-keys-hint{margin:0;}
   .lyric-head-mini{
     display:flex;justify-content:space-between;align-items:center;
     font-size:12px;color:var(--text2);margin-bottom:8px;gap:8px;
@@ -203,6 +218,10 @@ const DRAFT_KEY = '__draft__';
 // static page) writes a batch of extracted+preprocessed items here right before navigating to this
 // page, so the handoff needs no server and no localStorage size risk for many/large frames.
 const VIDEO_IMPORT_KEY = '__video_import__';
+// One entry per video-extraction session (written once by video-tab-extractor.html, keyed by the
+// videoSourceId every item from that session carries): { videoBlob, onsets, savedAt }. Read here to
+// drive the syllable-onset-snap lyric placement mode's mini waveform + playback.
+const VIDEO_SOURCE_KEY_PREFIX = '__video_source__';
 
 const DEFAULTS_INIT = {
   removeBg: true,
@@ -1210,7 +1229,301 @@ async function exportPagesAsZip(canvases, title, format) {
   URL.revokeObjectURL(url);
 }
 
-const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults, lyricFontSize, lyricLetterSpacing, defaultLyricAreaHeight, onChange, onDelete, onMove, mergeSelected, onToggleMergeSelect }) {
+// ---- syllable-onset-snap lyric placement (video-extraction blocks only) ----
+// Splits a pasted lyric line into placeable tokens: each Hangul syllable becomes its own token
+// (Korean lyrics are conventionally one syllable per beat/note), while a run of non-Hangul
+// characters (numbers, English words, punctuation) is kept together as a single token.
+function tokenizeLyricLine(text) {
+  const trimmed = (text || '').trim();
+  if (!trimmed) return [];
+  const tokens = [];
+  let buf = '';
+  const isHangul = ch => /[가-힣]/.test(ch);
+  for (const ch of trimmed) {
+    if (/\s/.test(ch)) { if (buf) { tokens.push(buf); buf = ''; } continue; }
+    if (isHangul(ch)) { if (buf) { tokens.push(buf); buf = ''; } tokens.push(ch); }
+    else { buf += ch; }
+  }
+  if (buf) tokens.push(buf);
+  return tokens;
+}
+
+// One decode per videoSourceId, shared by every block extracted from the same video (several
+// ImageBlocks can carry the same id) — avoids re-fetching/re-decoding the same Blob repeatedly.
+const _videoSourceMetaCache = new Map();
+function loadVideoSourceMeta(videoSourceId) {
+  if (!videoSourceId) return Promise.resolve(null);
+  if (_videoSourceMetaCache.has(videoSourceId)) return _videoSourceMetaCache.get(videoSourceId);
+  const p = (async () => {
+    const rec = await dbGet(VIDEO_SOURCE_KEY_PREFIX + videoSourceId);
+    if (!rec || !rec.videoBlob) return null;
+    const objectUrl = URL.createObjectURL(rec.videoBlob);
+    let monoData = null, sampleRate = null;
+    try {
+      const arrayBuffer = await rec.videoBlob.arrayBuffer();
+      const ac = new (window.AudioContext || window.webkitAudioContext)();
+      const audioBuffer = await ac.decodeAudioData(arrayBuffer);
+      monoData = audioBuffer.getChannelData(0);
+      sampleRate = audioBuffer.sampleRate;
+      ac.close();
+    } catch (err) {
+      console.error('오디오 디코딩 실패', err);
+    }
+    return { objectUrl, onsets: rec.onsets || [], monoData, sampleRate };
+  })();
+  _videoSourceMetaCache.set(videoSourceId, p);
+  return p;
+}
+
+const ONSET_LANE_Y_PCT = 50; // fixed placement row for onset-snapped syllables; drag handle fine-tunes it after
+
+// Above a video-extraction block's existing (manual, drag-handle) lyric lane, this panel adds a
+// keyboard-driven placement mode: paste the line's lyrics, they're tokenized into syllables, and
+// each is snapped onto the mini waveform (cropped to this block's own video time range) at the
+// exact playback position where Enter was pressed. Renders nothing (and touches nothing) for a
+// manually-uploaded block, since those never carry item.timeRange/videoSourceId.
+function OnsetLyricPanel({ item, addTagAt, removeTagById, removeTagsByIds, nextItemId }) {
+  const hasMeta = !!(item.timeRange && item.videoSourceId);
+  const [meta, setMeta] = useState(null);
+  const [metaLoading, setMetaLoading] = useState(hasMeta);
+  const [lineText, setLineText] = useState('');
+  const [placedIds, setPlacedIds] = useState([]);
+  const [activeSyllableIndex, setActiveSyllableIndex] = useState(0);
+  const [activeOnsetIndex, setActiveOnsetIndex] = useState(0);
+  const [guidance, setGuidance] = useState('');
+  const [waveW, setWaveW] = useState(600);
+
+  const videoElRef = useRef(null);
+  const waveWrapRef = useRef(null);
+  const waveCanvasRef = useRef(null);
+  const cursorCanvasRef = useRef(null);
+  const timeLabelRef = useRef(null);
+
+  useEffect(() => {
+    if (!hasMeta) return;
+    let cancelled = false;
+    setMetaLoading(true);
+    loadVideoSourceMeta(item.videoSourceId).then(m => {
+      if (cancelled) return;
+      setMeta(m);
+      setMetaLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [item.videoSourceId, hasMeta]);
+
+  useEffect(() => {
+    function measure() { if (waveWrapRef.current) setWaveW(waveWrapRef.current.offsetWidth || 600); }
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, []);
+
+  const start = item.timeRange ? item.timeRange.start : 0;
+  const end = item.timeRange ? item.timeRange.end : 0;
+  const blockOnsets = meta ? meta.onsets.filter(t => t >= start - 0.02 && t <= end + 0.02) : [];
+  const syllables = tokenizeLyricLine(lineText);
+
+  useEffect(() => {
+    const video = videoElRef.current;
+    if (!video || !meta) return;
+    video.currentTime = start;
+  }, [meta]);
+
+  useEffect(() => {
+    const video = videoElRef.current;
+    if (!video || !meta) return;
+    function onTimeUpdate() {
+      if (video.currentTime < start) video.currentTime = start;
+      else if (video.currentTime > end) { video.pause(); video.currentTime = end; }
+    }
+    video.addEventListener('timeupdate', onTimeUpdate);
+    return () => video.removeEventListener('timeupdate', onTimeUpdate);
+  }, [meta, start, end]);
+
+  // Static waveform + onset ticks, redrawn whenever the decoded audio or this block's own range changes.
+  useEffect(() => {
+    if (!meta || !meta.monoData || !waveCanvasRef.current) return;
+    const canvas = waveCanvasRef.current;
+    const cursorCanvas = cursorCanvasRef.current;
+    if (cursorCanvas) { cursorCanvas.width = canvas.width; cursorCanvas.height = canvas.height; }
+    const sr = meta.sampleRate;
+    const startSample = Math.max(0, Math.floor(start * sr));
+    const endSample = Math.min(meta.monoData.length, Math.ceil(end * sr));
+    const slice = meta.monoData.subarray(startSample, endSample);
+    const w = canvas.width, h = canvas.height;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = '#f7f7f7';
+    ctx.fillRect(0, 0, w, h);
+    const samplesPerPx = Math.max(1, slice.length / w);
+    ctx.strokeStyle = '#3366cc';
+    ctx.beginPath();
+    const mid = h / 2;
+    for (let x = 0; x < w; x++) {
+      const s0 = Math.floor(x * samplesPerPx), s1 = Math.floor((x + 1) * samplesPerPx);
+      let min = 1, max = -1;
+      for (let i = s0; i < s1 && i < slice.length; i++) {
+        const v = slice[i];
+        if (v < min) min = v;
+        if (v > max) max = v;
+      }
+      if (min > max) { min = 0; max = 0; }
+      ctx.moveTo(x, mid + min * mid * 0.9);
+      ctx.lineTo(x, mid + max * mid * 0.9);
+    }
+    ctx.stroke();
+    ctx.strokeStyle = '#e74c3c';
+    ctx.lineWidth = 2;
+    blockOnsets.forEach(t => {
+      const x = ((t - start) / Math.max(0.001, end - start)) * w;
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, 14); ctx.stroke();
+    });
+    ctx.lineWidth = 1;
+    // eslint-disable-next-line
+  }, [meta, waveW, start, end]);
+
+  // Playback-position cursor, drawn on a separate overlay canvas via rAF so it never triggers a
+  // React re-render (this panel can otherwise repaint dozens of times per second while playing).
+  useEffect(() => {
+    if (!meta) return;
+    let raf;
+    function tick() {
+      const video = videoElRef.current, canvas = cursorCanvasRef.current;
+      if (video && canvas) {
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        const t = video.currentTime;
+        const x = ((t - start) / Math.max(0.001, end - start)) * canvas.width;
+        ctx.strokeStyle = '#2ecc71';
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+        if (timeLabelRef.current) {
+          timeLabelRef.current.textContent = Math.max(0, t - start).toFixed(2) + 's / ' + (end - start).toFixed(2) + 's';
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    }
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [meta, start, end]);
+
+  function seekToOnsetIndex(idx) {
+    if (!blockOnsets.length) return;
+    idx = Math.min(blockOnsets.length - 1, Math.max(0, idx));
+    setActiveOnsetIndex(idx);
+    const video = videoElRef.current;
+    if (!video) return;
+    video.pause();
+    video.currentTime = blockOnsets[idx];
+  }
+
+  function placeSyllable() {
+    if (activeSyllableIndex >= syllables.length) { setGuidance('먼저 이 줄의 가사를 아래에 입력하세요.'); return; }
+    const video = videoElRef.current;
+    if (!video) return;
+    const t = Math.min(end, Math.max(start, video.currentTime));
+    const xPct = ((t - start) / Math.max(0.001, end - start)) * 100;
+    const id = addTagAt(syllables[activeSyllableIndex], xPct, ONSET_LANE_Y_PCT);
+    setPlacedIds(prev => [...prev, id]);
+    setActiveSyllableIndex(i => i + 1);
+    setGuidance('');
+  }
+
+  function undoLast() {
+    if (placedIds.length === 0) return;
+    const lastId = placedIds[placedIds.length - 1];
+    removeTagById(lastId);
+    setPlacedIds(prev => prev.slice(0, -1));
+    setActiveSyllableIndex(i => Math.max(0, i - 1));
+    setGuidance('');
+  }
+
+  function resetLine() {
+    if (placedIds.length > 0) removeTagsByIds(placedIds);
+    setPlacedIds([]);
+    setActiveSyllableIndex(0);
+    setGuidance('');
+    const video = videoElRef.current;
+    if (video) { video.pause(); video.currentTime = start; }
+  }
+
+  function rewindAndReplay() {
+    const video = videoElRef.current;
+    if (!video) return;
+    video.currentTime = Math.max(start, video.currentTime - 1);
+    video.play().catch(() => {});
+  }
+
+  function advanceLine() {
+    if (activeSyllableIndex < syllables.length) {
+      setGuidance('아직 배치하지 않은 가사가 있습니다 — 모두 배치한 뒤 다음 줄로 이동할 수 있습니다.');
+      return;
+    }
+    setGuidance('');
+    if (nextItemId) {
+      const el = document.getElementById('onset-lyric-' + nextItemId);
+      if (el) el.focus();
+    }
+  }
+
+  function handleKeyDown(e) {
+    if (!meta) return;
+    // These shortcuts only fire when the panel's own outer container has focus — while the user is
+    // actually typing in the line-text textarea, every key (Space/Enter/Backspace included) must
+    // behave as normal text editing instead of being hijacked as a placement command.
+    if (e.target !== e.currentTarget) return;
+    if (e.code === 'Space') { e.preventDefault(); const v = videoElRef.current; if (!v) return; if (v.paused) v.play().catch(() => {}); else v.pause(); return; }
+    if (e.key === 'ArrowRight') { e.preventDefault(); seekToOnsetIndex(activeOnsetIndex + 1); return; }
+    if (e.key === 'ArrowLeft') { e.preventDefault(); seekToOnsetIndex(activeOnsetIndex - 1); return; }
+    if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); advanceLine(); return; }
+    if (e.key === 'PageDown') { e.preventDefault(); advanceLine(); return; }
+    if (e.key === 'Enter') { e.preventDefault(); placeSyllable(); return; }
+    if (e.key === 'Backspace' && e.shiftKey) { e.preventDefault(); resetLine(); return; }
+    if (e.key === 'Backspace') { e.preventDefault(); undoLast(); return; }
+    if ((e.key === 'r' || e.key === 'R') && !e.ctrlKey && !e.metaKey) { e.preventDefault(); rewindAndReplay(); return; }
+  }
+
+  if (!hasMeta) return null;
+
+  return (
+    <div id={'onset-lyric-' + item.id} className="onset-lyric-panel" tabIndex={0} onKeyDown={handleKeyDown}>
+      <div className="lyric-head-mini">
+        <span>음절 자동 배치 (온셋 스냅) — 이 영역을 클릭해 포커스한 뒤 키보드로 조작하세요</span>
+      </div>
+      {metaLoading && <div className="hint-text">원본 영상 데이터를 불러오는 중...</div>}
+      {!metaLoading && !meta && (
+        <div className="hint-text">이 이미지의 원본 영상 데이터를 찾을 수 없어 자동 배치를 사용할 수 없습니다 (아래 손잡이로 수동 배치는 가능합니다).</div>
+      )}
+      {meta && (
+        <React.Fragment>
+          <textarea className="onset-line-input" placeholder="이 줄의 가사를 붙여넣거나 입력하세요 (음절 단위로 자동 분리됩니다)"
+            value={lineText} onChange={e => setLineText(e.target.value)} rows={2} />
+          <div className="onset-syllable-queue">
+            {syllables.length === 0 && <span className="hint-text">위에 가사를 입력하면 음절이 여기 표시됩니다.</span>}
+            {syllables.map((syl, i) => (
+              <span key={i} className={'syllable-chip' + (i === activeSyllableIndex ? ' active' : (i < activeSyllableIndex ? ' done' : ''))}>{syl}</span>
+            ))}
+          </div>
+          <div className="onset-wave-wrap" ref={waveWrapRef}>
+            <canvas ref={waveCanvasRef} className="onset-wave-canvas" width={waveW} height={60} />
+            <canvas ref={cursorCanvasRef} className="onset-cursor-canvas" width={waveW} height={60} />
+          </div>
+          <div className="onset-status-row">
+            <span ref={timeLabelRef} className="save-msg">0.00s / {(end - start).toFixed(2)}s</span>
+            {guidance && <span className="save-msg onset-guidance">{guidance}</span>}
+          </div>
+          <video ref={videoElRef} src={meta.objectUrl} preload="auto" className="hidden-video" muted={false} />
+          <p className="hint-text onset-keys-hint">
+            Space 재생/일시정지 · ←/→ 이전/다음 온셋으로 이동 · Enter 현재 위치에 음절 배치 · Backspace 마지막 배치 취소 ·
+            Shift+Backspace 이 줄 전체 초기화 · R 약 1초 되감아 다시재생 · Shift+Enter 또는 PageDown 다음 줄로 이동 (모두 배치해야 이동됨)
+          </p>
+        </React.Fragment>
+      )}
+    </div>
+  );
+}
+
+const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults, lyricFontSize, lyricLetterSpacing, defaultLyricAreaHeight, onChange, onDelete, onMove, mergeSelected, onToggleMergeSelect, nextItemId }) {
   const canvasRef = useRef(null);
   const imgRef = useRef(null);
   const laneRef = useRef(null);
@@ -1385,6 +1698,23 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   }
   function deleteTag(id) {
     updateLyrics({ tags: tags.filter(t => t.id !== id) });
+  }
+  // Used by OnsetLyricPanel's keyboard-driven placement — same shape as addTag/deleteTag above,
+  // just with an explicit text/position instead of the "+ 가사 추가" button's fixed default.
+  function addTagAt(text, xPct, yPct) {
+    const id = Date.now() + '_' + Math.random().toString(36).slice(2);
+    updateLyrics({ tags: [...tags, { id, text, xPct, yPct }] });
+    return id;
+  }
+  function removeTagById(id) {
+    updateLyrics({ tags: tags.filter(t => t.id !== id) });
+  }
+  // Bulk variant for OnsetLyricPanel's "reset whole line" — removing N ids via N separate
+  // removeTagById calls in the same synchronous burst would each read the same pre-update `tags`
+  // closure and only the last call's result would stick, silently losing all but one removal.
+  function removeTagsByIds(ids) {
+    const idSet = new Set(ids);
+    updateLyrics({ tags: tags.filter(t => !idSet.has(t.id)) });
   }
   function startDrag(e, tagId) {
     e.preventDefault();
@@ -1567,6 +1897,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
       </div>
 
       <div className="lyric-section">
+        <OnsetLyricPanel item={item} addTagAt={addTagAt} removeTagById={removeTagById} removeTagsByIds={removeTagsByIds} nextItemId={nextItemId} />
         <div className="lyric-head-mini">
           <span>가사 배치 — 손잡이(⠿)로 위치 이동, 하단 막대로 입력 영역 높이 조절 (이미지 하단 30%는 참고용 미리보기)</span>
           <button className="icon-btn" onClick={addTag}>+ 가사 추가</button>
@@ -2449,7 +2780,8 @@ function TabScoreBuilder() {
             onDelete={() => deleteItem(item.id)}
             onMove={dir => moveItem(item.id, dir)}
             mergeSelected={mergeSelectedIds.has(item.id)}
-            onToggleMergeSelect={() => toggleMergeSelect(item.id)} />
+            onToggleMergeSelect={() => toggleMergeSelect(item.id)}
+            nextItemId={items[idx + 1] ? items[idx + 1].id : null} />
         ))}
       </div>
 
