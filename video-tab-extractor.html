@@ -42,6 +42,7 @@
   .save-msg{font-size:13px;color:var(--accent);}
   .block{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;}
   .block-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-size:13px;color:var(--text2);gap:10px;}
+  .merge-preview-img{max-width:100%;display:block;background:#fff;border:1px solid var(--border);border-radius:8px;margin-top:6px;}
   canvas.preview{width:100%;display:block;background:#fff;border:1px solid var(--border);border-radius:8px;}
   .adv-toggle-row{display:flex;justify-content:space-between;align-items:center;font-size:12.5px;color:var(--text2);gap:8px;}
   .controls{display:flex;flex-direction:column;gap:10px;margin-top:12px;}
@@ -1051,23 +1052,341 @@ const FrameCard = React.memo(function FrameCard({ item, index, defaults, onChang
   );
 });
 
+// ---- "N장씩 합치기" (batch merge) — copied verbatim from tab-score-builder.html so the two pages'
+// merge behavior/output stay byte-for-byte identical. Only the exclude-range sub-feature (not part
+// of this page's spec) was left out; group-size, inter-piece gap and the front-2-images preview are
+// all reused as-is. See tab-score-builder.html for the extensive design-rationale comments.
+const STAFF_LINE_LUM_THRESHOLD = 235;
+const STAFF_WOBBLE_BAND_PX = 4;
+const STAFF_GAP_TOLERANCE_PX = 20;
+const STAFF_MIN_SPAN_FRACTION = 0.3;
+const STAFF_MIN_SPAN_FLOOR_PX = 90;
+const STAFF_MAX_GROUP_THICKNESS = STAFF_WOBBLE_BAND_PX * 2 + 6;
+const STAFF_GAP_Y_TOLERANCE = 0.25;
+const STAFF_MIN_X_OVERLAP_FRACTION = 0.6;
+
+function detectStaffBand(imageData, w, h) {
+  const d = imageData.data;
+  const isDark = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      isDark[y * w + x] = lum < STAFF_LINE_LUM_THRESHOLD ? 1 : 0;
+    }
+  }
+  const minSpan = Math.max(STAFF_MIN_SPAN_FLOOR_PX, w * STAFF_MIN_SPAN_FRACTION);
+  const rowLeft = new Int32Array(h).fill(-1);
+  const rowRight = new Int32Array(h).fill(-1);
+  const rowLen = new Int32Array(h);
+  const bandOr = new Uint8Array(w);
+  for (let y = 0; y < h; y++) {
+    const lo = Math.max(0, y - STAFF_WOBBLE_BAND_PX), hi = Math.min(h - 1, y + STAFF_WOBBLE_BAND_PX);
+    bandOr.fill(0);
+    for (let yy = lo; yy <= hi; yy++) {
+      const rowOff = yy * w;
+      for (let x = 0; x < w; x++) if (isDark[rowOff + x]) bandOr[x] = 1;
+    }
+    let bestStart = -1, bestEnd = -1, bestLen = 0;
+    let x = 0;
+    while (x < w) {
+      if (!bandOr[x]) { x++; continue; }
+      const start = x;
+      let gap = 0, xe = x;
+      while (xe < w) {
+        if (bandOr[xe]) { gap = 0; xe++; }
+        else { gap++; if (gap > STAFF_GAP_TOLERANCE_PX) break; xe++; }
+      }
+      let end = xe;
+      while (end > start && !bandOr[end - 1]) end--;
+      if (end - start > bestLen) { bestLen = end - start; bestStart = start; bestEnd = end; }
+      x = xe;
+    }
+    if (bestLen >= minSpan) { rowLeft[y] = bestStart; rowRight[y] = bestEnd; rowLen[y] = bestLen; }
+  }
+  const groups = [];
+  let y = 0;
+  while (y < h) {
+    if (rowLen[y] === 0) { y++; continue; }
+    const start = y;
+    while (y < h && rowLen[y] > 0) y++;
+    const end = y;
+    if (end - start > STAFF_MAX_GROUP_THICKNESS) continue;
+    let peakY = start;
+    for (let yy = start + 1; yy < end; yy++) if (rowLen[yy] > rowLen[peakY]) peakY = yy;
+    groups.push({ y: (start + end - 1) / 2, left: rowLeft[peakY], right: rowRight[peakY] });
+  }
+  if (groups.length < 6) return null;
+  let best = null;
+  for (let i = 0; i < groups.length; i++) {
+    for (let j = i + 1; j < groups.length; j++) {
+      const gap = groups[j].y - groups[i].y;
+      if (gap <= 0) continue;
+      const chain = [groups[i]];
+      let ok = true;
+      for (let k = 1; k < 6; k++) {
+        const target = groups[i].y + gap * k;
+        let closest = null, closestDiff = Infinity;
+        for (const g of groups) {
+          const diff = Math.abs(g.y - target);
+          if (diff < closestDiff) { closestDiff = diff; closest = g; }
+        }
+        if (closest === null || closestDiff > gap * STAFF_GAP_Y_TOLERANCE) { ok = false; break; }
+        chain.push(closest);
+      }
+      if (!ok || chain.length !== 6) continue;
+      const lefts = chain.map(c => c.left), rights = chain.map(c => c.right);
+      const overlapLeft = Math.max(...lefts), overlapRight = Math.min(...rights);
+      const avgSpan = chain.reduce((s, c) => s + (c.right - c.left), 0) / 6;
+      if (avgSpan <= 0 || (overlapRight - overlapLeft) < avgSpan * STAFF_MIN_X_OVERLAP_FRACTION) continue;
+      const gaps = [];
+      for (let k = 1; k < 6; k++) gaps.push(chain[k].y - chain[k - 1].y);
+      const meanGap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+      const variance = gaps.reduce((a, b) => a + (b - meanGap) * (b - meanGap), 0) / gaps.length;
+      const confidence = 1 / (1 + variance);
+      if (!best || confidence > best.confidence) {
+        best = {
+          staffTop: chain[0].y, staffBottom: chain[5].y,
+          staffLeft: overlapLeft, staffRight: overlapRight,
+          lineYs: chain.map(c => c.y), confidence,
+        };
+      }
+    }
+  }
+  return best;
+}
+
+function resolvedSrc(item) {
+  return (item.barLayout && item.barLayout.appliedSrc) || item.src;
+}
+
+const MERGED_ROW_NEUTRAL_OVERRIDE = {
+  removeBg: false, invert: false, threshold: 140, softness: 0,
+  despeckle: false, despeckleSize: 0,
+  playheadRemove: false, playheadColor: null,
+  cropTop: 0, cropBottom: 0, cropLeft: 0, cropRight: 0,
+};
+const MERGE_GAP_MIN_PCT = -10;
+const MERGE_GAP_MAX_PCT = 5;
+
+function computeMergeSeamPositions(pieces, gapPct) {
+  const xs = [];
+  let x = 0;
+  for (let i = 0; i < pieces.length; i++) {
+    if (i > 0) {
+      const prev = pieces[i - 1], cur = pieces[i];
+      const refW = (prev.contentRight + cur.contentRight) / 2;
+      x = (xs[i - 1] + prev.contentRight) + Math.round((gapPct / 100) * refW);
+    }
+    xs.push(x);
+    x += pieces[i].w;
+  }
+  return { xs, totalW: x };
+}
+
+async function mergeImagesIntoRow(sourceItems, defaults, gapPct) {
+  gapPct = gapPct || 0;
+  const processed = [];
+  for (const it of sourceItems) {
+    const img = await loadImage(resolvedSrc(it));
+    const canvas = document.createElement('canvas');
+    drawProcessed(canvas, img, effectiveImageSettings(it, defaults));
+    const imageData = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height);
+    const staff = detectStaffBand(imageData, canvas.width, canvas.height);
+    processed.push({ item: it, canvas, staff });
+  }
+
+  const ref = processed.find(p => p.staff);
+  const refSpacing = ref ? (ref.staff.staffBottom - ref.staff.staffTop) / 5 : null;
+
+  const scaled = processed.map(p => {
+    let scale = 1;
+    if (refSpacing && p.staff) {
+      const spacing = (p.staff.staffBottom - p.staff.staffTop) / 5;
+      if (spacing > 0) scale = refSpacing / spacing;
+    }
+    const w = Math.max(1, Math.round(p.canvas.width * scale));
+    const h = Math.max(1, Math.round(p.canvas.height * scale));
+    const staffTopScaled = p.staff ? p.staff.staffTop * scale : null;
+    const staffLeftNative = p.staff ? p.staff.staffLeft : null;
+    const contentLeft = p.staff ? p.staff.staffLeft * scale : null;
+    const contentRight = p.staff ? p.staff.staffRight * scale : null;
+    return { item: p.item, canvas: p.canvas, w, h, staffTopScaled, staffLeftNative, contentLeft, contentRight };
+  });
+
+  const knownTops = scaled.map(s => s.staffTopScaled).filter(v => v != null);
+  const refTop = knownTops.length ? Math.max(...knownTops) : 0;
+  const withOffsets = scaled.map(s => ({
+    ...s, offsetY: s.staffTopScaled != null ? Math.round(refTop - s.staffTopScaled) : 0,
+  }));
+
+  const trimmed = withOffsets.map((s, i) => {
+    const trimNative = (i > 0 && s.staffLeftNative != null) ? s.staffLeftNative : 0;
+    const trimScaled = (i > 0 && s.contentLeft != null) ? s.contentLeft : 0;
+    const w = s.w - trimScaled;
+    const contentRight = s.contentRight != null ? (s.contentRight - trimScaled) : w;
+    return { ...s, fullW: s.w, w, contentRight, trimNative, trimScaled };
+  });
+
+  const { xs, totalW: seamTotalW } = computeMergeSeamPositions(trimmed, gapPct);
+  const totalW = Math.max(1, seamTotalW);
+  const totalH = Math.max(...trimmed.map(s => s.offsetY + s.h));
+
+  const out = document.createElement('canvas');
+  out.width = totalW;
+  out.height = Math.max(1, totalH);
+  const ctx = out.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, out.width, out.height);
+
+  const mergedTags = [];
+  trimmed.forEach((s, i) => {
+    const x = xs[i];
+    const srcW = s.canvas.width - s.trimNative;
+    ctx.drawImage(s.canvas, s.trimNative, 0, srcW, s.canvas.height, x, s.offsetY, s.w, s.h);
+    const conceptualFullX = x - s.trimScaled;
+    const tags = (s.item.lyrics && s.item.lyrics.tags) || [];
+    for (const t of tags) {
+      const localXPx = (t.xPct / 100) * s.fullW;
+      const globalXPct = ((conceptualFullX + localXPx) / totalW) * 100;
+      mergedTags.push({ ...t, id: Date.now() + '_' + Math.random().toString(36).slice(2), xPct: globalXPct });
+    }
+  });
+
+  const areaHeightRatios = sourceItems
+    .map(it => (it.lyrics && it.lyrics.areaHeightRatio) || 0)
+    .filter(v => v > 0);
+  const areaHeightRatio = areaHeightRatios.length ? Math.max(...areaHeightRatios) : null;
+
+  // Union of every source piece's own video time range — a merged block covers everything its
+  // pieces covered, from the earliest start to the latest end. Only computed when EVERY source item
+  // carries a timeRange (always true for items coming out of this page's own extraction flow).
+  const ranges = sourceItems.map(it => it.timeRange).filter(Boolean);
+  const timeRange = ranges.length === sourceItems.length
+    ? { start: Math.min(...ranges.map(r => r.start)), end: Math.max(...ranges.map(r => r.end)) }
+    : null;
+  const videoSourceId = sourceItems.length && sourceItems.every(it => it.videoSourceId === sourceItems[0].videoSourceId)
+    ? sourceItems[0].videoSourceId
+    : null;
+
+  return {
+    canvas: out,
+    lyrics: { tags: mergedTags, areaHeightRatio },
+    anyStaffMissing: processed.some(p => !p.staff),
+    timeRange, videoSourceId,
+  };
+}
+
+function padCanvasRightTo(canvas, targetWidth) {
+  if (canvas.width >= targetWidth) return canvas;
+  const out = document.createElement('canvas');
+  out.width = targetWidth; out.height = canvas.height;
+  const ctx = out.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, out.width, out.height);
+  ctx.drawImage(canvas, 0, 0);
+  return out;
+}
+
+function chunkForBatchMerge(list, n) {
+  const groups = [];
+  for (let i = 0; i < list.length; i += n) groups.push(list.slice(i, i + n));
+  return groups;
+}
+
 function PreprocessStep({ items, setItems, defaults, setDefaults, videoFile, onsets, videoSourceId, onBack }) {
   const [sending, setSending] = useState(false);
+  // 'settings' (전처리 조정) → 'choose' (그대로 넘기기 vs N장씩 합치기) → 'merge' (합치기 설정, choose에서 진입).
+  // Defaults collapsed for this page's global-settings panel specifically — scoped to the video
+  // extraction path only, tab-score-builder.html's own native flow keeps its panel expanded as before.
+  const [phase, setPhase] = useState('settings');
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [mergeGroupSize, setMergeGroupSize] = useState(2);
+  const [mergeGapPct, setMergeGapPct] = useState(0);
+  const [merging, setMerging] = useState(false);
+  const [mergePreviewSrc, setMergePreviewSrc] = useState(null);
+  const [mergePreviewBusy, setMergePreviewBusy] = useState(false);
   function update(patch) { setDefaults(prev => ({ ...prev, ...patch })); }
   function updateItem(id, next) { setItems(prev => prev.map(it => it.id === id ? next : it)); }
 
-  async function handleSend() {
+  // Live preview of the first 2 images that would be grouped, so the gap/overlap setting can be
+  // sanity-checked before running the (irreversible) batch merge — reused from tab-score-builder.html.
+  useEffect(() => {
+    let cancelled = false;
+    if (phase !== 'merge' || items.length < 2) { setMergePreviewSrc(null); return; }
+    setMergePreviewBusy(true);
+    const timer = setTimeout(async () => {
+      try {
+        const result = await mergeImagesIntoRow(items.slice(0, 2), defaults, mergeGapPct);
+        if (cancelled) return;
+        setMergePreviewSrc(result.canvas.toDataURL('image/png'));
+      } finally {
+        if (!cancelled) setMergePreviewBusy(false);
+      }
+    }, 350);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [phase, items, mergeGapPct, defaults]);
+
+  async function handleBatchMerge() {
+    const n = Math.max(2, Math.floor(mergeGroupSize) || 2);
+    const groups = chunkForBatchMerge(items, n);
+    const lastGroup = groups[groups.length - 1];
+    const lastIsPartial = lastGroup.length < n;
+
+    setMerging(true);
+    try {
+      const mergedResults = [];
+      for (const group of groups) {
+        const result = await mergeImagesIntoRow(group, defaults, mergeGapPct);
+        mergedResults.push(result);
+      }
+
+      if (lastIsPartial) {
+        const fullWidths = groups
+          .map((g, i) => (g.length === n ? mergedResults[i].canvas.width : null))
+          .filter(w => w != null);
+        if (fullWidths.length > 0) {
+          const avgFullWidth = Math.round(fullWidths.reduce((a, b) => a + b, 0) / fullWidths.length);
+          const lastCanvas = mergedResults[mergedResults.length - 1].canvas;
+          mergedResults[mergedResults.length - 1] = {
+            ...mergedResults[mergedResults.length - 1],
+            canvas: padCanvasRightTo(lastCanvas, avgFullWidth),
+          };
+        }
+      }
+
+      const newBlocks = mergedResults.map((result, i) => ({
+        id: Date.now() + '_' + Math.random().toString(36).slice(2) + '_' + i,
+        type: 'image', src: result.canvas.toDataURL('image/png'),
+        invert: false, override: { ...MERGED_ROW_NEUTRAL_OVERRIDE },
+        lyrics: result.lyrics,
+        playheadExcluded: [], barLayout: null, stitchMeta: null,
+        timeRange: result.timeRange, videoSourceId: result.videoSourceId,
+      }));
+
+      await handleSend(newBlocks);
+    } catch (err) {
+      console.error(err);
+      alert('합치기 중 오류가 발생했습니다.');
+      setMerging(false);
+    }
+  }
+
+  async function handleSend(itemsOverride) {
+    const sourceList = itemsOverride || items;
     setSending(true);
     try {
       // Bake each item's RESOLVED settings (global default or override, whichever applies) into a
       // concrete override — so what was previewed here is exactly what appears after handoff,
       // regardless of whatever tab-score-builder.html's OWN global defaults happen to be set to.
-      const finalItems = items.map(it => {
-        const eff = effectiveImageSettings(it, defaults);
+      // Merged blocks (itemsOverride) already carry their own neutral override + resolved fields, so
+      // this only re-bakes for the "그대로 넘기기" (per-frame, unmerged) path.
+      const finalItems = sourceList.map(it => {
+        const eff = itemsOverride ? it.override : effectiveImageSettings(it, defaults);
         return {
           id: it.id, type: 'image', src: it.src,
-          invert: eff.invert, override: { ...eff },
-          lyrics: { tags: [], areaHeightRatio: null },
+          invert: itemsOverride ? it.invert : eff.invert, override: itemsOverride ? it.override : { ...eff },
+          lyrics: it.lyrics || { tags: [], areaHeightRatio: null },
           playheadExcluded: [], barLayout: null, stitchMeta: null,
           timeRange: it.timeRange || null,
           videoSourceId: it.videoSourceId || null,
@@ -1092,58 +1411,117 @@ function PreprocessStep({ items, setItems, defaults, setDefaults, videoFile, ons
 
   return (
     <div>
-      <div className="block">
-        <div className="block-head"><span>3단계 — 전처리 (배경 제거 · 부드러운 경계 · 잡티 제거)</span></div>
-        <p className="hint-text">tab-score-builder.html과 동일한 방식입니다 — 아래 기본값이 모든 프레임에 실시간 적용되고, 특정 프레임만 다르게 하려면 그 프레임의 "고급 설정 사용"을 누르세요.</p>
-        <div className="controls">
-          <label>
-            <input type="checkbox" checked={defaults.removeBg} onChange={e => update({ removeBg: e.target.checked })} />
-            배경 제거 기본 사용
-          </label>
-          <div>
-            <div className="slider-label">어두운 배경 처리</div>
-            <select value={defaults.invertMode} onChange={e => update({ invertMode: e.target.value })}>
-              <option value="auto">자동 감지</option>
-              <option value="on">항상 반전 (어두운 사진 배경)</option>
-              <option value="off">항상 일반 (밝은/흰 배경)</option>
-            </select>
+      {phase === 'settings' && (
+        <React.Fragment>
+          <div className="block">
+            <div className="block-head">
+              <span>3단계 — 전처리 (배경 제거 · 부드러운 경계 · 잡티 제거)</span>
+              <button className="icon-btn" onClick={() => setSettingsOpen(o => !o)}>{settingsOpen ? '접기' : '펼치기'}</button>
+            </div>
+            {settingsOpen && (
+              <React.Fragment>
+                <p className="hint-text">tab-score-builder.html과 동일한 방식입니다 — 아래 기본값이 모든 프레임에 실시간 적용되고, 특정 프레임만 다르게 하려면 그 프레임의 "고급 설정 사용"을 누르세요.</p>
+                <div className="controls">
+                  <label>
+                    <input type="checkbox" checked={defaults.removeBg} onChange={e => update({ removeBg: e.target.checked })} />
+                    배경 제거 기본 사용
+                  </label>
+                  <div>
+                    <div className="slider-label">어두운 배경 처리</div>
+                    <select value={defaults.invertMode} onChange={e => update({ invertMode: e.target.value })}>
+                      <option value="auto">자동 감지</option>
+                      <option value="on">항상 반전 (어두운 사진 배경)</option>
+                      <option value="off">항상 일반 (밝은/흰 배경)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <div className="slider-label">배경 제거 강도 ({defaults.threshold})</div>
+                    <input type="range" min="0" max="255" step="1" value={defaults.threshold}
+                      onChange={e => update({ threshold: Number(e.target.value) })} />
+                  </div>
+                  <div>
+                    <div className="slider-label">부드러운 경계 — 안티앨리어싱 유지 ({defaults.softness})</div>
+                    <input type="range" min="0" max="60" step="1" value={defaults.softness}
+                      onChange={e => update({ softness: Number(e.target.value) })} />
+                  </div>
+                  <label>
+                    <input type="checkbox" checked={defaults.despeckle} onChange={e => update({ despeckle: e.target.checked })} />
+                    잡티(고립 노이즈) 제거
+                  </label>
+                  {defaults.despeckle && (
+                    <div>
+                      <div className="slider-label">제거할 잡티 크기 ({defaults.despeckleSize}px 이하)</div>
+                      <input type="range" min="1" max="12" step="1" value={defaults.despeckleSize}
+                        onChange={e => update({ despeckleSize: Number(e.target.value) })} />
+                    </div>
+                  )}
+                </div>
+              </React.Fragment>
+            )}
           </div>
-          <div>
-            <div className="slider-label">배경 제거 강도 ({defaults.threshold})</div>
-            <input type="range" min="0" max="255" step="1" value={defaults.threshold}
-              onChange={e => update({ threshold: Number(e.target.value) })} />
+
+          <div className="list">
+            {items.map((it, i) => (
+              <FrameCard key={it.id} item={it} index={i} defaults={defaults} onChange={next => updateItem(it.id, next)} />
+            ))}
           </div>
-          <div>
-            <div className="slider-label">부드러운 경계 — 안티앨리어싱 유지 ({defaults.softness})</div>
-            <input type="range" min="0" max="60" step="1" value={defaults.softness}
-              onChange={e => update({ softness: Number(e.target.value) })} />
+
+          <div className="toolbar">
+            <button className="icon-btn" onClick={onBack} disabled={sending}>← 이전</button>
+            <button onClick={() => setPhase('choose')} disabled={items.length === 0}>다음 →</button>
           </div>
-          <label>
-            <input type="checkbox" checked={defaults.despeckle} onChange={e => update({ despeckle: e.target.checked })} />
-            잡티(고립 노이즈) 제거
-          </label>
-          {defaults.despeckle && (
+        </React.Fragment>
+      )}
+
+      {phase === 'choose' && (
+        <div className="block">
+          <div className="block-head"><span>다음 단계 선택 — {items.length}장</span></div>
+          <p className="hint-text">각 프레임을 TAB 이미지 1장씩 그대로 전달하거나, 여러 장을 한 줄로 묶어 전달할 수 있습니다. 마디선 자동 인식/재배열은 이번 단계에서 지원하지 않습니다.</p>
+          <div className="toolbar">
+            <button className="icon-btn" onClick={() => setPhase('settings')} disabled={sending}>← 이전</button>
+            <button onClick={() => handleSend()} disabled={sending}>
+              {sending ? '전달 중...' : '그대로 TAB으로 넘기기 (' + items.length + '장) →'}
+            </button>
+            <button className="icon-btn" onClick={() => setPhase('merge')} disabled={sending || items.length < 2}>
+              N장씩 합치기
+            </button>
+          </div>
+        </div>
+      )}
+
+      {phase === 'merge' && (
+        <div className="block">
+          <div className="block-head"><span>N장씩 합치기</span></div>
+          <div className="controls">
             <div>
-              <div className="slider-label">제거할 잡티 크기 ({defaults.despeckleSize}px 이하)</div>
-              <input type="range" min="1" max="12" step="1" value={defaults.despeckleSize}
-                onChange={e => update({ despeckleSize: Number(e.target.value) })} />
+              <span className="slider-label" style={{ margin: 0 }}>
+                <input type="number" min="2" max={Math.max(2, items.length)} step="1" value={mergeGroupSize}
+                  onChange={e => setMergeGroupSize(e.target.value)} style={{ width: '4em' }} />
+                장씩 순서대로 합치기 ({items.length}장 → {Math.ceil(items.length / Math.max(2, Math.floor(mergeGroupSize) || 2))}개 그룹)
+              </span>
+            </div>
+            <div>
+              <div className="slider-label">조각 사이 간격 ({mergeGapPct}%, 각 조각 폭 기준 — 음수면 겹쳐서 이어붙임)</div>
+              <input type="range" min={MERGE_GAP_MIN_PCT} max={MERGE_GAP_MAX_PCT} step="0.5" value={mergeGapPct}
+                onChange={e => setMergeGapPct(Number(e.target.value))} />
+              <input type="number" min={MERGE_GAP_MIN_PCT} max={MERGE_GAP_MAX_PCT} step="0.5" value={mergeGapPct}
+                onChange={e => setMergeGapPct(Number(e.target.value))} style={{ width: '4em' }} />
+            </div>
+          </div>
+          {(mergePreviewSrc || mergePreviewBusy) && (
+            <div className="controls">
+              <span className="slider-label">앞부분 미리보기{mergePreviewBusy ? ' (갱신 중...)' : ''} — 겹치는 부분에 마디 내용이 가려지지 않는지 확인하세요</span>
+              {mergePreviewSrc && <img src={mergePreviewSrc} alt="합치기 미리보기" className="merge-preview-img" />}
             </div>
           )}
+          <div className="toolbar">
+            <button className="icon-btn" onClick={() => setPhase('choose')} disabled={merging || sending}>← 이전</button>
+            <button onClick={handleBatchMerge} disabled={merging || sending}>
+              {(merging || sending) ? '합치는 중...' : '합치기 진행 →'}
+            </button>
+          </div>
         </div>
-      </div>
-
-      <div className="list">
-        {items.map((it, i) => (
-          <FrameCard key={it.id} item={it} index={i} defaults={defaults} onChange={next => updateItem(it.id, next)} />
-        ))}
-      </div>
-
-      <div className="toolbar">
-        <button className="icon-btn" onClick={onBack} disabled={sending}>← 이전</button>
-        <button onClick={handleSend} disabled={sending || items.length === 0}>
-          {sending ? '전달 중...' : 'TAB 악보 만들기로 보내기 (' + items.length + '장) →'}
-        </button>
-      </div>
+      )}
     </div>
   );
 }
