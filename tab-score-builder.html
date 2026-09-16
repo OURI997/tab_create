@@ -7,8 +7,6 @@
 <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
-<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <style>
@@ -190,7 +188,6 @@
   .color-swatch{display:inline-block;width:14px;height:14px;border-radius:50%;border:1px solid var(--border-strong);vertical-align:middle;}
   .eyedrop-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
   .stitch-progress-row{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text2);}
-  .stitch-conflict-card{border:1px solid var(--border);border-radius:10px;padding:10px;display:flex;flex-direction:column;gap:8px;font-size:13px;}
   .barline-section{margin-top:14px;border-top:1px solid var(--border);padding-top:12px;}
 </style>
 </head>
@@ -206,32 +203,6 @@ const DRAFT_KEY = '__draft__';
 // static page) writes a batch of extracted+preprocessed items here right before navigating to this
 // page, so the handoff needs no server and no localStorage size risk for many/large frames.
 const VIDEO_IMPORT_KEY = '__video_import__';
-
-// ---- timeout guard for async steps with no built-in completion guarantee ----
-// Reproduced (both from a real user report and independently via headless-browser testing on the
-// same real files) that "여러 장 이어붙이기" could hang the WHOLE PAGE — not just fail, but freeze
-// solid enough that even the browser's own reload/close stopped responding. Root cause: several
-// steps in this pipeline (image decode via FileReader+Image, the OCR worker's startup, a single OCR
-// recognize() call, one ORB feature-match pair) are awaited directly with no timeout at all — if
-// any ONE of them never settles for any reason, the whole async chain (and everything chained after
-// it, including UI state updates) stays pending forever. This wraps a promise so that instead, it
-// rejects with a clear, diagnosable message after a bounded wait — turning "the browser is dead" into
-// "here's exactly which step, and which image, got stuck," while the rest of the app stays usable.
-class TimeoutError extends Error {}
-function withTimeout(promise, ms, label) {
-  console.log('[withTimeout] scheduled: "' + label + '" (' + ms + 'ms)');
-  let timer;
-  const timeoutPromise = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      console.log('[withTimeout] FIRED: "' + label + '" — the guarded promise did not settle within ' + ms + 'ms');
-      reject(new TimeoutError('시간 초과: ' + label + ' (' + (ms / 1000) + '초 내에 끝나지 않음)'));
-    }, ms);
-  });
-  return Promise.race([promise, timeoutPromise]).finally(() => {
-    clearTimeout(timer);
-    console.log('[withTimeout] settled (either way): "' + label + '"');
-  });
-}
 
 const DEFAULTS_INIT = {
   removeBg: true,
@@ -501,107 +472,6 @@ function detectBarLinesByPixels(imageData, w, h) {
   return runs.map(r => r.centerXPct);
 }
 
-// ---- bar-number OCR (feature 2) ----
-// Caps the strip's OUTPUT width. Previously this always scaled the FULL source width by a flat 3x
-// regardless of how wide the source was, which for a ~1100-1400px-wide content-cropped image produces
-// a ~3300-4200px-wide canvas handed to Tesseract — most of it blank (bar numbers are sparse), but
-// still real pixels Tesseract has to scan. Suspected (not yet confirmed live) contributor to a report
-// of "여러 장 이어붙이기" hanging on the SECOND image's OCR step for over a minute with no console
-// output and the Promise-based timeout guard never firing — which points at a synchronous main-thread
-// stall (e.g. inside recognize()'s canvas→pixel handoff before it ever reaches the async worker call),
-// since setTimeout-based timeouts can only fire between synchronous tasks, never preempt one already
-// running. This doesn't fix that possibility outright, but removes a plausible way this step could
-// scale unboundedly with source image width, and cuts typical strip size by roughly half either way.
-const OCR_STRIP_MAX_WIDTH = 2400;
-
-function extractTopStripCanvas(source, opts) {
-  // source: an <img> (naturalWidth/naturalHeight) or a <canvas> (width/height) — either works
-  opts = opts || {};
-  const W = source.naturalWidth || source.width, H = source.naturalHeight || source.height;
-  let stripTop, stripBottom;
-  if (opts.staffTopPx != null) {
-    // bar numbers sit just above the top staff line — use a band ending right at the detected
-    // staff top, regardless of how much varying album-art/UI chrome sits above it in this capture
-    const margin = opts.aboveMarginPx != null ? opts.aboveMarginPx : Math.round(H * 0.08);
-    stripBottom = Math.max(1, Math.round(opts.staffTopPx));
-    stripTop = Math.max(0, stripBottom - margin);
-  } else {
-    // fallback: fixed top percentage, used when staff-band detection failed
-    stripTop = 0;
-    stripBottom = Math.max(1, Math.round(H * (opts.heightPct || 0.15)));
-  }
-  const stripH = Math.max(1, stripBottom - stripTop);
-  const scale = Math.max(1, Math.min(3, Math.floor(OCR_STRIP_MAX_WIDTH / W)));
-  const c = document.createElement('canvas');
-  c.width = W * scale; c.height = stripH * scale;
-  const ctx = c.getContext('2d');
-  ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(source, 0, stripTop, W, stripH, 0, 0, c.width, c.height);
-  return c;
-}
-
-let _ocrWorkerPromise = null;
-async function getOcrWorker() {
-  if (!_ocrWorkerPromise) {
-    _ocrWorkerPromise = Tesseract.createWorker('eng').then(async w => {
-      await w.setParameters({ tessedit_char_whitelist: '0123456789' });
-      return w;
-    });
-  }
-  return _ocrWorkerPromise;
-}
-
-const OCR_RECOGNIZE_TIMEOUT_MS = 20000;
-
-async function recognizeBarNumbers(stripCanvas, ocrWorker, label) {
-  try {
-    const { data } = await withTimeout(ocrWorker.recognize(stripCanvas), OCR_RECOGNIZE_TIMEOUT_MS, label || 'OCR 인식(worker.recognize)');
-    const words = (data.words || []);
-    const candidates = [];
-    for (const w of words) {
-      const val = parseInt((w.text || '').trim(), 10);
-      if (!Number.isFinite(val) || val < 0 || val > 999) continue;
-      const bbox = w.bbox || {};
-      const xPct = ((((bbox.x0 || 0) + (bbox.x1 || 0)) / 2) / stripCanvas.width) * 100;
-      candidates.push({ value: val, xPct });
-    }
-    return { candidates };
-  } catch (e) {
-    // a genuine OCR failure (bad image, no text found, etc.) is expected and already has a graceful
-    // fallback (empty candidates → the caller falls through to ORB feature matching) — but a TIMEOUT
-    // means something is actually stuck, not just "OCR found nothing", so let it propagate instead of
-    // silently swallowing it, per the diagnostic goal of this timeout-guard pass
-    if (e instanceof TimeoutError) throw e;
-    return { candidates: [] };
-  }
-}
-
-function validateBarNumberSequence(candidates) {
-  const sorted = [...candidates].sort((a, b) => a.xPct - b.xPct);
-  let best = [];
-  for (let i = 0; i < sorted.length; i++) {
-    let run = [sorted[i]];
-    for (let j = i + 1; j < sorted.length; j++) {
-      const gap = sorted[j].value - run[run.length - 1].value;
-      if (gap >= 1 && gap <= 4) run.push(sorted[j]);
-      else break;
-    }
-    if (run.length > best.length) best = run;
-  }
-  if (best.length < 2) return null;
-  return { numbers: best.map(c => c.value), xPcts: best.map(c => c.xPct) };
-}
-
-// ---- horizontal overlap detection (feature 2) ----
-function computeOverlapFromBarNumbers(seqA, seqB) {
-  if (!seqA || !seqB) return null;
-  const common = seqA.numbers.filter(n => seqB.numbers.includes(n));
-  if (common.length === 0) return null;
-  const firstCommon = Math.min(...common);
-  const bIdx = seqB.numbers.indexOf(firstCommon);
-  const cutBLeftPct = seqB.xPcts[bIdx];
-  return { cutBLeftPct, seamBars: common };
-}
 
 // ---- TAB staff-band auto-detection ----
 // Finds the actual Y-range (and, best-effort, X-range) of the 6 horizontal TAB staff lines,
@@ -731,195 +601,6 @@ function detectStaffBand(imageData, w, h) {
   return best;
 }
 
-// ---- uniform-border auto-crop ----
-// Letterboxing/frame borders added by a screen-capture or photo (usually solid black or white,
-// unbroken from the very edge) can otherwise get matched to each other as a "perfect overlap" by
-// downstream overlap detection, since they're maximally self-similar. Detected once per image and
-// used for ALL downstream analysis (staff detection, overlap search, OCR) — but the final composited
-// image still draws from the original, uncropped canvas; only the analysis coordinates are adjusted.
-function detectContentRect(imageData, w, h) {
-  const d = imageData.data;
-  function rowVariance(y) {
-    let sum = 0, sumSq = 0;
-    for (let x = 0; x < w; x++) {
-      const i = (y * w + x) * 4;
-      const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-      sum += lum; sumSq += lum * lum;
-    }
-    const mean = sum / w;
-    return sumSq / w - mean * mean;
-  }
-  function colVariance(x) {
-    let sum = 0, sumSq = 0;
-    for (let y = 0; y < h; y++) {
-      const i = (y * w + x) * 4;
-      const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-      sum += lum; sumSq += lum * lum;
-    }
-    const mean = sum / h;
-    return sumSq / h - mean * mean;
-  }
-  const VARIANCE_THRESHOLD = 20;   // near-zero variance = a uniform-color row/column
-  const MIN_BORDER_RUN = 6;        // require several unbroken uniform rows/cols before trusting it as a real border, not noise
-  const MAX_BORDER_FRACTION = 0.25; // never trim more than this fraction from any one side, as a safety cap
-
-  function scanEdge(size, statFn, forward) {
-    const maxTrim = Math.floor(size * MAX_BORDER_FRACTION);
-    let runStart = -1, trimTo = 0;
-    for (let k = 0; k < maxTrim; k++) {
-      const idx = forward ? k : (size - 1 - k);
-      if (statFn(idx) < VARIANCE_THRESHOLD) {
-        if (runStart === -1) runStart = k;
-        if (k - runStart + 1 >= MIN_BORDER_RUN) trimTo = k + 1;
-      } else {
-        break; // a real border is unbroken from the edge — stop at the first non-uniform row/col
-      }
-    }
-    return trimTo;
-  }
-
-  const top = scanEdge(h, rowVariance, true);
-  const bottomTrim = scanEdge(h, rowVariance, false);
-  const left = scanEdge(w, colVariance, true);
-  const rightTrim = scanEdge(w, colVariance, false);
-  const rect = { left, top, right: w - rightTrim, bottom: h - bottomTrim };
-
-  // safety: never let this crop away most of the image (e.g. a genuinely blank/near-empty capture)
-  if (rect.right - rect.left < w * 0.5 || rect.bottom - rect.top < h * 0.5) {
-    return { left: 0, top: 0, right: w, bottom: h };
-  }
-  return rect;
-}
-
-function cropCanvasToRect(canvas, rect) {
-  const w = rect.right - rect.left, h = rect.bottom - rect.top;
-  const out = document.createElement('canvas');
-  out.width = Math.max(1, w); out.height = Math.max(1, h);
-  out.getContext('2d').drawImage(canvas, rect.left, rect.top, out.width, out.height, 0, 0, out.width, out.height);
-  return out;
-}
-
-// ---- ORB feature matching + RANSAC (the overlap-detection fallback when bar-number OCR fails) ----
-// Verified (both in an offline Python/OpenCV prototype and here) that per-pixel/column correlation
-// completely fails on real recorded TAB captures: at the true overlap the ink-agreement score was
-// 0.02-0.04 (noise level), while the global best-scoring offset (0.97) was a confirmed spurious
-// match. Feature matching succeeds on the same pair because it only needs LOCAL texture around each
-// keypoint (chord-diagram dots, note/number glyphs, staff/bar-line intersections) to survive — a
-// moving playhead-highlight overlay or capture-to-capture noise kills the few keypoints under it and
-// leaves the rest intact, whereas whole-row/column correlation is corrupted by any such local change.
-// It also doesn't depend on bar numbers being printed at all, unlike the OCR path this supplements.
-let _cvReadyPromise = null;
-function getCv() {
-  if (!_cvReadyPromise) {
-    // Not an onRuntimeInitialized callback hook: opencv.js (Emscripten) only invokes that hook once,
-    // at whatever moment its own init sequence happens to check for it — attaching to it here races
-    // that moment, and if we lose the race (cv exists but cv.Mat isn't set yet, and the real init has
-    // already moved past checking the hook) our callback never fires and this waits forever.
-    // Also not a manual `new Promise` wrapping a hand-rolled recursive setTimeout chain — verified
-    // that pattern here intermittently never settles even though the condition it's polling for is
-    // already true (root cause unconfirmed, possibly a Babel-transform interaction with a named
-    // function recursing inside a Promise executor); a plain async/await polling loop does not
-    // exhibit the problem and is simpler besides.
-    _cvReadyPromise = (async () => {
-      while (!(window.cv && window.cv.Mat)) {
-        await new Promise((r) => setTimeout(r, 50));
-      }
-      return window.cv;
-    })();
-  }
-  return _cvReadyPromise;
-}
-
-async function findOverlapByFeatureMatching(canvasA, canvasB, opts) {
-  opts = opts || {};
-  const cv = await getCv();
-
-  const matA = cv.imread(canvasA), matB = cv.imread(canvasB);
-  const grayA = new cv.Mat(), grayB = new cv.Mat();
-  cv.cvtColor(matA, grayA, cv.COLOR_RGBA2GRAY);
-  cv.cvtColor(matB, grayB, cv.COLOR_RGBA2GRAY);
-
-  const orb = new cv.ORB(opts.nFeatures || 2000);
-  const kpA = new cv.KeyPointVector(), kpB = new cv.KeyPointVector();
-  const descA = new cv.Mat(), descB = new cv.Mat();
-  const mask = new cv.Mat();
-  orb.detectAndCompute(grayA, mask, kpA, descA);
-  orb.detectAndCompute(grayB, mask, kpB, descB);
-
-  let result = null;
-  const MIN_MATCHES_FOR_RANSAC = 8; // need enough correspondences for a robust affine estimate
-
-  if (descA.rows >= 2 && descB.rows >= 2) {
-    const bf = new cv.BFMatcher(cv.NORM_HAMMING, false);
-    const knn = new cv.DMatchVectorVector();
-    bf.knnMatch(descA, descB, knn, 2);
-
-    // Lowe's ratio test: a good match's best neighbor should be clearly better than its 2nd-best,
-    // otherwise the match is ambiguous (common on repetitive TAB structure — grid lines, digits)
-    const RATIO = 0.75;
-    const good = [];
-    for (let i = 0; i < knn.size(); i++) {
-      const m = knn.get(i);
-      if (m.size() < 2) continue;
-      const m0 = m.get(0), m1 = m.get(1);
-      if (m0.distance < RATIO * m1.distance) good.push(m0);
-    }
-
-    if (good.length >= MIN_MATCHES_FOR_RANSAC) {
-      const srcArr = new Float32Array(good.length * 2), dstArr = new Float32Array(good.length * 2);
-      for (let i = 0; i < good.length; i++) {
-        const ptA = kpA.get(good[i].queryIdx).pt, ptB = kpB.get(good[i].trainIdx).pt;
-        srcArr[i * 2] = ptA.x; srcArr[i * 2 + 1] = ptA.y;
-        dstArr[i * 2] = ptB.x; dstArr[i * 2 + 1] = ptB.y;
-      }
-      const srcMat = cv.matFromArray(good.length, 1, cv.CV_32FC2, srcArr);
-      const dstMat = cv.matFromArray(good.length, 1, cv.CV_32FC2, dstArr);
-      const inliers = new cv.Mat();
-      // estimateAffinePartial2D (similarity: uniform scale+rotation+translation) isn't exposed in
-      // this build of opencv.js — estimateAffine2D (full 6-DOF affine) is used instead; we still
-      // decompose and sanity-check the result against near-1 scale / near-0 rotation below, since a
-      // genuine same-content scroll-capture pair should never need real shear/anisotropic scaling.
-      const M = cv.estimateAffine2D(srcMat, dstMat, inliers, cv.RANSAC,
-        opts.ransacReprojThreshold || 3, 2000, 0.99, 10);
-
-      if (!M.empty()) {
-        let inlierCount = 0;
-        for (let i = 0; i < inliers.rows; i++) if (inliers.data[i]) inlierCount++;
-
-        const a = M.data64F[0], c = M.data64F[3], tx = M.data64F[2], ty = M.data64F[5];
-        const scale = Math.sqrt(a * a + c * c);
-        const rotationDeg = Math.atan2(c, a) * 180 / Math.PI;
-
-        // Verified against two real capture files: 166 inliers out of 470 candidate matches, a
-        // decisive majority — the threshold just needs to separate "a real consensus transform
-        // exists" from "no consensus / too few points to trust". Left tunable; the caller (and the
-        // manual "순서대로 이어붙이기 / 개별로 추가" fallback for whatever this rejects) needs real
-        // sample diversity (bar numbers present/absent, recorded/clean-scanned) to tune precisely.
-        const MIN_INLIERS = opts.minInliers != null ? opts.minInliers : 20;
-        const MAX_SCALE_DEVIATION = 0.1;   // reject if scale differs from 1.0 by more than this
-        const MAX_ROTATION_DEG = 3;        // reject implausibly large rotation for a scroll capture
-
-        const scaleOk = Math.abs(scale - 1) <= MAX_SCALE_DEVIATION;
-        const rotationOk = Math.abs(rotationDeg) <= MAX_ROTATION_DEG;
-
-        if (inlierCount >= MIN_INLIERS && scaleOk && rotationOk) {
-          const overlapPx = Math.round(canvasA.width + tx);
-          if (overlapPx > 0 && overlapPx < Math.min(canvasA.width, canvasB.width)) {
-            result = { overlapPx, inlierCount, totalMatches: good.length, scale, rotationDeg, tx, ty };
-          }
-        }
-      }
-      srcMat.delete(); dstMat.delete(); inliers.delete(); M.delete();
-    }
-    bf.delete(); knn.delete();
-  }
-
-  matA.delete(); matB.delete(); grayA.delete(); grayB.delete();
-  kpA.delete(); kpB.delete(); descA.delete(); descB.delete(); mask.delete(); orb.delete();
-
-  return result;
-}
-
 // ---- bar-slice regrouping ("한 줄에 몇 마디") ----
 async function rebuildBarsPerRow(img, sortedMarkersXPct, barsPerRow) {
   const W = img.naturalWidth, H = img.naturalHeight;
@@ -949,210 +630,6 @@ async function rebuildBarsPerRow(img, sortedMarkersXPct, barsPerRow) {
     }
   });
   return canvas;
-}
-
-// ---- stitch orchestration (feature 2) ----
-function loadFileAsImage(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = ev => {
-      const img = new Image();
-      img.onload = () => resolve(img);
-      img.onerror = reject;
-      img.src = ev.target.result;
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-}
-
-function canvasFromImage(img) {
-  const c = document.createElement('canvas');
-  c.width = img.naturalWidth; c.height = img.naturalHeight;
-  c.getContext('2d').drawImage(img, 0, 0);
-  return c;
-}
-
-const IMAGE_LOAD_TIMEOUT_MS = 20000;
-const OCR_WORKER_TIMEOUT_MS = 20000;
-const FEATURE_MATCH_TIMEOUT_MS = 20000;
-
-async function stitchImages(files, opts, onProgress) {
-  opts = opts || {};
-  const total = files.length;
-  const imgs = await Promise.all(files.map((f, idx) =>
-    withTimeout(loadFileAsImage(f), IMAGE_LOAD_TIMEOUT_MS, '이미지 로딩 — ' + (idx + 1) + '번째 파일 (' + (f.name || '이름없음') + ')')
-  ));
-  let canvases = imgs.map(img => canvasFromImage(img));
-
-  if (opts.playheadRemove) {
-    canvases = canvases.map(c => {
-      const ctx = c.getContext('2d');
-      const imageData = ctx.getImageData(0, 0, c.width, c.height);
-      const runs = detectPlayheadRuns(imageData, c.width, c.height, opts.playheadColor);
-      removePlayheadRuns(imageData, c.width, c.height, runs, [], { r: 255, g: 255, b: 255 });
-      ctx.putImageData(imageData, 0, 0);
-      return c;
-    });
-  }
-
-  // Auto-crop any uniform-color border (letterboxing from the capture/photo) once per image, BEFORE
-  // any analysis — staff detection, overlap search, and OCR all run on these content-only canvases
-  // so a border can never get mistaken for real content. The final composite still draws from the
-  // original uncropped canvases (see cutLeftPx conversion back to original coordinates below).
-  const contentRects = canvases.map(c => {
-    const imageData = c.getContext('2d').getImageData(0, 0, c.width, c.height);
-    return detectContentRect(imageData, c.width, c.height);
-  });
-  const contentCanvases = canvases.map((c, i) => cropCanvasToRect(c, contentRects[i]));
-
-  // Detect each image's actual TAB staff-line band ONCE and reuse it for both bar-number OCR and
-  // overlap detection below — this is what makes both steps robust to captures where album art /
-  // playback-UI chrome takes up a different proportion of the image each time.
-  const staffBands = contentCanvases.map(c => {
-    const imageData = c.getContext('2d').getImageData(0, 0, c.width, c.height);
-    return detectStaffBand(imageData, c.width, c.height);
-  });
-  // staffBands[i].staffTop is in contentCanvases[i]'s coordinate space; this converts it back to the
-  // original (uncropped) canvas's coordinate space, needed wherever we composite from the original.
-  function originalStaffTop(i) {
-    const band = staffBands[i];
-    return band ? contentRects[i].top + band.staffTop : null;
-  }
-
-  const ocrResults = [];
-  if (total > 1) {
-    console.log('[stitch] requesting OCR worker...');
-    const worker = await withTimeout(getOcrWorker(), OCR_WORKER_TIMEOUT_MS, 'OCR 워커 생성 (getOcrWorker)');
-    console.log('[stitch] OCR worker ready');
-    for (let i = 0; i < contentCanvases.length; i++) {
-      onProgress && onProgress({ stage: 'ocr', i: i + 1, total });
-      console.log('[stitch] OCR loop i=' + (i + 1) + '/' + total + ': starting (contentCanvas ' + contentCanvases[i].width + 'x' + contentCanvases[i].height + ')');
-      // OCR the (possibly playhead-cleaned, border-cropped) canvas's bar-number strip
-      const band = staffBands[i];
-      // scale the "how far above the staff" margin to the staff's OWN line spacing rather than a
-      // fraction of the whole image — the surrounding UI chrome height has nothing to do with how
-      // far bar numbers sit above the staff, but the staff's own line spacing does
-      const stripFromCanvas = band
-        ? extractTopStripCanvas(contentCanvases[i], {
-            staffTopPx: band.staffTop,
-            aboveMarginPx: Math.max(40, Math.round(((band.staffBottom - band.staffTop) / 5) * 3)),
-          })
-        : extractTopStripCanvas(contentCanvases[i], { heightPct: 0.15 });
-      console.log('[stitch] OCR loop i=' + (i + 1) + '/' + total + ': strip extracted (' + stripFromCanvas.width + 'x' + stripFromCanvas.height + '), calling recognizeBarNumbers...');
-      const { candidates } = await recognizeBarNumbers(stripFromCanvas, worker, 'OCR 인식 — ' + (i + 1) + '번째 이미지');
-      console.log('[stitch] OCR loop i=' + (i + 1) + '/' + total + ': recognizeBarNumbers returned, ' + candidates.length + ' candidate(s)');
-      ocrResults[i] = validateBarNumberSequence(candidates);
-    }
-  }
-
-  const seams = [];
-  for (let i = 0; i < canvases.length - 1; i++) {
-    onProgress && onProgress({ stage: 'seam', i: i + 1, total: canvases.length - 1 });
-    const A = ocrResults[i], B = ocrResults[i + 1];
-    const barOverlap = computeOverlapFromBarNumbers(A, B);
-    if (barOverlap) {
-      // cutBLeftPct is a % of contentCanvases[i+1]'s width — convert to an absolute pixel offset in
-      // the ORIGINAL (uncropped) canvas B, since that's what actually gets composited
-      const contentWidthB = contentRects[i + 1].right - contentRects[i + 1].left;
-      const cutLeftPx = contentRects[i + 1].left + Math.round((barOverlap.cutBLeftPct / 100) * contentWidthB);
-      seams.push({ i, method: 'ocr', cutLeftPx });
-      continue;
-    }
-    // Per-pixel/column correlation (the previous fallback here) was verified to fail completely on
-    // real recorded captures — 0.02-0.04 similarity at the true seam, a confirmed-spurious offset
-    // scoring highest instead. ORB feature matching + RANSAC succeeds on the same pairs because it
-    // only needs enough LOCAL keypoints (chord-diagram dots, glyphs, line intersections) to survive
-    // whatever differs between captures (a moving playhead highlight, compression noise), and works
-    // whether or not bar numbers are printed at all (unlike the OCR path above).
-    const featureOverlap = await withTimeout(
-      findOverlapByFeatureMatching(contentCanvases[i], contentCanvases[i + 1], {}),
-      FEATURE_MATCH_TIMEOUT_MS,
-      '겹침 탐지(ORB) — ' + (i + 1) + '번째↔' + (i + 2) + '번째 이미지'
-    );
-    if (featureOverlap) {
-      // featureOverlap.overlapPx is in contentCanvases[i+1]'s own coordinate space (counted from its
-      // own left edge) — convert to the original canvas B's coordinate space the same way as above
-      const cutLeftPx = contentRects[i + 1].left + featureOverlap.overlapPx;
-      seams.push({ i, method: 'feature', cutLeftPx, inlierCount: featureOverlap.inlierCount, totalMatches: featureOverlap.totalMatches });
-      continue;
-    }
-    seams.push({ i, method: 'unresolved' });
-  }
-
-  function resolvedResult(seamChoices) {
-    seamChoices = seamChoices || {};
-    const parts = [{ canvas: canvases[0], cutLeftPx: 0, srcIndex: 0 }];
-    const seamMethods = [];
-    const warnings = [];
-    for (let i = 0; i < seams.length; i++) {
-      const seam = seams[i];
-      const nextCanvas = canvases[i + 1];
-      if (seam.method === 'ocr' || seam.method === 'feature') {
-        // seam.cutLeftPx is already converted to the ORIGINAL (uncropped) canvas B's coordinate
-        // space — see the border/content-crop conversion where each seam was built above
-        parts.push({ canvas: nextCanvas, cutLeftPx: seam.cutLeftPx, srcIndex: i + 1 });
-        seamMethods.push(seam.method);
-      } else {
-        const choice = seamChoices[i] || 'concat';
-        if (choice === 'concat') {
-          parts.push({ canvas: nextCanvas, cutLeftPx: 0, srcIndex: i + 1 });
-          seamMethods.push('concat');
-          warnings.push('이미지 ' + (i + 1) + '↔' + (i + 2) + ': 겹침을 찾지 못해 그대로 이어붙임');
-        } else {
-          parts.push({ canvas: nextCanvas, cutLeftPx: 0, srcIndex: i + 1 });
-          seamMethods.push('split');
-          warnings.push('이미지 ' + (i + 1) + '↔' + (i + 2) + ': 겹침을 찾지 못해 개별 이미지로 분리됨');
-        }
-      }
-    }
-    const splitAfter = new Set();
-    Object.keys(seamChoices).forEach(k => { if (seamChoices[k] === 'split') splitAfter.add(Number(k)); });
-
-    const groups = [[parts[0]]];
-    for (let i = 1; i < parts.length; i++) {
-      if (splitAfter.has(i - 1)) groups.push([parts[i]]);
-      else groups[groups.length - 1].push(parts[i]);
-    }
-
-    const finalCanvases = groups.map(group => {
-      // Captures of the same content can have very different album-art/playback-UI chrome heights
-      // above the staff, so naively drawing each segment at y=0 would leave the actual TAB lines
-      // jumping up/down at every seam. Align every segment's staff band to the first segment's
-      // (using the same staffBands already computed above — no extra detection work here), falling
-      // back to y=0 alignment for any segment whose staff band wasn't detected.
-      const refTop = originalStaffTop(group[0].srcIndex);
-      const offsets = group.map(p => {
-        const t = originalStaffTop(p.srcIndex);
-        return (refTop != null && t != null) ? (refTop - t) : 0;
-      });
-      const minOffset = Math.min(0, ...offsets);
-      const maxOffset = Math.max(0, ...offsets);
-      let w = 0;
-      group.forEach((p, idx) => { w += (idx === 0 ? p.canvas.width : (p.canvas.width - p.cutLeftPx)); });
-      const h = Math.max(...group.map((p, idx) => p.canvas.height + offsets[idx])) - minOffset;
-
-      const out = document.createElement('canvas');
-      out.width = Math.max(1, w); out.height = Math.max(1, Math.round(h));
-      const ctx = out.getContext('2d');
-      ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, out.width, out.height);
-      let x = 0;
-      group.forEach((p, idx) => {
-        const cutLeftPx = idx === 0 ? 0 : p.cutLeftPx;
-        const sw = p.canvas.width - cutLeftPx;
-        const y = Math.round(offsets[idx] - minOffset);
-        ctx.drawImage(p.canvas, cutLeftPx, 0, sw, p.canvas.height, x, y, sw, p.canvas.height);
-        x += sw;
-      });
-      return out;
-    });
-
-    return { canvases: finalCanvases, seamMethods, warnings };
-  }
-
-  const unresolvedPairs = seams.filter(s => s.method === 'unresolved').map(s => ({ indexA: s.i, indexB: s.i + 1 }));
-
-  return { resolvedResult, seams, unresolvedPairs, sourceCount: total };
 }
 
 function resolvedSrc(item) {
@@ -1222,9 +699,8 @@ function effectiveImageSettings(item, defaults) {
 }
 
 // ---- merge already-processed images into one side-by-side row ----
-// Unlike stitchImages (which finds an OVERLAP between raw captures of the same content and trims the
-// duplicate), this takes items that are already fully processed (background removed, cropped, etc. —
-// each already rendered once via drawProcessed) and whose content does NOT overlap at all (different
+// This takes items that are already fully processed (background removed, cropped, etc. — each
+// already rendered once via drawProcessed) and whose content does NOT overlap at all (different
 // bars), and simply places them next to each other to build one multi-bar row out of several
 // narrow single/two-bar captures. No overlap search of any kind is used here.
 
@@ -2350,123 +1826,6 @@ function FloatingPreview({ title, items, titleFontSize, referenceWidth, imageGap
   );
 }
 
-function StitchUploadModal({ defaults, onComplete, onClose }) {
-  const [files, setFiles] = useState([]);
-  const [playheadRemove, setPlayheadRemove] = useState(!!defaults.playheadRemove);
-  const [phase, setPhase] = useState('pick'); // pick | processing | conflict | error
-  const [progress, setProgress] = useState({ stage: '', i: 0, total: 0 });
-  const [stitchState, setStitchState] = useState(null); // { resolvedResult, seams, unresolvedPairs }
-  const [conflictChoices, setConflictChoices] = useState({});
-  const [errorMsg, setErrorMsg] = useState('');
-  const fileRef = useRef(null);
-
-  async function start() {
-    if (files.length === 0) return;
-    setPhase('processing');
-    setErrorMsg('');
-    try {
-      const result = await stitchImages(files, { playheadRemove, playheadColor: defaults.playheadColor }, p => setProgress(p));
-      setStitchState(result);
-      if (result.unresolvedPairs.length > 0) {
-        setPhase('conflict');
-      } else {
-        finish(result, {});
-      }
-    } catch (e) {
-      console.error(e);
-      setErrorMsg('이어붙이기 중 오류가 발생했습니다: ' + (e && e.message ? e.message : e));
-      setPhase('error');
-    }
-  }
-
-  function chooseConflict(pairKey, choice) {
-    setConflictChoices(prev => ({ ...prev, [pairKey]: choice }));
-  }
-
-  function allConflictsResolved() {
-    if (!stitchState) return false;
-    return stitchState.unresolvedPairs.every(p => conflictChoices[p.indexA] != null);
-  }
-
-  function finishAfterConflicts() {
-    finish(stitchState, conflictChoices);
-  }
-
-  function finish(result, choices) {
-    const composed = result.resolvedResult(choices);
-    const newItems = composed.canvases.map((canvas, idx) => {
-      const baseId = Date.now() + '_' + Math.random().toString(36).slice(2) + '_' + idx;
-      return {
-        id: baseId, type: 'image', src: canvas.toDataURL('image/png'),
-        invert: false, override: null,
-        lyrics: { tags: [], areaHeightRatio: null },
-        playheadExcluded: [],
-        barLayout: null,
-        stitchMeta: { sourceCount: result.sourceCount, seamMethods: composed.seamMethods, warnings: composed.warnings },
-      };
-    });
-    onComplete(newItems);
-  }
-
-  return (
-    <div className="preview-modal-backdrop" onClick={onClose}>
-      <div className="preview-modal" onClick={e => e.stopPropagation()}>
-        <div className="preview-modal-head">
-          <span>여러 장 이어붙이기</span>
-          <button className="icon-btn" onClick={onClose}>닫기</button>
-        </div>
-        <div className="preview-modal-body">
-          {phase === 'pick' && (
-            <div className="controls">
-              <div className="slider-label">이어붙일 이미지를 순서대로 여러 장 선택하세요 (왼쪽→오른쪽 순서)</div>
-              <input ref={fileRef} type="file" accept="image/*" multiple
-                onChange={e => setFiles(Array.from(e.target.files || []))} />
-              <label>
-                <input type="checkbox" checked={playheadRemove} onChange={e => setPlayheadRemove(e.target.checked)} />
-                재생 표시줄 제거 적용 (이어붙이기 전 각 이미지에 먼저 적용)
-              </label>
-              <button onClick={start} disabled={files.length === 0}>이어붙이기 시작</button>
-            </div>
-          )}
-          {phase === 'processing' && (
-            <div className="stitch-progress-row">
-              <span>
-                {progress.stage === 'ocr' && `${progress.i}/${progress.total} 이미지 분석 중 (마디 번호 인식)...`}
-                {progress.stage === 'seam' && `${progress.i}/${progress.total} 겹침 위치 계산 중...`}
-                {!progress.stage && '처리 중...'}
-              </span>
-            </div>
-          )}
-          {phase === 'conflict' && stitchState && (
-            <div className="controls">
-              <div className="slider-label">겹침 위치를 자동으로 찾지 못한 이미지 쌍이 있습니다. 각각 선택해주세요.</div>
-              {stitchState.unresolvedPairs.map(p => (
-                <div className="stitch-conflict-card" key={p.indexA}>
-                  <span>{p.indexA + 1}번째, {p.indexB + 1}번째 이미지는 자동으로 겹침 위치를 못 찾았습니다. 순서대로 이어붙이기만 하시겠습니까, 아니면 개별 이미지로 각각 업로드하시겠습니까?</span>
-                  <div className="block-actions">
-                    <button className={conflictChoices[p.indexA] === 'concat' ? '' : 'icon-btn'}
-                      onClick={() => chooseConflict(p.indexA, 'concat')}>순서대로 이어붙이기</button>
-                    <button className={conflictChoices[p.indexA] === 'split' ? '' : 'icon-btn'}
-                      onClick={() => chooseConflict(p.indexA, 'split')}>개별 이미지로 추가</button>
-                  </div>
-                </div>
-              ))}
-              <button onClick={finishAfterConflicts} disabled={!allConflictsResolved()}>계속</button>
-            </div>
-          )}
-          {phase === 'error' && (
-            <div className="controls">
-              <div className="save-msg" style={{ color: '#c0392b' }}>{errorMsg}</div>
-              <div className="slider-label">자동 이어붙이기에 실패해도 각 이미지를 "TAB 이미지 추가"로 개별 업로드해서 계속 작업하실 수 있습니다.</div>
-              <button onClick={onClose}>닫기</button>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function TabScoreBuilder() {
   const [title, setTitle] = useState('');
   const [items, setItems] = useState([]);
@@ -2481,7 +1840,6 @@ function TabScoreBuilder() {
   const [loaded, setLoaded] = useState(false);
   const [saveMsg, setSaveMsg] = useState('');
   const [noticeDismissed, setNoticeDismissed] = useState(true);
-  const [showStitchModal, setShowStitchModal] = useState(false);
   const [mergeSelectedIds, setMergeSelectedIds] = useState(new Set());
   const [merging, setMerging] = useState(false);
   const [mergeGapPct, setMergeGapPct] = useState(0);
@@ -2577,11 +1935,6 @@ function TabScoreBuilder() {
       reader.readAsDataURL(file);
     });
     e.target.value = '';
-  }
-
-  function handleStitchComplete(newItems) {
-    setItems(prev => [...prev, ...newItems]);
-    setShowStitchModal(false);
   }
 
   function toggleMergeSelect(id) {
@@ -2962,7 +2315,6 @@ function TabScoreBuilder() {
       <div className="toolbar">
         <input ref={fileInputRef} type="file" accept="image/*" multiple onChange={handleFiles} style={{ display: 'none' }} />
         <button onClick={() => fileInputRef.current && fileInputRef.current.click()}>TAB 이미지 추가</button>
-        <button className="icon-btn" onClick={() => setShowStitchModal(true)}>여러 장 이어붙이기</button>
         <button onClick={handleExport} disabled={items.length === 0 || exporting}>
           {exporting ? '내보내는 중...' : 'PNG로 내보내기'}
         </button>
@@ -3105,10 +2457,6 @@ function TabScoreBuilder() {
         referenceWidth={getReferenceWidth()} imageGap={defaults.imageGap}
         lyricFontSize={lyricFontSize} lyricLetterSpacing={lyricLetterSpacing}
         lyricAreaHeight={defaults.lyricAreaHeight} defaults={defaults} />
-
-      {showStitchModal && (
-        <StitchUploadModal defaults={defaults} onComplete={handleStitchComplete} onClose={() => setShowStitchModal(false)} />
-      )}
 
       <div className="disclaimer-footer">
         본 도구는 이미지 편집·정리 기능만 제공하는 개인 연습용 소프트웨어이며, 악보나 이미지를 수집·배포하지 않습니다.<br />
