@@ -130,6 +130,11 @@ const STORE_NAME = 'scores';
 // Matches tab-score-builder.html's own VIDEO_IMPORT_KEY exactly — same database, same store, this
 // page only ever writes this one key right before navigating over.
 const VIDEO_IMPORT_KEY = '__video_import__';
+// One entry per extraction session, keyed by VIDEO_SOURCE_KEY_PREFIX + a generated id (see
+// App.goToPreprocess) — holds the original video file (for on-demand audio decode/playback later, in
+// tab-score-builder.html's syllable-placement mode) plus its detected onsets, stored once and shared
+// by every TAB item built from that same video rather than duplicated per item.
+const VIDEO_SOURCE_KEY_PREFIX = '__video_source__';
 
 function openDB() {
   return new Promise((resolve, reject) => {
@@ -320,6 +325,127 @@ function getRoiPixelsForDiff(video, roi) {
   return diffSampleCtx.getImageData(0, 0, outW, outH).data;
 }
 
+// ==== onset (sound-start) detection — spectral flux, reused from the verified onset-detect-test.html
+// prototype: FFT magnitude spectrum per frame, positive-change flux between adjacent frames, adaptive
+// local-mean+stddev threshold for peak picking, then merge candidates closer than the minimum gap. ====
+
+function nextPow2(n) { let p = 1; while (p < n) p *= 2; return p; }
+
+// Iterative radix-2 FFT (real input, magnitude spectrum only) — identical to the prototype's.
+function fftMagnitude(real) {
+  const n = real.length;
+  const re = Float64Array.from(real);
+  const im = new Float64Array(n);
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = -2 * Math.PI / len;
+    const wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let curWr = 1, curWi = 0;
+      for (let j = 0; j < len / 2; j++) {
+        const ur = re[i + j], ui = im[i + j];
+        const vr = re[i + j + len/2] * curWr - im[i + j + len/2] * curWi;
+        const vi = re[i + j + len/2] * curWi + im[i + j + len/2] * curWr;
+        re[i + j] = ur + vr; im[i + j] = ui + vi;
+        re[i + j + len/2] = ur - vr; im[i + j + len/2] = ui - vi;
+        const nWr = curWr * wr - curWi * wi;
+        curWi = curWr * wi + curWi * wr;
+        curWr = nWr;
+      }
+    }
+  }
+  const mags = new Float64Array(n / 2);
+  for (let i = 0; i < n / 2; i++) mags[i] = Math.hypot(re[i], im[i]);
+  return mags;
+}
+
+// Returns onset times in seconds, ABSOLUTE within monoData's own timeline — if monoData is decoded
+// from the whole original video file (not a cropped segment), these are directly usable as
+// video-absolute timestamps, which is what downstream syllable placement needs regardless of how the
+// video later gets split into pages or merged into rows.
+function detectOnsets(monoData, sampleRate) {
+  const FRAME_SIZE = 1024, HOP = 512;
+  const SENSITIVITY = 1.5, MIN_GAP_SEC = 0.12; // prototype's verified defaults, not exposed as UI here
+  const win = new Float64Array(FRAME_SIZE);
+  for (let i = 0; i < FRAME_SIZE; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (FRAME_SIZE - 1));
+
+  const numFrames = Math.max(0, Math.floor((monoData.length - FRAME_SIZE) / HOP));
+  const flux = new Float64Array(numFrames);
+  let prevMag = null;
+  const frameBuf = new Float64Array(FRAME_SIZE);
+  for (let f = 0; f < numFrames; f++) {
+    const start = f * HOP;
+    for (let i = 0; i < FRAME_SIZE; i++) frameBuf[i] = monoData[start + i] * win[i];
+    const mag = fftMagnitude(frameBuf);
+    if (prevMag) {
+      let sum = 0;
+      for (let k = 0; k < mag.length; k++) { const d = mag[k] - prevMag[k]; if (d > 0) sum += d; }
+      flux[f] = sum;
+    }
+    prevMag = mag;
+  }
+
+  const maxFlux = Math.max(...flux, 1e-9);
+  for (let i = 0; i < flux.length; i++) flux[i] /= maxFlux;
+
+  const minGapFrames = Math.max(1, Math.round(MIN_GAP_SEC * sampleRate / HOP));
+  const W = 20;
+  const candidates = [];
+  for (let i = 2; i < flux.length - 2; i++) {
+    const lo = Math.max(0, i - W), hi = Math.min(flux.length, i + W);
+    let mean = 0;
+    for (let k = lo; k < hi; k++) mean += flux[k];
+    mean /= (hi - lo);
+    let variance = 0;
+    for (let k = lo; k < hi; k++) variance += (flux[k] - mean) ** 2;
+    const std = Math.sqrt(variance / (hi - lo));
+    const threshold = mean + SENSITIVITY * std;
+    const isLocalPeak = flux[i] > flux[i-1] && flux[i] >= flux[i+1];
+    if (isLocalPeak && flux[i] > threshold && flux[i] > 0.02) candidates.push({ frame: i, score: flux[i] });
+  }
+
+  candidates.sort((a, b) => a.frame - b.frame);
+  const filtered = [];
+  for (const c of candidates) {
+    if (filtered.length === 0 || c.frame - filtered[filtered.length - 1].frame >= minGapFrames) {
+      filtered.push(c);
+    } else if (c.score > filtered[filtered.length - 1].score) {
+      filtered[filtered.length - 1] = c;
+    }
+  }
+  return filtered.map(c => (c.frame * HOP) / sampleRate);
+}
+
+// Decodes the full audio track of a video/audio File and runs onset detection on it. Returns
+// { onsets: number[], duration: number } — duration comes straight from the decoded buffer, matching
+// the video's own duration closely enough for range-clamping purposes. Resolves to { onsets: [],
+// duration: 0 } (never rejects) on any decode failure — e.g. a video with no audio track — since
+// onset data is an enhancement, not a hard requirement for the rest of the pipeline to work.
+async function decodeAudioOnsets(file) {
+  try {
+    const arrayBuf = await file.arrayBuffer();
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const audioBuffer = await ctx.decodeAudioData(arrayBuf);
+    const ch0 = audioBuffer.getChannelData(0);
+    let monoData = ch0;
+    if (audioBuffer.numberOfChannels > 1) {
+      const ch1 = audioBuffer.getChannelData(1);
+      monoData = new Float32Array(ch0.length);
+      for (let i = 0; i < ch0.length; i++) monoData[i] = (ch0[i] + ch1[i]) / 2;
+    }
+    const onsets = detectOnsets(monoData, audioBuffer.sampleRate);
+    return { onsets, duration: audioBuffer.duration };
+  } catch (err) {
+    console.warn('온셋 감지용 오디오 디코딩 실패 (온셋 없이 계속 진행):', err);
+    return { onsets: [], duration: 0 };
+  }
+}
+
 function diffScore(a, b) {
   let sum = 0;
   const n = a.length / 4;
@@ -383,7 +509,7 @@ function Lightbox({ src, onClose }) {
   );
 }
 
-function CaptureStep({ videoRef, frames, setFrames, onNext }) {
+function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile, setVideoFile, onNext }) {
   const roiCanvasRef = useRef(null);
   const roiBoxRef = useRef(null);
   const chartRef = useRef(null);
@@ -412,6 +538,7 @@ function CaptureStep({ videoRef, frames, setFrames, onNext }) {
   const [extracting, setExtracting] = useState(false);
   const [statusMsg, setStatusMsg] = useState('영상 파일을 선택하세요.');
   const [lightboxSrc, setLightboxSrc] = useState(null);
+  const [onsetDetecting, setOnsetDetecting] = useState(false);
 
   function log(msg) { setStatusMsg(msg); }
 
@@ -530,6 +657,8 @@ function CaptureStep({ videoRef, frames, setFrames, onNext }) {
     setRoi(null);
     setAnalysis(null);
     setFrames([]);
+    setVideoFile(file);
+    setOnsets([]);
     video.onloadedmetadata = async () => {
       setVideoLoaded(true);
       setDuration(video.duration);
@@ -592,6 +721,19 @@ function CaptureStep({ videoRef, frames, setFrames, onNext }) {
     setAnalyzing(true);
     setAnalyzeProgress(0);
     setFrames([]);
+
+    // Onset detection runs independently of (and concurrently with) the page-transition diff loop
+    // below — it's a one-time whole-file audio decode + FFT pass, unrelated to the ROI/ threshold/
+    // seek work the diff loop does, so there's no reason to block on it or repeat it on every re-run
+    // of "분석 시작" for the same file.
+    if (videoFile && onsets.length === 0 && !onsetDetecting) {
+      setOnsetDetecting(true);
+      decodeAudioOnsets(videoFile).then(result => {
+        setOnsets(result.onsets);
+        setOnsetDetecting(false);
+      }).catch(() => setOnsetDetecting(false));
+    }
+
     const video = videoRef.current;
     const step = parseFloat(stepSec) || 0.3;
     // Only the user-selected range is sampled — defaults to the whole video (0..duration) when no
@@ -750,6 +892,11 @@ function CaptureStep({ videoRef, frames, setFrames, onNext }) {
         )}
 
         <div className="slider-label" style={{ whiteSpace: 'pre-wrap' }}>{statusMsg}</div>
+        {(onsetDetecting || onsets.length > 0) && (
+          <div className="slider-label">
+            {onsetDetecting ? '오디오 온셋(소리 시작 지점) 감지 중...' : ('오디오 온셋 ' + onsets.length + '개 감지됨 (가사 배치 단계에서 사용됩니다)')}
+          </div>
+        )}
         <canvas ref={chartRef} className="chart-canvas" />
       </div>
 
@@ -904,7 +1051,7 @@ const FrameCard = React.memo(function FrameCard({ item, index, defaults, onChang
   );
 });
 
-function PreprocessStep({ items, setItems, defaults, setDefaults, onBack }) {
+function PreprocessStep({ items, setItems, defaults, setDefaults, videoFile, onsets, videoSourceId, onBack }) {
   const [sending, setSending] = useState(false);
   function update(patch) { setDefaults(prev => ({ ...prev, ...patch })); }
   function updateItem(id, next) { setItems(prev => prev.map(it => it.id === id ? next : it)); }
@@ -922,8 +1069,19 @@ function PreprocessStep({ items, setItems, defaults, setDefaults, onBack }) {
           invert: eff.invert, override: { ...eff },
           lyrics: { tags: [], areaHeightRatio: null },
           playheadExcluded: [], barLayout: null, stitchMeta: null,
+          timeRange: it.timeRange || null,
+          videoSourceId: it.videoSourceId || null,
         };
       });
+      // Persist the original video + detected onsets ONCE per video, shared by every item
+      // extracted from it (keyed by videoSourceId), so lyric-placement playback can reach it later.
+      if (videoSourceId && videoFile) {
+        await dbPut(VIDEO_SOURCE_KEY_PREFIX + videoSourceId, {
+          videoBlob: videoFile,
+          onsets,
+          savedAt: Date.now(),
+        });
+      }
       await dbPut(VIDEO_IMPORT_KEY, { items: finalItems, importedAt: Date.now() });
       window.location.href = 'tab-score-builder.html';
     } catch (err) {
@@ -997,9 +1155,17 @@ function App() {
   const [selectedFrameIds, setSelectedFrameIds] = useState(new Set());
   const [items, setItems] = useState([]);
   const [defaults, setDefaults] = useState(VIDEO_DEFAULTS_INIT);
+  const [onsets, setOnsets] = useState([]);
+  const [videoFile, setVideoFile] = useState(null);
+  const [videoSourceId, setVideoSourceId] = useState(null);
 
   async function goToPreprocess() {
     const selected = frames.filter(f => selectedFrameIds.has(f.id));
+    // One id shared by every item built from this extraction session, so the (possibly large) video
+    // file + onsets are stored ONCE in tab-score-builder.html's IndexedDB and referenced by id, not
+    // duplicated per TAB block.
+    const sourceId = videoFile ? ('vsrc_' + Date.now() + '_' + Math.random().toString(36).slice(2)) : null;
+    setVideoSourceId(sourceId);
     const built = await Promise.all(selected.map(async f => {
       const img = await loadImage(f.dataUrl);
       const avg = sampleAvgLuminance(img);
@@ -1008,6 +1174,11 @@ function App() {
         invert: avg < 128, override: null,
         lyrics: { tags: [], areaHeightRatio: null },
         playheadExcluded: [], barLayout: null, stitchMeta: null,
+        // Which span of the source video this page covers, and which stored video source it came
+        // from — carried all the way to tab-score-builder.html so the syllable-placement onset-snap
+        // mode (a later stage) knows what audio range to play and which onsets apply.
+        timeRange: { start: f.segStartT, end: f.segEndT },
+        videoSourceId: sourceId,
       };
     }));
     setItems(built);
@@ -1045,6 +1216,7 @@ function App() {
           video, ROI, diff analysis, per-frame overrides — survives moving back and forth. */}
       <div style={{ display: step === 'capture' ? 'block' : 'none' }}>
         <CaptureStep videoRef={videoRef} frames={frames} setFrames={setFrames}
+          onsets={onsets} setOnsets={setOnsets} videoFile={videoFile} setVideoFile={setVideoFile}
           onNext={() => { setSelectedFrameIds(new Set(frames.map(f => f.id))); setStep('select'); }} />
       </div>
       <div style={{ display: step === 'select' ? 'block' : 'none' }}>
@@ -1053,6 +1225,7 @@ function App() {
       </div>
       <div style={{ display: step === 'preprocess' ? 'block' : 'none' }}>
         <PreprocessStep items={items} setItems={setItems} defaults={defaults} setDefaults={setDefaults}
+          videoFile={videoFile} onsets={onsets} videoSourceId={videoSourceId}
           onBack={() => setStep('select')} />
       </div>
     </div>
