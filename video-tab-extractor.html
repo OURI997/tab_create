@@ -1269,10 +1269,18 @@ async function mergeImagesIntoRow(sourceItems, defaults, gapPct) {
     ? sourceItems[0].videoSourceId
     : null;
 
+  // 0-based indices (within sourceItems) whose staff detection failed — these pieces got NEITHER
+  // the scale correction NOR the content-boundary trim/overlap (both derive from the same
+  // detectStaffBand result), and silently fell back to plain edge-to-edge concatenation at their
+  // own native scale. Returned so the caller can tell the user exactly which pieces this happened
+  // to, instead of a single generic flag that only implies the scale side of it.
+  const missingStaffIndices = processed.map((p, i) => (p.staff ? null : i)).filter(i => i !== null);
+
   return {
     canvas: out,
     lyrics: { tags: mergedTags, areaHeightRatio },
-    anyStaffMissing: processed.some(p => !p.staff),
+    anyStaffMissing: missingStaffIndices.length > 0,
+    missingStaffIndices,
     timeRange, videoSourceId,
   };
 }
@@ -1363,6 +1371,16 @@ function PreprocessStep({ items, setItems, defaults, setDefaults, videoFile, ons
         playheadExcluded: [], barLayout: null, stitchMeta: null,
         timeRange: result.timeRange, videoSourceId: result.videoSourceId,
       }));
+
+      const staffMissingGroupNumbers = mergedResults
+        .map((result, i) => (result.anyStaffMissing ? i + 1 : null))
+        .filter(n => n !== null);
+      if (staffMissingGroupNumbers.length > 0) {
+        alert(
+          staffMissingGroupNumbers.join(', ') + '번째 그룹은 일부 이미지의 보표선을 인식하지 못해, '
+          + '크기 보정과 겹침(콘텐츠 경계 기준 자르기) 보정을 모두 건너뛰고 원본 폭 그대로 합쳐졌습니다 — TAB 악보 만들기 화면에서 결과를 확인해주세요.'
+        );
+      }
 
       await handleSend(newBlocks);
     } catch (err) {
