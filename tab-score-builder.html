@@ -902,6 +902,15 @@ function padCanvasRightTo(canvas, targetWidth) {
 // produce a canvas wide/tall enough to freeze the browser or take a very long time to render/encode.
 const EXPORT_MAX_WIDTH = 4500;
 
+// Left/right print margin, as a fraction of the export's own (resolution-preserving) width — kept
+// as a ratio rather than a fixed px value so it stays proportionally correct whether the canvas
+// ends up 780px (small preview) or the full EXPORT_MAX_WIDTH. Roughly matches Word/한글의 "여백
+// 좁게" preset (~1.27cm on A4, ≈6% of the page width) while erring toward the low end, since this
+// only needs to clear a consumer printer's few-mm unprintable border, not reproduce a specific
+// paper size — every previous export filled edge-to-edge with zero margin, which real printers can
+// silently crop.
+const EXPORT_MARGIN_RATIO = 0.04;
+
 // Shared by composeScore (single-canvas export/preview) and composeScorePages (A4-split export) —
 // decodes + measures everything once, so page-break math can reuse the exact same per-item heights
 // the single-canvas renderer uses, instead of re-deriving them.
@@ -944,11 +953,17 @@ async function buildScoreLayout(items, title, targetW, opts) {
   const lyricLetterSpacingPx = (opts.lyricLetterSpacing || 0) * scale;
   const defaultLyricRatio = (opts.lyricAreaHeight != null ? opts.lyricAreaHeight : 90) / (opts.referenceWidth || 780);
 
+  // Left/right print margin — the canvas itself stays at the full (resolution-preserving) W, but
+  // every image and lyric x-position below is laid out against this narrower contentW, inset by
+  // marginPx on each side, so the export never fills edge-to-edge.
+  const marginPx = Math.round(W * EXPORT_MARGIN_RATIO);
+  const contentW = Math.max(1, W - marginPx * 2);
+
   const processed = rawProcessed.map(({ item: it, canvas: off }) => {
-    const scaledH = Math.round(off.height * W / off.width);
+    const scaledH = Math.round(off.height * contentW / off.width);
     const tags = ((it.lyrics && it.lyrics.tags) || []).filter(t => (t.text || '').trim() !== '');
     const ratio = (it.lyrics && it.lyrics.areaHeightRatio != null) ? it.lyrics.areaHeightRatio : defaultLyricRatio;
-    const laneH = tags.length > 0 ? Math.max(lyricLineH, Math.round(ratio * W)) : 0;
+    const laneH = tags.length > 0 ? Math.max(lyricLineH, Math.round(ratio * contentW)) : 0;
     return { canvas: off, scaledH, tags, laneH, groupH: scaledH + laneH };
   });
 
@@ -957,7 +972,7 @@ async function buildScoreLayout(items, title, targetW, opts) {
   totalH += PAD;
 
   return {
-    W, PAD, titleH, gapAfterImage, titleFont, titleFontPx, lyricFont, lyricFontPx, lyricLineH,
+    W, marginPx, contentW, PAD, titleH, gapAfterImage, titleFont, titleFontPx, lyricFont, lyricFontPx, lyricLineH,
     lyricLetterSpacingPx, processed, totalH: Math.max(Math.round(totalH), titleH + PAD * 2),
   };
 }
@@ -989,12 +1004,16 @@ function drawScoreTitle(ctx, W, title, layout, y) {
 // Draws one item's image + (optional) lyric lane at y, returns the y position right after it
 // (caller adds the page's gap) — this is the single unbreakable unit a page break may never cut
 // through. `scale` (default 1) uniformly shrinks the image + lyric text/lane for THIS page only
-// (step-2 "A" fallback below) — the image is centered so the shrink reads as a print margin, not a
-// left-aligned resize.
-function drawScoreItem(ctx, W, p, y, layout, scale) {
+// (step-2 "A" fallback below) — the image is centered WITHIN the content area (inset from the
+// canvas edges by layout.marginPx on each side, per EXPORT_MARGIN_RATIO) so both the normal
+// full-size case and a page's own extra shrink always leave the same print-safe margin, never
+// edge-to-edge. Lyric x-positions (0-100%) map onto that same inset content area, not the raw
+// canvas width, so they line up with the image's own (now-inset) edges.
+function drawScoreItem(ctx, p, y, layout, scale) {
   scale = scale || 1;
-  const dw = Math.round(W * scale);
-  const dx = Math.round((W - dw) / 2);
+  const contentW = layout.contentW;
+  const dw = Math.round(contentW * scale);
+  const dx = layout.marginPx + Math.round((contentW - dw) / 2);
   const dh = Math.round(p.scaledH * scale);
   ctx.textAlign = 'left';
   ctx.drawImage(p.canvas, dx, y, dw, dh);
@@ -1009,7 +1028,7 @@ function drawScoreItem(ctx, W, p, y, layout, scale) {
     ctx.fillStyle = '#1a1a1a';
     ctx.textBaseline = 'middle';
     for (const t of p.tags) {
-      const tx = Math.min(W - 4, Math.max(4, (t.xPct / 100) * W));
+      const tx = layout.marginPx + Math.min(contentW - 4, Math.max(4, (t.xPct / 100) * contentW));
       const half = lyricLineH / 2;
       const cy = y + Math.min(laneH - half, Math.max(half, (t.yPct / 100) * laneH));
       fillTextWithSpacing(ctx, t.text, tx, cy, lyricLetterSpacingPx);
@@ -1033,7 +1052,7 @@ async function composeScore(items, title, targetW, opts) {
   y += layout.titleH;
 
   for (const p of layout.processed) {
-    y = drawScoreItem(ctx, layout.W, p, y, layout);
+    y = drawScoreItem(ctx, p, y, layout);
     y += layout.gapAfterImage;
   }
   return canvas;
@@ -1184,7 +1203,7 @@ function renderScorePageCanvas(layout, title, page, W, H) {
     y += titleH;
   }
   for (const p of page.items) {
-    y = drawScoreItem(ctx, W, p, y, layout, page.scale);
+    y = drawScoreItem(ctx, p, y, layout, page.scale);
     y += Math.round(page.gap * page.scale);
   }
   return canvas;
