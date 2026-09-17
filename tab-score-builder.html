@@ -68,10 +68,12 @@
   .onset-lyric-panel{border:1px solid var(--border-strong);border-radius:10px;padding:10px;margin-bottom:12px;background:#fdfdfb;}
   .onset-lyric-panel:focus{outline:2px solid var(--accent);outline-offset:2px;}
   .onset-line-input{width:100%;box-sizing:border-box;font-size:13px;padding:6px 8px;border:1px solid var(--border-strong);border-radius:8px;resize:vertical;margin-bottom:8px;font-family:inherit;}
+  .onset-placed-row{display:flex;align-items:center;gap:6px;margin-bottom:8px;}
+  .onset-placed-label{font-size:12px;color:var(--text2);white-space:nowrap;}
+  .onset-placed-input{flex:1;box-sizing:border-box;font-size:14px;padding:6px 8px;border:1px solid var(--border-strong);border-radius:8px;font-family:Georgia,"Noto Serif KR",serif;letter-spacing:inherit;white-space:pre;}
   .onset-syllable-queue{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;}
   .syllable-chip{display:inline-block;padding:2px 7px;border-radius:6px;font-size:13px;background:var(--card);border:1px solid var(--border);color:var(--text2);}
   .syllable-chip.active{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600;}
-  .syllable-chip.done{opacity:0.4;text-decoration:line-through;}
   .onset-wave-wrap{position:relative;width:100%;margin-bottom:6px;}
   .onset-wave-canvas{width:100%;display:block;border:1px solid var(--border);border-radius:8px;}
   .onset-cursor-canvas{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;}
@@ -209,7 +211,7 @@
 <body>
 <div id="root"></div>
 <script type="text/babel">
-const { useState, useRef, useEffect } = React;
+const { useState, useRef, useEffect, useMemo } = React;
 
 const DB_NAME = 'tab_score_builder_db';
 const STORE_NAME = 'scores';
@@ -1283,20 +1285,69 @@ function loadVideoSourceMeta(videoSourceId) {
   return p;
 }
 
-const ONSET_LANE_Y_PCT = 50; // fixed placement row for onset-snapped syllables; drag handle fine-tunes it after
+// Fixed position for the single line-text tag OnsetLyricPanel manages — a small left margin, not
+// draggable in this mode (space-editing is the one adjustment mechanism). Any pre-music lead-in is
+// expressed as leading spaces INSIDE the text itself, not by moving this anchor point.
+const ONSET_LINE_X_PCT = 2;
+const ONSET_LANE_Y_PCT = 50;
+
+let _onsetMeasureCtx = null;
+function measureLyricText(text, fontSize, letterSpacing) {
+  if (!_onsetMeasureCtx) _onsetMeasureCtx = document.createElement('canvas').getContext('2d');
+  _onsetMeasureCtx.font = fontSize + 'px Georgia, "Noto Serif KR", serif';
+  const t = text || '';
+  return _onsetMeasureCtx.measureText(t).width + letterSpacing * Math.max(0, t.length - 1);
+}
+
+// Walks `buffer` (a run of spaces + syllables, in order — exactly what the editable line-text
+// input holds) against the known `syllables` list, greedily matching each syllable in turn.
+// Stops at the first syllable it can't find next (whatever follows in the buffer, if anything, is
+// left alone) — so a stray edit only affects how many syllables currently register as "placed",
+// never throws. Returns per-syllable leading space counts and the buffer offset right before each
+// placed syllable's own leading spaces, so callers can both re-derive elapsed "space time" and
+// truncate the buffer precisely (Backspace) without re-deriving positions themselves.
+function parseOnsetBuffer(buffer, syllables) {
+  let pos = 0, i = 0;
+  const spacesBeforeEach = [];
+  const offsetsBeforeSpaces = [];
+  while (i < syllables.length) {
+    const spacesStart = pos;
+    let spaceCount = 0;
+    while (pos < buffer.length && buffer[pos] === ' ') { spaceCount++; pos++; }
+    const syl = syllables[i];
+    if (buffer.slice(pos, pos + syl.length) === syl) {
+      spacesBeforeEach.push(spaceCount);
+      offsetsBeforeSpaces.push(spacesStart);
+      pos += syl.length;
+      i++;
+    } else {
+      break;
+    }
+  }
+  return { placedCount: i, spacesBeforeEach, offsetsBeforeSpaces };
+}
 
 // Above a video-extraction block's existing (manual, drag-handle) lyric lane, this panel adds a
 // keyboard-driven placement mode: paste the line's lyrics, they're tokenized into syllables, and
 // each is snapped onto the mini waveform (cropped to this block's own video time range) at the
 // exact playback position where Enter was pressed. Renders nothing (and touches nothing) for a
 // manually-uploaded block, since those never carry item.timeRange/videoSourceId.
-function OnsetLyricPanel({ item, addTagAt, removeTagById, removeTagsByIds, nextItemId }) {
+//
+// Placement is shown as ONE continuously-flowing line of text rather than separately-positioned
+// boxes per syllable — the earlier per-syllable-box design let boxes overlap/cover each other
+// whenever two onsets landed close together, forcing the user to keep checking the preview just to
+// tell what was where. Instead, the gap between two syllables is however many space CHARACTERS sit
+// between them in the text, and a leading run of spaces represents a lead-in before the first
+// syllable — both directly visible and directly editable (add/remove spaces) without any separate
+// UI. "1 space = N seconds" is derived once per line from this block's own duration divided by how
+// wide the FULL (single-space-joined) line would render at the current lyric font — an
+// approximation by design (the request explicitly treats the auto-placed result as a good starting
+// point for manual space nudging afterward, not a final answer).
+function OnsetLyricPanel({ item, onsetTagText, updateOnsetTag, lyricFontSize, lyricLetterSpacing, nextItemId }) {
   const hasMeta = !!(item.timeRange && item.videoSourceId);
   const [meta, setMeta] = useState(null);
   const [metaLoading, setMetaLoading] = useState(hasMeta);
   const [lineText, setLineText] = useState('');
-  const [placedIds, setPlacedIds] = useState([]);
-  const [activeSyllableIndex, setActiveSyllableIndex] = useState(0);
   const [activeOnsetIndex, setActiveOnsetIndex] = useState(0);
   const [guidance, setGuidance] = useState('');
   const [waveW, setWaveW] = useState(600);
@@ -1330,6 +1381,20 @@ function OnsetLyricPanel({ item, addTagAt, removeTagById, removeTagsByIds, nextI
   const end = item.timeRange ? item.timeRange.end : 0;
   const blockOnsets = meta ? meta.onsets.filter(t => t >= start - 0.02 && t <= end + 0.02) : [];
   const syllables = tokenizeLyricLine(lineText);
+  const buffer = onsetTagText || '';
+  const { placedCount, spacesBeforeEach, offsetsBeforeSpaces } = parseOnsetBuffer(buffer, syllables);
+
+  // "1 space = how many seconds" — this block's own duration divided by how wide the full line
+  // (all syllables, single space between each) would render at the current lyric font, times one
+  // space's own glyph width. Recomputed only when the inputs that matter actually change, not on
+  // every keystroke while placing.
+  const secPerSpace = useMemo(() => {
+    if (syllables.length === 0) return 0;
+    const fullWidth = measureLyricText(syllables.join(' '), lyricFontSize, lyricLetterSpacing);
+    const spaceWidth = measureLyricText(' ', lyricFontSize, lyricLetterSpacing);
+    const duration = Math.max(0.001, end - start);
+    return fullWidth > 0 ? (spaceWidth * duration) / fullWidth : 0;
+  }, [syllables.join(' '), lyricFontSize, lyricLetterSpacing, start, end]);
 
   useEffect(() => {
     const video = videoElRef.current;
@@ -1425,31 +1490,34 @@ function OnsetLyricPanel({ item, addTagAt, removeTagById, removeTagsByIds, nextI
     video.currentTime = blockOnsets[idx];
   }
 
+  // Elapsed "space time" up to (not including) the syllable about to be placed — i.e. start plus
+  // every already-placed syllable's own leading-space run, converted via secPerSpace. Syllables
+  // themselves are treated as instantaneous markers; only the spaces between/before them carry
+  // duration, which is what makes "N spaces = a gap" a coherent, invertible model.
+  function elapsedSpaceTime() {
+    const totalSpaces = spacesBeforeEach.reduce((s, n) => s + n, 0);
+    return start + totalSpaces * secPerSpace;
+  }
+
   function placeSyllable() {
-    if (activeSyllableIndex >= syllables.length) { setGuidance('먼저 이 줄의 가사를 아래에 입력하세요.'); return; }
+    if (placedCount >= syllables.length) { setGuidance('먼저 이 줄의 가사를 아래에 입력하세요.'); return; }
     const video = videoElRef.current;
-    if (!video) return;
+    if (!video || secPerSpace <= 0) return;
     const t = Math.min(end, Math.max(start, video.currentTime));
-    const xPct = ((t - start) / Math.max(0.001, end - start)) * 100;
-    const id = addTagAt(syllables[activeSyllableIndex], xPct, ONSET_LANE_Y_PCT);
-    setPlacedIds(prev => [...prev, id]);
-    setActiveSyllableIndex(i => i + 1);
+    const gapSeconds = Math.max(0, t - elapsedSpaceTime());
+    const spacesToInsert = Math.max(0, Math.round(gapSeconds / secPerSpace));
+    updateOnsetTag(buffer + ' '.repeat(spacesToInsert) + syllables[placedCount]);
     setGuidance('');
   }
 
   function undoLast() {
-    if (placedIds.length === 0) return;
-    const lastId = placedIds[placedIds.length - 1];
-    removeTagById(lastId);
-    setPlacedIds(prev => prev.slice(0, -1));
-    setActiveSyllableIndex(i => Math.max(0, i - 1));
+    if (placedCount === 0) return;
+    updateOnsetTag(buffer.slice(0, offsetsBeforeSpaces[placedCount - 1]));
     setGuidance('');
   }
 
   function resetLine() {
-    if (placedIds.length > 0) removeTagsByIds(placedIds);
-    setPlacedIds([]);
-    setActiveSyllableIndex(0);
+    updateOnsetTag('');
     setGuidance('');
     const video = videoElRef.current;
     if (video) { video.pause(); video.currentTime = start; }
@@ -1463,7 +1531,7 @@ function OnsetLyricPanel({ item, addTagAt, removeTagById, removeTagsByIds, nextI
   }
 
   function advanceLine() {
-    if (activeSyllableIndex < syllables.length) {
+    if (placedCount < syllables.length) {
       setGuidance('아직 배치하지 않은 가사가 있습니다 — 모두 배치한 뒤 다음 줄로 이동할 수 있습니다.');
       return;
     }
@@ -1506,10 +1574,16 @@ function OnsetLyricPanel({ item, addTagAt, removeTagById, removeTagsByIds, nextI
         <React.Fragment>
           <textarea className="onset-line-input" placeholder="이 줄의 가사를 붙여넣거나 입력하세요 (음절 단위로 자동 분리됩니다)"
             value={lineText} onChange={e => setLineText(e.target.value)} rows={2} />
+          <div className="onset-placed-row">
+            <span className="onset-placed-label">배치됨 →</span>
+            <input type="text" className="onset-placed-input" spellCheck={false}
+              value={buffer} onChange={e => updateOnsetTag(e.target.value)}
+              placeholder="Enter로 음절을 배치하면 여기 텍스트로 쌓입니다 — 공백을 직접 넣거나 지워서 간격을 조절하세요" />
+          </div>
           <div className="onset-syllable-queue">
             {syllables.length === 0 && <span className="hint-text">위에 가사를 입력하면 음절이 여기 표시됩니다.</span>}
-            {syllables.map((syl, i) => (
-              <span key={i} className={'syllable-chip' + (i === activeSyllableIndex ? ' active' : (i < activeSyllableIndex ? ' done' : ''))}>{syl}</span>
+            {syllables.slice(placedCount).map((syl, i) => (
+              <span key={placedCount + i} className={'syllable-chip' + (i === 0 ? ' active' : '')}>{syl}</span>
             ))}
           </div>
           <div className="onset-wave-wrap" ref={waveWrapRef}>
@@ -1524,6 +1598,7 @@ function OnsetLyricPanel({ item, addTagAt, removeTagById, removeTagsByIds, nextI
           <p className="hint-text onset-keys-hint">
             Space 재생/일시정지 · ←/→ 이전/다음 온셋으로 이동 · Enter 현재 위치에 음절 배치 · Backspace 마지막 배치 취소 ·
             Shift+Backspace 이 줄 전체 초기화 · R 약 1초 되감아 다시재생 · Shift+Enter 또는 PageDown 다음 줄로 이동 (모두 배치해야 이동됨)
+            — 배치된 텍스트 칸을 클릭하면 공백을 직접 편집할 수 있습니다 (음절 사이 공백 = 시간 간격).
           </p>
         </React.Fragment>
       )}
@@ -1707,22 +1782,24 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   function deleteTag(id) {
     updateLyrics({ tags: tags.filter(t => t.id !== id) });
   }
-  // Used by OnsetLyricPanel's keyboard-driven placement — same shape as addTag/deleteTag above,
-  // just with an explicit text/position instead of the "+ 가사 추가" button's fixed default.
-  function addTagAt(text, xPct, yPct) {
-    const id = Date.now() + '_' + Math.random().toString(36).slice(2);
-    updateLyrics({ tags: [...tags, { id, text, xPct, yPct }] });
-    return id;
-  }
-  function removeTagById(id) {
-    updateLyrics({ tags: tags.filter(t => t.id !== id) });
-  }
-  // Bulk variant for OnsetLyricPanel's "reset whole line" — removing N ids via N separate
-  // removeTagById calls in the same synchronous burst would each read the same pre-update `tags`
-  // closure and only the last call's result would stick, silently losing all but one removal.
-  function removeTagsByIds(ids) {
-    const idSet = new Set(ids);
-    updateLyrics({ tags: tags.filter(t => !idSet.has(t.id)) });
+  // OnsetLyricPanel manages exactly ONE tag per block — a single flowing text whose embedded
+  // run-of-spaces represent inter-syllable timing (see the panel's own comments) — tracked by
+  // item.onsetTagId so it's never confused with any manually-added "+ 가사 추가" tag. Creates the
+  // tag lazily on first non-empty text, updates its text in place afterward, and removes it
+  // entirely once emptied (e.g. after Shift+Backspace). A single onChange call per invocation
+  // (never two in the same synchronous burst) keeps this safe against the stale-closure pitfall
+  // that bit the old per-syllable-tag design's bulk removal.
+  function updateOnsetTag(text) {
+    if (item.onsetTagId) {
+      if (text === '') {
+        onChange({ ...item, onsetTagId: null, lyrics: { ...lyricsObj, tags: tags.filter(t => t.id !== item.onsetTagId) } });
+      } else {
+        onChange({ ...item, lyrics: { ...lyricsObj, tags: tags.map(t => t.id === item.onsetTagId ? { ...t, text } : t) } });
+      }
+    } else if (text !== '') {
+      const id = Date.now() + '_' + Math.random().toString(36).slice(2);
+      onChange({ ...item, onsetTagId: id, lyrics: { ...lyricsObj, tags: [...tags, { id, text, xPct: ONSET_LINE_X_PCT, yPct: ONSET_LANE_Y_PCT }] } });
+    }
   }
   function startDrag(e, tagId) {
     e.preventDefault();
@@ -1905,7 +1982,9 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
       </div>
 
       <div className="lyric-section">
-        <OnsetLyricPanel item={item} addTagAt={addTagAt} removeTagById={removeTagById} removeTagsByIds={removeTagsByIds} nextItemId={nextItemId} />
+        <OnsetLyricPanel item={item} onsetTagText={(tags.find(t => t.id === item.onsetTagId) || {}).text || ''}
+          updateOnsetTag={updateOnsetTag} lyricFontSize={lyricFontSize} lyricLetterSpacing={lyricLetterSpacing}
+          nextItemId={nextItemId} />
         <div className="lyric-head-mini">
           <span>가사 배치 — 손잡이(⠿)로 위치 이동, 하단 막대로 입력 영역 높이 조절 (이미지 하단 30%는 참고용 미리보기)</span>
           <button className="icon-btn" onClick={addTag}>+ 가사 추가</button>
