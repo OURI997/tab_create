@@ -65,22 +65,18 @@
   .lyric-section{margin-top:14px;border-top:1px solid var(--border);padding-top:12px;}
   .hint-text{font-size:12.5px;color:var(--text2);line-height:1.6;margin:0 0 8px;}
   video.hidden-video{position:fixed;top:0;left:0;width:2px;height:2px;opacity:0.01;pointer-events:none;}
-  .click-lyric-panel{border:1px solid var(--border-strong);border-radius:10px;padding:10px;margin-bottom:12px;background:#fdfdfb;}
-  .click-lyric-panel:focus{outline:2px solid var(--accent);outline-offset:2px;}
+  .lyric-section:focus{outline:2px solid var(--accent);outline-offset:2px;border-radius:8px;}
   .onset-line-input{width:100%;box-sizing:border-box;font-size:13px;padding:6px 8px;border:1px solid var(--border-strong);border-radius:8px;resize:vertical;margin-bottom:8px;font-family:inherit;}
   .onset-syllable-queue{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;}
   .syllable-chip{display:inline-block;padding:2px 7px;border-radius:6px;font-size:13px;background:var(--card);border:1px solid var(--border);color:var(--text2);}
   .syllable-chip.active{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600;}
-  .click-lane-wrap{position:relative;width:100%;height:100px;border:1px solid var(--border);border-radius:8px;overflow:hidden;cursor:crosshair;margin-bottom:8px;
-    background:repeating-linear-gradient(45deg,#f3f1ea,#f3f1ea 6px,#ece9df 6px,#ece9df 12px);}
-  .click-lane-image{position:absolute;top:0;height:100%;object-fit:fill;pointer-events:none;}
-  .click-marker{position:absolute;top:0;bottom:0;width:3px;margin-left:-1.5px;pointer-events:none;border-radius:2px;}
+  .click-marker{position:absolute;top:0;bottom:0;width:3px;margin-left:-1.5px;pointer-events:none;border-radius:2px;z-index:2;}
   .click-marker.snapped{background:#2ecc71;box-shadow:0 0 0 1px #fff;}
   .click-marker.free{background:#888;}
   .click-tag-chunk{
-    position:absolute;top:50%;transform:translate(-50%,-50%);background:#fff;border:1.5px solid var(--border-strong);
+    position:absolute;transform:translate(-50%,-50%);background:#fff;border:1.5px solid var(--border-strong);
     border-radius:6px;padding:2px 7px;font-size:12.5px;white-space:pre;cursor:pointer;box-shadow:0 1px 2px rgba(0,0,0,.1);
-    max-width:220px;overflow:hidden;text-overflow:ellipsis;
+    max-width:220px;overflow:hidden;text-overflow:ellipsis;z-index:1;
   }
   .click-tag-chunk.selected{border-color:var(--accent);box-shadow:0 0 0 2px rgba(0,0,0,.08);}
   .click-selected-row{display:flex;align-items:center;gap:8px;margin-bottom:8px;}
@@ -95,11 +91,11 @@
   .lyric-head-mini .icon-btn{font-size:11px;padding:3px 8px;}
   .lane-wrap{display:flex;flex-direction:column;}
   .lane-ref-strip-standalone{
-    width:100%;flex-shrink:0;
-    background-repeat:no-repeat;background-size:100% auto;background-position:bottom;
-    opacity:0.32;pointer-events:none;
+    position:relative;width:100%;flex-shrink:0;pointer-events:none;overflow:hidden;
+    background:#fdfdfb;
     border:1px dashed var(--border-strong);border-bottom:none;border-radius:8px 8px 0 0;
   }
+  .lane-ref-strip-standalone img{object-fit:fill;}
   .lyric-lane{
     position:relative;width:100%;min-height:20px;
     border:1px dashed var(--border-strong);border-radius:0 0 8px 8px;
@@ -107,6 +103,16 @@
     background-image:repeating-linear-gradient(to right, var(--border) 0, var(--border) 1px, transparent 1px, transparent 5%);
   }
   .lyric-lane.no-ref{border-radius:8px;}
+  .lyric-lane.clickable{cursor:crosshair;}
+  .lane-margin-zone{
+    position:absolute;top:0;bottom:0;pointer-events:none;z-index:0;
+    background:repeating-linear-gradient(45deg,#f3f1ea,#f3f1ea 6px,#ece9df 6px,#ece9df 12px);
+  }
+  .play-bar-section{margin-top:14px;border-top:1px solid var(--border);padding-top:12px;}
+  .play-bar-row{display:flex;align-items:center;gap:10px;}
+  .play-bar-track{flex:1;height:10px;border-radius:5px;background:var(--border);position:relative;cursor:pointer;overflow:hidden;}
+  .play-bar-fill{position:absolute;top:0;left:0;bottom:0;background:var(--accent);border-radius:5px;}
+  .play-bar-time{white-space:nowrap;}
   .lane-empty{
     position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
     text-align:center;padding:8px;font-size:11.5px;color:var(--text2);line-height:1.5;
@@ -1347,8 +1353,8 @@ const CLICK_LYRIC_Y_PCT = 50;
 const SNAP_TOLERANCE_PCT = 2.5;
 const NUDGE_SMALL_PCT = 0.3;
 const NUDGE_LARGE_PCT = 1.5;
-const PREVIEW_LEAD_SEC = 0.25;
-const PREVIEW_TAIL_SEC = 0.6;
+const PREVIEW_LEAD_SEC = 0.5;
+const PREVIEW_TAIL_SEC = 2.0;
 
 // Groups xPct-ordered click-placed tags into DISPLAY chunks wherever two consecutive words'
 // rendered text would overlap at the current lyric font — shown as one combined label (words
@@ -1380,217 +1386,14 @@ function imageXPctToWrapPct(xPct) {
   return m + (xPct / 100) * (100 - 2 * m);
 }
 
-// Above a video-extraction block's existing (manual, drag-handle) lyric lane, this panel adds a
-// click-driven placement mode: paste the line's lyrics (split into words by whitespace), click
-// where each word belongs on the image — or its left/right margin, for lyrics that start before
-// or run past this block's own notation — and press Enter to confirm, which also plays a short
-// preview clip around that position so the placement can be checked by ear right away. Renders
-// nothing (and touches nothing) for a manually-uploaded block, since those never carry
-// item.timeRange/videoSourceId.
-function ClickLyricPanel({ item, tags, laneWidthPx, noteColumns, processedSrc, lyricFontSize, lyricLetterSpacing,
-  addClickTag, updateClickTagText, updateClickTagXPct, removeClickTagById, nextItemId }) {
-  const hasMeta = !!(item.timeRange && item.videoSourceId);
-  const [meta, setMeta] = useState(null);
-  const [lineText, setLineText] = useState('');
-  const [pendingXPct, setPendingXPct] = useState(null);
-  const [pendingSnapped, setPendingSnapped] = useState(false);
-  const [selectedTagId, setSelectedTagId] = useState(null);
-  const [selectedText, setSelectedText] = useState('');
-  const [guidance, setGuidance] = useState('');
-
-  const videoElRef = useRef(null);
-  const wrapRef = useRef(null);
-
-  useEffect(() => {
-    if (!hasMeta) return;
-    let cancelled = false;
-    loadVideoSourceMeta(item.videoSourceId).then(m => { if (!cancelled) setMeta(m); });
-    return () => { cancelled = true; };
-  }, [item.videoSourceId, hasMeta]);
-
-  const start = item.timeRange ? item.timeRange.start : 0;
-  const end = item.timeRange ? item.timeRange.end : 0;
-
-  const clickTags = tags.filter(t => t.viaClick).sort((a, b) => a.xPct - b.xPct);
-  const words = tokenizeWords(lineText);
-  const placedCount = clickTags.length;
-  const lastPlacedXPct = clickTags.length > 0 ? clickTags[clickTags.length - 1].xPct : -LYRIC_MARGIN_PCT - 1;
-  const chunks = mergeOverlappingLabels(clickTags, laneWidthPx, lyricFontSize, lyricLetterSpacing);
-  const selectedTag = selectedTagId ? tags.find(t => t.id === selectedTagId) : null;
-
-  useEffect(() => {
-    if (selectedTag) setSelectedText(selectedTag.text);
-    // eslint-disable-next-line
-  }, [selectedTagId]);
-
-  function xPctFromClientX(clientX) {
-    const rect = wrapRef.current.getBoundingClientRect();
-    const m = LYRIC_MARGIN_PCT / (100 + 2 * LYRIC_MARGIN_PCT);
-    const imageLeftPx = rect.left + rect.width * m;
-    const imageWidthPx = rect.width * (1 - 2 * m);
-    return ((clientX - imageLeftPx) / Math.max(1, imageWidthPx)) * 100;
-  }
-
-  function snapXPct(rawXPct) {
-    if (!noteColumns || noteColumns.length === 0) return { xPct: rawXPct, snapped: false };
-    let best = null, bestDist = Infinity;
-    for (const c of noteColumns) {
-      const d = Math.abs(c - rawXPct);
-      if (d < bestDist) { bestDist = d; best = c; }
-    }
-    if (best !== null && bestDist <= SNAP_TOLERANCE_PCT) return { xPct: best, snapped: true };
-    return { xPct: rawXPct, snapped: false };
-  }
-
-  function handleWrapClick(e) {
-    if (selectedTagId) { setSelectedTagId(null); return; }
-    const raw = xPctFromClientX(e.clientX);
-    const { xPct, snapped } = snapXPct(raw);
-    setPendingXPct(xPct);
-    setPendingSnapped(snapped);
-    setGuidance('');
-  }
-
-  function selectTag(id) {
-    setPendingXPct(null);
-    setSelectedTagId(id);
-  }
-
-  function playPreviewAround(timeSec) {
-    const video = videoElRef.current;
-    if (!video) return;
-    const t = Math.max(0, timeSec);
-    video.pause();
-    video.currentTime = Math.max(0, t - PREVIEW_LEAD_SEC);
-    const stopAt = t + PREVIEW_TAIL_SEC;
-    video.play().catch(() => {});
-    function tick() {
-      if (video.paused) return;
-      if (video.currentTime >= stopAt) { video.pause(); return; }
-      requestAnimationFrame(tick);
-    }
-    requestAnimationFrame(tick);
-  }
-
-  function confirmPlacement() {
-    if (placedCount >= words.length) { setGuidance('먼저 이 줄의 가사를 아래에 입력하세요.'); return; }
-    if (pendingXPct === null) { setGuidance('먼저 이미지(또는 좌우 여백) 위를 클릭해 위치를 지정하세요.'); return; }
-    if (pendingXPct < lastPlacedXPct) {
-      setGuidance('이미 배치한 단어보다 앞에는 놓을 수 없습니다 — 시간 순서대로만 배치할 수 있습니다.');
-      return;
-    }
-    addClickTag(words[placedCount], pendingXPct);
-    playPreviewAround(start + (pendingXPct / 100) * (end - start));
-    setPendingXPct(null);
-    setPendingSnapped(false);
-    setGuidance('');
-  }
-
-  function undoLast() {
-    if (clickTags.length === 0) return;
-    removeClickTagById(clickTags[clickTags.length - 1].id);
-    setGuidance('');
-  }
-
-  function advanceLine() {
-    if (placedCount < words.length) {
-      setGuidance('아직 배치하지 않은 가사가 있습니다 — 모두 배치한 뒤 다음 줄로 이동할 수 있습니다.');
-      return;
-    }
-    setGuidance('');
-    if (nextItemId) {
-      const el = document.getElementById('click-lyric-' + nextItemId);
-      if (el) el.focus();
-    }
-  }
-
-  function nudgeSelected(deltaPct) {
-    if (!selectedTag) return;
-    updateClickTagXPct(selectedTag.id, selectedTag.xPct + deltaPct);
-  }
-
-  function handleKeyDown(e) {
-    if (!meta) return;
-    // These shortcuts only fire when the panel's own outer container has focus — while the user is
-    // typing in the line-text textarea or the selected-word text input, every key (Enter/Backspace
-    // included) must behave as normal text editing instead of being hijacked as a placement command.
-    if (e.target !== e.currentTarget) return;
-    if (selectedTagId) {
-      if (e.key === 'ArrowLeft') { e.preventDefault(); nudgeSelected(e.shiftKey ? -NUDGE_LARGE_PCT : -NUDGE_SMALL_PCT); return; }
-      if (e.key === 'ArrowRight') { e.preventDefault(); nudgeSelected(e.shiftKey ? NUDGE_LARGE_PCT : NUDGE_SMALL_PCT); return; }
-      if (e.key === 'Escape' || e.key === 'Enter') { e.preventDefault(); setSelectedTagId(null); return; }
-      return;
-    }
-    if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); advanceLine(); return; }
-    if (e.key === 'PageDown') { e.preventDefault(); advanceLine(); return; }
-    if (e.key === 'Enter') { e.preventDefault(); confirmPlacement(); return; }
-    if (e.key === 'Backspace') { e.preventDefault(); undoLast(); return; }
-    if (e.key === 'Escape') { e.preventDefault(); setPendingXPct(null); setGuidance(''); return; }
-  }
-
-  if (!hasMeta) return null;
-
-  return (
-    <div id={'click-lyric-' + item.id} className="click-lyric-panel" tabIndex={0} onKeyDown={handleKeyDown}>
-      <div className="lyric-head-mini">
-        <span>가사 배치 (클릭) — 이 영역을 클릭해 포커스한 뒤 키보드로 조작하세요</span>
-      </div>
-      {!meta && <div className="hint-text">이 이미지의 원본 영상 데이터를 찾을 수 없어 클릭 배치를 사용할 수 없습니다 (아래 손잡이로 수동 배치는 가능합니다).</div>}
-      {meta && (
-        <React.Fragment>
-          <textarea className="onset-line-input" placeholder="이 줄의 가사를 붙여넣거나 입력하세요 (띄어쓰기 기준으로 단어가 나뉩니다)"
-            value={lineText} onChange={e => setLineText(e.target.value)} rows={2} />
-          <div className="onset-syllable-queue">
-            {words.length === 0 && <span className="hint-text">위에 가사를 입력하면 단어가 여기 표시됩니다.</span>}
-            {words.slice(placedCount).map((w, i) => (
-              <span key={placedCount + i} className={'syllable-chip' + (i === 0 ? ' active' : '')}>{w}</span>
-            ))}
-          </div>
-          <div className="click-lane-wrap" ref={wrapRef} onClick={handleWrapClick}>
-            {processedSrc && <img src={processedSrc} className="click-lane-image" draggable={false} alt=""
-              style={{ left: imageXPctToWrapPct(0) + '%', width: (imageXPctToWrapPct(100) - imageXPctToWrapPct(0)) + '%' }} />}
-            {chunks.map(c => (
-              <div key={c.ids[0]}
-                className={'click-tag-chunk' + (c.ids.includes(selectedTagId) ? ' selected' : '')}
-                style={{ left: imageXPctToWrapPct(c.xPct) + '%' }}
-                onClick={e => { e.stopPropagation(); if (c.ids.length === 1) selectTag(c.ids[0]); }}>
-                {c.text}
-              </div>
-            ))}
-            {pendingXPct !== null && (
-              <div className={'click-marker ' + (pendingSnapped ? 'snapped' : 'free')}
-                style={{ left: imageXPctToWrapPct(pendingXPct) + '%' }} />
-            )}
-          </div>
-          {selectedTag && (
-            <div className="click-selected-row">
-              <span className="hint-text" style={{ margin: 0 }}>선택됨 — ←/→ 미세 이동(Shift 크게), Enter/Esc 선택 해제:</span>
-              <input type="text" value={selectedText}
-                onChange={e => { setSelectedText(e.target.value); updateClickTagText(selectedTag.id, e.target.value); }} />
-              <button className="icon-btn" onClick={() => { removeClickTagById(selectedTag.id); setSelectedTagId(null); }}>삭제</button>
-            </div>
-          )}
-          <div className="onset-status-row">
-            <span className="save-msg">{start.toFixed(2)}s ~ {end.toFixed(2)}s (좌우 여백 포함 클릭 가능)</span>
-            {guidance && <span className="save-msg onset-guidance">{guidance}</span>}
-          </div>
-          <video ref={videoElRef} src={meta.objectUrl} preload="auto" className="hidden-video" muted={false} />
-          <p className="hint-text onset-keys-hint">
-            클릭으로 위치 지정(자석 스냅 자동 적용, 초록 테두리=스냅됨/회색=자유 배치) · Enter 확정 후 근방 미리듣기 ·
-            Backspace 마지막 배치 취소 · Shift+Enter 또는 PageDown 다음 줄로 이동 (모두 배치해야 이동됨) ·
-            배치된 단어를 클릭하면 텍스트 수정/방향키 미세조정이 가능합니다.
-          </p>
-        </React.Fragment>
-      )}
-    </div>
-  );
-}
 
 const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults, lyricFontSize, lyricLetterSpacing, defaultLyricAreaHeight, onChange, onDelete, onMove, mergeSelected, onToggleMergeSelect, nextItemId }) {
   const canvasRef = useRef(null);
   const imgRef = useRef(null);
   const laneRef = useRef(null);
   const measureCtxRef = useRef(null);
+  const videoElRef = useRef(null);
+  const previewGenRef = useRef(0);
   const [advanced, setAdvanced] = useState(!!item.override);
   // Whether the whole preprocessing-settings block below the image is expanded — separate from
   // `advanced` (which tracks whether this item HAS an override at all), so the panel starts
@@ -1606,9 +1409,24 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   const [barLayoutBusy, setBarLayoutBusy] = useState(false);
   const [processedSrc, setProcessedSrc] = useState(null);
   const [noteColumns, setNoteColumns] = useState([]);
+  // Click-placement state (video-extraction blocks only — see hasClickMeta below).
+  const [videoMeta, setVideoMeta] = useState(null);
+  const [lineText, setLineText] = useState('');
+  const [pendingXPct, setPendingXPct] = useState(null);
+  const [pendingSnapped, setPendingSnapped] = useState(false);
+  const [selectedTagId, setSelectedTagId] = useState(null);
+  const [selectedText, setSelectedText] = useState('');
+  const [guidance, setGuidance] = useState('');
+  // Independent play bar state — this line's own scrub bar, separate from the auto-preview clip
+  // that plays after every placement/nudge.
+  const [barPos01, setBarPos01] = useState(0);
+  const [barPlaying, setBarPlaying] = useState(false);
 
   const eff = effectiveImageSettings(item, defaults);
   const resolvedItemSrc = resolvedSrc(item);
+  const hasClickMeta = !!(item.timeRange && item.videoSourceId);
+  const start = item.timeRange ? item.timeRange.start : 0;
+  const end = item.timeRange ? item.timeRange.end : 0;
 
   useEffect(() => {
     let active = true;
@@ -1627,18 +1445,48 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     if (laneRef.current) setLaneWidth(laneRef.current.offsetWidth || 700);
   }, []);
 
+  useEffect(() => {
+    if (!hasClickMeta) return;
+    let cancelled = false;
+    loadVideoSourceMeta(item.videoSourceId).then(m => { if (!cancelled) setVideoMeta(m); });
+    return () => { cancelled = true; };
+  }, [item.videoSourceId, hasClickMeta]);
+
+  // Drives the independent play bar's fill/play-state — reads the shared video element directly,
+  // so it stays in sync whether currentTime moved from the bar itself or from a placement preview.
+  // Depends on videoMeta (not just hasClickMeta) because the <video> itself only mounts once that
+  // finishes loading — without it here, this effect's first run finds videoElRef.current still
+  // null (ref attaches after this render) and never re-attaches once the element actually appears.
+  useEffect(() => {
+    const video = videoElRef.current;
+    if (!video || !hasClickMeta) return;
+    function onTimeUpdate() {
+      const dur = Math.max(0.001, end - start);
+      setBarPos01(Math.min(1, Math.max(0, (video.currentTime - start) / dur)));
+    }
+    function onPlay() { setBarPlaying(true); }
+    function onPause() { setBarPlaying(false); }
+    video.addEventListener('timeupdate', onTimeUpdate);
+    video.addEventListener('play', onPlay);
+    video.addEventListener('pause', onPause);
+    return () => {
+      video.removeEventListener('timeupdate', onTimeUpdate);
+      video.removeEventListener('play', onPlay);
+      video.removeEventListener('pause', onPause);
+    };
+  }, [hasClickMeta, videoMeta, start, end]);
+
   function redraw() {
     if (!imgRef.current || !canvasRef.current) return;
     const result = drawProcessed(canvasRef.current, imgRef.current, effectiveImageSettings(item, defaults));
     setPlayheadRuns((result && result.playheadRuns) || []);
-    // The lyric-placement background strip below should show the same PROCESSED (background-removed/
+    // The lyric-placement reference image below should show the same PROCESSED (background-removed/
     // cropped/despeckled) image the TAB preview above shows — not the raw upload — so lyric positions
     // are set against what will actually be exported, not an image whose cropped/removed regions won't
     // even be there in the final result.
     setProcessedSrc(canvasRef.current.toDataURL('image/png'));
-    // Magnet-snap candidates for ClickLyricPanel — computed here (once per redraw) rather than
-    // inside the panel itself, since it already has the processed canvas's ImageData at hand from
-    // the exact same pass playhead detection uses.
+    // Magnet-snap candidates for click placement — computed here (once per redraw) since this is
+    // already where the processed canvas's ImageData is at hand (same pass playhead detection uses).
     if (item.timeRange && item.videoSourceId) {
       const canvas = canvasRef.current;
       const imageData = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height);
@@ -1761,7 +1609,16 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   const tags = lyricsObj.tags || [];
   const laneHeightRatio = lyricsObj.areaHeightRatio != null ? lyricsObj.areaHeightRatio : (defaultLyricAreaHeight / (laneWidth || 700));
   const laneHeight = Math.round(laneHeightRatio * (laneWidth || 700));
-  const refStripHeight = naturalRatio ? Math.round((laneWidth || 700) * naturalRatio * 0.3) : 0;
+  // Left/right margin reserved on the click-placement track (and, so the reference image above it
+  // stays x-aligned with it, on that image's own row too) — video-extraction blocks only. A plain
+  // manually-uploaded block keeps marginFrac at 0, i.e. the image/lane span edge-to-edge exactly
+  // like before this feature existed.
+  const marginFrac = hasClickMeta ? LYRIC_MARGIN_PCT / (100 + 2 * LYRIC_MARGIN_PCT) : 0;
+  const contentWidthPx = (laneWidth || 700) * (1 - 2 * marginFrac);
+  // Full reference image (no more 30%-height/translucent peek) — purely visual, not a click target;
+  // its own height is derived from the CONTENT width (excluding the margin columns) so its aspect
+  // ratio renders correctly and it lines up with the track's own image-aligned zone below it.
+  const refStripHeight = naturalRatio ? Math.round(contentWidthPx * naturalRatio) : 0;
 
   function updateLyrics(patch) {
     onChange({ ...item, lyrics: { ...lyricsObj, ...patch } });
@@ -1776,10 +1633,13 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   function deleteTag(id) {
     updateLyrics({ tags: tags.filter(t => t.id !== id) });
   }
-  // ClickLyricPanel's own tags — each click-placed word is its OWN tag (viaClick: true, fixed
-  // CLICK_LYRIC_Y_PCT row), living in the exact same item.lyrics.tags array as manually-added
-  // "+ 가사 추가" tags (so save/load and export need nothing new — they're just tags). The flag is
-  // what lets the panel tell "mine" apart from manual ones without a separate id/index to track.
+  // Click-placed words — each is its OWN tag (viaClick: true, fixed CLICK_LYRIC_Y_PCT row), living
+  // in the exact same item.lyrics.tags array as manually-added "+ 가사 추가" tags (so save/load and
+  // export need nothing new — they're just tags). The flag is what lets this panel tell "mine" apart
+  // from manual ones without a separate id/index to track. Undo is simply "remove the tag with the
+  // largest xPct" — since placement order and xPct order are the same thing (order is enforced at
+  // confirm time), this already supports any number of consecutive undos with no extra history
+  // structure needed, so a fixed-depth "20 steps" stack would just be redundant bookkeeping here.
   function addClickTag(text, xPct) {
     const id = Date.now() + '_' + Math.random().toString(36).slice(2);
     updateLyrics({ tags: [...tags, { id, text, xPct, yPct: CLICK_LYRIC_Y_PCT, viaClick: true }] });
@@ -1798,7 +1658,12 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     e.stopPropagation();
     const rect = laneRef.current.getBoundingClientRect();
     function onMove(ev) {
-      let xPct = ((ev.clientX - rect.left) / rect.width) * 100;
+      // Margin-aware so a manually-dragged tag lines up with the same coordinate space click-placed
+      // words use, whenever this block has one (marginFrac is 0 otherwise, reducing to the plain
+      // edge-to-edge mapping this always used).
+      const imageLeftPx = rect.left + rect.width * marginFrac;
+      const imageWidthPx = rect.width * (1 - 2 * marginFrac);
+      let xPct = ((ev.clientX - imageLeftPx) / Math.max(1, imageWidthPx)) * 100;
       let yPct = ((ev.clientY - rect.top) / rect.height) * 100;
       xPct = Math.min(100, Math.max(0, xPct));
       yPct = Math.min(100, Math.max(0, yPct));
@@ -1836,6 +1701,178 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     const t = text || ' ';
     const w = mctx.measureText(t).width + lyricLetterSpacing * Math.max(0, t.length - 1);
     el.style.width = Math.max(20, w + 12) + 'px';
+  }
+
+  // ---- click placement (video-extraction blocks only) ----
+  const clickTags = tags.filter(t => t.viaClick).sort((a, b) => a.xPct - b.xPct);
+  const words = tokenizeWords(lineText);
+  const placedCount = clickTags.length;
+  const lastPlacedXPct = clickTags.length > 0 ? clickTags[clickTags.length - 1].xPct : -LYRIC_MARGIN_PCT - 1;
+  const chunks = mergeOverlappingLabels(clickTags, laneWidth, lyricFontSize, lyricLetterSpacing);
+  const selectedTag = selectedTagId ? tags.find(t => t.id === selectedTagId) : null;
+
+  useEffect(() => {
+    if (selectedTag) setSelectedText(selectedTag.text);
+    // eslint-disable-next-line
+  }, [selectedTagId]);
+
+  function xPctFromClientX(clientX) {
+    const rect = laneRef.current.getBoundingClientRect();
+    const imageLeftPx = rect.left + rect.width * marginFrac;
+    const imageWidthPx = rect.width * (1 - 2 * marginFrac);
+    return ((clientX - imageLeftPx) / Math.max(1, imageWidthPx)) * 100;
+  }
+  function snapXPct(rawXPct) {
+    if (!noteColumns || noteColumns.length === 0) return { xPct: rawXPct, snapped: false };
+    let best = null, bestDist = Infinity;
+    for (const c of noteColumns) {
+      const d = Math.abs(c - rawXPct);
+      if (d < bestDist) { bestDist = d; best = c; }
+    }
+    if (best !== null && bestDist <= SNAP_TOLERANCE_PCT) return { xPct: best, snapped: true };
+    return { xPct: rawXPct, snapped: false };
+  }
+
+  // Plays a short clip around `timeSec`, restarting from scratch every time it's called — the rule
+  // requested for every placement/reselect/nudge: stop whatever was playing and replay the new
+  // position's own 0.5s-before .. 2s-after window from its start, not just resume/extend a stream.
+  // A placement immediately followed by a reselect/nudge (or several nudges in a row) calls this
+  // repeatedly in quick succession — each call's own stop-watcher must recognize it's been
+  // superseded and stop silently instead of pausing playback out from under whichever call is
+  // newest, which is what previewGenRef (bumped on every call, checked inside the watcher)
+  // prevents. The stop-watcher itself listens for the video's own 'timeupdate' rather than
+  // polling via requestAnimationFrame — rAF is throttled/paused for a backgrounded or unfocused
+  // tab, which let a preview silently run past its intended stop point and on to the end of the
+  // whole video when this used rAF; 'timeupdate' keeps firing as long as the video is actually
+  // playing, regardless of tab visibility.
+  function playSnippetAround(timeSec) {
+    const video = videoElRef.current;
+    if (!video) return;
+    const myGen = ++previewGenRef.current;
+    const t = Math.max(0, timeSec);
+    video.pause();
+    video.currentTime = Math.max(0, t - PREVIEW_LEAD_SEC);
+    const stopAt = t + PREVIEW_TAIL_SEC;
+    video.play().catch(() => {});
+    function onTimeUpdate() {
+      if (previewGenRef.current !== myGen) { video.removeEventListener('timeupdate', onTimeUpdate); return; }
+      if (video.currentTime >= stopAt) {
+        video.pause();
+        video.removeEventListener('timeupdate', onTimeUpdate);
+      }
+    }
+    video.addEventListener('timeupdate', onTimeUpdate);
+  }
+
+  function handleTrackClick(e) {
+    if (!hasClickMeta) return;
+    if (selectedTagId) { setSelectedTagId(null); return; }
+    const raw = xPctFromClientX(e.clientX);
+    const { xPct, snapped } = snapXPct(raw);
+    setPendingXPct(xPct);
+    setPendingSnapped(snapped);
+    setGuidance('');
+  }
+
+  function selectTag(id) {
+    setPendingXPct(null);
+    setSelectedTagId(id);
+    const tag = tags.find(t => t.id === id);
+    if (tag) playSnippetAround(start + (tag.xPct / 100) * (end - start));
+  }
+
+  function confirmPlacement() {
+    if (placedCount >= words.length) { setGuidance('먼저 이 줄의 가사를 입력하세요.'); return; }
+    if (pendingXPct === null) { setGuidance('먼저 트랙 위를 클릭해 위치를 지정하세요.'); return; }
+    if (pendingXPct < lastPlacedXPct) {
+      setGuidance('이미 배치한 단어보다 앞에는 놓을 수 없습니다 — 시간 순서대로만 배치할 수 있습니다.');
+      return;
+    }
+    addClickTag(words[placedCount], pendingXPct);
+    playSnippetAround(start + (pendingXPct / 100) * (end - start));
+    setPendingXPct(null);
+    setPendingSnapped(false);
+    setGuidance('');
+  }
+
+  function undoLast() {
+    if (clickTags.length === 0) return;
+    removeClickTagById(clickTags[clickTags.length - 1].id);
+    setGuidance('');
+  }
+
+  function advanceLine() {
+    if (placedCount < words.length) {
+      setGuidance('아직 배치하지 않은 가사가 있습니다 — 모두 배치한 뒤 다음 줄로 이동할 수 있습니다.');
+      return;
+    }
+    setGuidance('');
+    if (nextItemId) {
+      const el = document.getElementById('lyric-focus-' + nextItemId);
+      if (el) el.focus();
+    }
+  }
+
+  function nudgeSelected(deltaPct) {
+    if (!selectedTag) return;
+    const nextXPct = selectedTag.xPct + deltaPct;
+    updateClickTagXPct(selectedTag.id, nextXPct);
+    playSnippetAround(start + (nextXPct / 100) * (end - start));
+  }
+
+  function handleLyricFocusKeyDown(e) {
+    if (!hasClickMeta || !videoMeta) return;
+    // Fires only when this wrapper itself has focus — while the user types in the line-text
+    // textarea, a manual tag's text input, or the selected-word text input, every key (Enter/
+    // Backspace included) behaves as normal text editing instead of a placement command.
+    if (e.target !== e.currentTarget) return;
+    if (selectedTagId) {
+      if (e.key === 'ArrowLeft') { e.preventDefault(); nudgeSelected(e.shiftKey ? -NUDGE_LARGE_PCT : -NUDGE_SMALL_PCT); return; }
+      if (e.key === 'ArrowRight') { e.preventDefault(); nudgeSelected(e.shiftKey ? NUDGE_LARGE_PCT : NUDGE_SMALL_PCT); return; }
+      if (e.key === 'Escape' || e.key === 'Enter') { e.preventDefault(); setSelectedTagId(null); return; }
+      return;
+    }
+    if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); advanceLine(); return; }
+    if (e.key === 'PageDown') { e.preventDefault(); advanceLine(); return; }
+    if (e.key === 'Enter') { e.preventDefault(); confirmPlacement(); return; }
+    if (e.key === 'Backspace') { e.preventDefault(); undoLast(); return; }
+    if (e.key === 'Escape') { e.preventDefault(); setPendingXPct(null); setGuidance(''); return; }
+  }
+
+  // ---- independent play bar (bottom of block) ----
+  function handleBarClick(e) {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const pct = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    const video = videoElRef.current;
+    if (!video) return;
+    video.pause();
+    video.currentTime = start + pct * (end - start);
+  }
+  function toggleBarPlay() {
+    const video = videoElRef.current;
+    if (!video) return;
+    if (video.paused) {
+      // Shares previewGenRef with playSnippetAround so starting the bar invalidates any still-
+      // running placement-preview watcher, and vice versa — only the most recently started
+      // playback intent is ever allowed to call pause() when its own stop condition is reached.
+      // 'timeupdate' rather than requestAnimationFrame for the same reason as playSnippetAround:
+      // rAF is throttled while the tab is backgrounded/unfocused, which let this run past `end`
+      // and on to the end of the whole video instead of stopping there.
+      const myGen = ++previewGenRef.current;
+      if (video.currentTime < start || video.currentTime > end) video.currentTime = start;
+      video.play().catch(() => {});
+      function onTimeUpdate() {
+        if (previewGenRef.current !== myGen) { video.removeEventListener('timeupdate', onTimeUpdate); return; }
+        if (video.currentTime >= end) {
+          video.pause();
+          video.currentTime = end;
+          video.removeEventListener('timeupdate', onTimeUpdate);
+        }
+      }
+      video.addEventListener('timeupdate', onTimeUpdate);
+    } else {
+      video.pause();
+    }
   }
 
   return (
@@ -1976,22 +2013,47 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
       </div>
       )}
 
-      <div className="lyric-section">
-        <ClickLyricPanel item={item} tags={tags} laneWidthPx={laneWidth} noteColumns={noteColumns} processedSrc={processedSrc}
-          lyricFontSize={lyricFontSize} lyricLetterSpacing={lyricLetterSpacing}
-          addClickTag={addClickTag} updateClickTagText={updateClickTagText} updateClickTagXPct={updateClickTagXPct}
-          removeClickTagById={removeClickTagById} nextItemId={nextItemId} />
+      <div id={'lyric-focus-' + item.id} className="lyric-section" tabIndex={hasClickMeta ? 0 : undefined} onKeyDown={handleLyricFocusKeyDown}>
+        {hasClickMeta && (
+          <React.Fragment>
+            <div className="lyric-head-mini">
+              <span>이 줄 가사 — 띄어쓰기로 단어가 나뉩니다. 아래 트랙을 클릭해 배치하세요.</span>
+            </div>
+            <textarea className="onset-line-input" placeholder="이 줄의 가사를 붙여넣거나 입력하세요 (띄어쓰기 기준으로 단어가 나뉩니다)"
+              value={lineText} onChange={e => setLineText(e.target.value)} rows={2} />
+            <div className="onset-syllable-queue">
+              {words.length === 0 && <span className="hint-text">위에 가사를 입력하면 단어가 여기 표시됩니다.</span>}
+              {words.slice(placedCount).map((w, i) => (
+                <span key={placedCount + i} className={'syllable-chip' + (i === 0 ? ' active' : '')}>{w}</span>
+              ))}
+            </div>
+            {!videoMeta && <div className="hint-text">이 이미지의 원본 영상 데이터를 찾을 수 없어 클릭 배치를 사용할 수 없습니다.</div>}
+          </React.Fragment>
+        )}
+
         <div className="lyric-head-mini">
-          <span>가사 배치 — 손잡이(⠿)로 위치 이동, 하단 막대로 입력 영역 높이 조절 (이미지 하단 30%는 참고용 미리보기)</span>
+          <span>가사 배치 — 위: 참고용 TAB 이미지 (클릭 대상 아님) · 아래: {hasClickMeta ? '클릭으로 배치하는 트랙' : '손잡이(⠿)로 위치 이동'}</span>
           <button className="icon-btn" onClick={addTag}>+ 가사 추가</button>
         </div>
         <div className="lane-wrap">
           {refStripHeight > 0 && processedSrc && (
-            <div className="lane-ref-strip-standalone" style={{ height: refStripHeight + 'px', backgroundImage: 'url(' + processedSrc + ')' }} />
+            <div className="lane-ref-strip-standalone" style={{ height: refStripHeight + 'px' }}>
+              <img src={processedSrc} alt="" draggable={false}
+                style={{ position: 'absolute', top: 0, left: (marginFrac * 100) + '%', width: (100 - 2 * marginFrac * 100) + '%', height: '100%' }} />
+            </div>
           )}
-          <div className={refStripHeight > 0 ? 'lyric-lane' : 'lyric-lane no-ref'} ref={laneRef} style={{ height: laneHeight + 'px' }}>
-            {tags.filter(t => !t.viaClick).length === 0 && (
-              <div className="lane-empty">"+ 가사 추가"로 가사를 추가한 뒤 원하는 위치로 끌어서 놓으세요.</div>
+          <div className={(refStripHeight > 0 ? 'lyric-lane' : 'lyric-lane no-ref') + (hasClickMeta ? ' clickable' : '')}
+            ref={laneRef} style={{ height: laneHeight + 'px' }} onClick={handleTrackClick}>
+            {hasClickMeta && marginFrac > 0 && (
+              <React.Fragment>
+                <div className="lane-margin-zone" style={{ left: 0, width: (marginFrac * 100) + '%' }} />
+                <div className="lane-margin-zone" style={{ right: 0, width: (marginFrac * 100) + '%' }} />
+              </React.Fragment>
+            )}
+            {tags.filter(t => !t.viaClick).length === 0 && chunks.length === 0 && (
+              <div className="lane-empty">
+                {hasClickMeta ? '위에 가사를 입력하고 트랙을 클릭해 배치하거나, "+ 가사 추가"로 자유롭게 추가하세요.' : '"+ 가사 추가"로 가사를 추가한 뒤 원하는 위치로 끌어서 놓으세요.'}
+              </div>
             )}
             {tags.filter(t => !t.viaClick).map(t => (
               <div className="lyric-tag" key={t.id} style={{ left: t.xPct + '%', top: t.yPct + '%', fontSize: lyricFontSize + 'px', letterSpacing: lyricLetterSpacing + 'px' }}>
@@ -2006,9 +2068,44 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
                 </div>
               </div>
             ))}
+            {hasClickMeta && chunks.map(c => (
+              <div key={c.ids[0]}
+                className={'click-tag-chunk' + (c.ids.includes(selectedTagId) ? ' selected' : '')}
+                style={{ left: imageXPctToWrapPct(c.xPct) + '%', top: CLICK_LYRIC_Y_PCT + '%' }}
+                onClick={e => { e.stopPropagation(); if (c.ids.length === 1) selectTag(c.ids[0]); }}>
+                {c.text}
+              </div>
+            ))}
+            {hasClickMeta && pendingXPct !== null && (
+              <div className={'click-marker ' + (pendingSnapped ? 'snapped' : 'free')}
+                style={{ left: imageXPctToWrapPct(pendingXPct) + '%' }} />
+            )}
             <div className="lane-resize-handle" onPointerDown={startResize} title="드래그해서 입력 영역 높이 조절" />
           </div>
         </div>
+
+        {hasClickMeta && selectedTag && (
+          <div className="click-selected-row">
+            <span className="hint-text" style={{ margin: 0 }}>선택됨 — ←/→ 미세 이동(Shift 크게), Enter/Esc 선택 해제:</span>
+            <input type="text" value={selectedText}
+              onChange={e => { setSelectedText(e.target.value); updateClickTagText(selectedTag.id, e.target.value); }} />
+            <button className="icon-btn" onClick={() => { removeClickTagById(selectedTag.id); setSelectedTagId(null); }}>삭제</button>
+          </div>
+        )}
+        {hasClickMeta && (
+          <div className="onset-status-row">
+            <span className="save-msg">이 줄 구간 {start.toFixed(2)}s ~ {end.toFixed(2)}s (좌우 여백 포함 클릭 가능)</span>
+            {guidance && <span className="save-msg onset-guidance">{guidance}</span>}
+          </div>
+        )}
+        {hasClickMeta && (
+          <p className="hint-text onset-keys-hint">
+            트랙 클릭으로 위치 지정(자석 스냅 자동 적용, 초록 테두리=스냅됨/회색=자유 배치) · Enter 확정 후 근방 미리듣기 ·
+            Backspace 마지막 배치 취소 · Shift+Enter 또는 PageDown 다음 줄로 이동 (모두 배치해야 이동됨) ·
+            배치된 단어를 클릭하면 텍스트 수정/방향키 미세조정이 가능합니다 (조정할 때마다 미리듣기 재생).
+          </p>
+        )}
+        {hasClickMeta && videoMeta && <video ref={videoElRef} src={videoMeta.objectUrl} preload="auto" className="hidden-video" muted={false} />}
       </div>
 
       <div className="barline-section">
@@ -2035,13 +2132,30 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
           </div>
         )}
       </div>
+
+      {hasClickMeta && videoMeta && (
+        <div className="play-bar-section">
+          <div className="lyric-head-mini">
+            <span>이 줄 재생 — 막대를 클릭하면 그 지점부터 재생됩니다 (배치 미리듣기와는 별개)</span>
+          </div>
+          <div className="play-bar-row">
+            <button className="icon-btn" onClick={toggleBarPlay}>{barPlaying ? '정지' : '재생'}</button>
+            <div className="play-bar-track" onClick={handleBarClick}>
+              <div className="play-bar-fill" style={{ width: (barPos01 * 100) + '%' }} />
+            </div>
+            <span className="save-msg play-bar-time">{(barPos01 * (end - start)).toFixed(1)}s / {(end - start).toFixed(1)}s</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 });
 
 
 function GlobalSettings({ defaults, setDefaults, titleFontSize, setTitleFontSize, lyricFontSize, setLyricFontSize, lyricLetterSpacing, setLyricLetterSpacing, onApplyAll, onApplyLyricAreaHeight, hasItems }) {
-  const [open, setOpen] = useState(true);
+  // Starts collapsed, same as each image's own "이미지 고급" panel — both are binary
+  // collapse/expand with nothing visible in between, so the page opens with minimal chrome.
+  const [open, setOpen] = useState(false);
   function update(patch) { setDefaults(prev => ({ ...prev, ...patch })); }
 
   return (
