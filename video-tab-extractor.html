@@ -750,7 +750,16 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
       while (t < rangeE) {
         await seekTo(video, t);
         const sample = getRoiPixelsForDiff(video, roiRef.current);
-        if (prevSample) { diffs.push(diffScore(prevSample, sample)); times.push(t); }
+        // Every sampled timestamp (including the very first, at rangeS) goes into `times` — the
+        // first sample used to be dropped here (only used to seed `prevSample`), which silently
+        // shifted `times[0]` to rangeS+step instead of rangeS itself. Since extractSegments always
+        // starts its first segment at index 0, that made the FIRST segment's start time wrong by a
+        // full sampling step (or worse) on every extraction — the source of the reported first-image
+        // timeRange bug. diffs[i] now means "the diff between times[i] and times[i+1]" (one shorter
+        // than times, as it must be), instead of the old "diff ending at times[i]" convention that
+        // this record-the-first-sample fix would otherwise silently break extractSegments' indexing.
+        times.push(t);
+        if (prevSample) diffs.push(diffScore(prevSample, sample));
         prevSample = sample;
         idx++;
         setAnalyzeProgress(Math.min(100, Math.round((idx / totalSteps) * 100)));
