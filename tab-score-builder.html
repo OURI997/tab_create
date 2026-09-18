@@ -827,7 +827,13 @@ async function mergeImagesIntoRow(sourceItems, defaults, gapPct) {
     processed.push({ item: it, canvas, staff });
   }
 
-  const ref = processed.find(p => p.staff);
+  // Always anchor scale to the FIRST (leftmost) piece specifically — never to some LATER piece
+  // that merely happens to be the first one with a detectable staff. Anchoring to whichever piece
+  // came first with detectable ink meant merging more images onto an already-placed-lyrics image
+  // could rescale THAT image to match a later one, silently moving its lyrics even though nothing
+  // about it changed. If the first piece itself has no detectable staff, refSpacing stays null and
+  // every piece (including the first) keeps scale 1 — the existing safe fallback.
+  const ref = processed[0].staff ? processed[0] : null;
   const refSpacing = ref ? (ref.staff.staffBottom - ref.staff.staffTop) / 5 : null;
 
   const scaled = processed.map(p => {
@@ -852,12 +858,24 @@ async function mergeImagesIntoRow(sourceItems, defaults, gapPct) {
   });
 
   // Shift each image down so every (scaled) staff top lands on the same y — images with no detected
-  // staff are simply top-aligned (offsetY 0), since there's nothing to align them to.
+  // staff are simply top-aligned (offsetY 0), since there's nothing to align them to. `refTop` uses
+  // the MAXIMUM staffTopScaled across pieces so nobody ever needs a negative offset (which would
+  // push them above the canvas and clip them) — but that can leave the first piece itself needing a
+  // nonzero offsetY (whenever some OTHER piece's staff sits lower in its own frame), moving the
+  // first piece vertically for a reason that has nothing to do with it. The re-anchor pass below
+  // undoes exactly that: shift everyone uniformly so the first piece's own offsetY is 0 again (their
+  // RELATIVE spacing to each other is unaffected by a uniform shift), then only if that would newly
+  // push someone negative, shift the whole group down by that deficit instead — the first piece
+  // still never moves relative to the others, it just isn't necessarily glued to y=0 in that case.
   const knownTops = scaled.map(s => s.staffTopScaled).filter(v => v != null);
   const refTop = knownTops.length ? Math.max(...knownTops) : 0;
-  const withOffsets = scaled.map(s => ({
+  const rawOffsets = scaled.map(s => ({
     ...s, offsetY: s.staffTopScaled != null ? Math.round(refTop - s.staffTopScaled) : 0,
   }));
+  const firstOffset = rawOffsets[0].offsetY;
+  const reAnchored = rawOffsets.map(s => ({ ...s, offsetY: s.offsetY - firstOffset }));
+  const minOffset = Math.min(...reAnchored.map(s => s.offsetY));
+  const withOffsets = minOffset < 0 ? reAnchored.map(s => ({ ...s, offsetY: s.offsetY - minOffset })) : reAnchored;
 
   // Crop away every non-first piece's own blank lead-in margin (from its left edge to its detected
   // content start) BEFORE it's ever composited — this is what guarantees that margin can never be
