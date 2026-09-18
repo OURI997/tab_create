@@ -60,7 +60,6 @@
   .merge-panel{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:14px;}
   .merge-preview{border-top:1px solid var(--border);padding-top:10px;}
   .merge-preview-img{max-width:100%;display:block;background:#fff;border:1px solid var(--border);border-radius:8px;margin-top:6px;}
-  canvas.preview{width:100%;display:block;background:#fff;border:1px solid var(--border);border-radius:8px;}
   .adv-toggle-row{display:flex;justify-content:space-between;align-items:center;font-size:12.5px;color:var(--text2);gap:8px;}
   .lyric-section{margin-top:14px;border-top:1px solid var(--border);padding-top:12px;}
   .hint-text{font-size:12.5px;color:var(--text2);line-height:1.6;margin:0 0 8px;}
@@ -91,11 +90,13 @@
   .lyric-head-mini .icon-btn{font-size:11px;padding:3px 8px;}
   .lane-wrap{display:flex;flex-direction:column;}
   .lane-ref-strip-standalone{
-    position:relative;width:100%;flex-shrink:0;pointer-events:none;overflow:hidden;
+    position:relative;width:100%;flex-shrink:0;overflow:hidden;
     background:#fdfdfb;
     border:1px dashed var(--border-strong);border-bottom:none;border-radius:8px 8px 0 0;
   }
-  .lane-ref-strip-standalone img{object-fit:fill;}
+  .lane-ref-strip-standalone img{object-fit:fill;pointer-events:none;}
+  .ref-img-inner{position:absolute;}
+  .ref-img-inner.picking{cursor:crosshair;}
   .lyric-lane{
     position:relative;width:100%;min-height:20px;
     border:1px dashed var(--border-strong);border-radius:0 0 8px 8px;
@@ -201,8 +202,6 @@
   .preview-modal-body{overflow:auto;padding:12px;}
   .preview-modal-body img{width:100%;display:block;}
 
-  .canvas-overlay-wrap{position:relative;}
-  .canvas-overlay-wrap.picking canvas.preview{cursor:crosshair;}
   .playhead-overlay,.barline-overlay{position:absolute;inset:0;pointer-events:none;}
   .playhead-run-highlight{
     position:absolute;top:0;bottom:0;background:rgba(230,60,60,0.28);
@@ -1409,6 +1408,10 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   const canvasRef = useRef(null);
   const imgRef = useRef(null);
   const laneRef = useRef(null);
+  // The visible reference-image box inside the lyric section — now the block's ONLY rendered image,
+  // so this is what eyedropper clicks and bar-marker drags measure against (the actual <canvas> is
+  // hidden and only used as an off-screen render/ImageData source).
+  const refStripInnerRef = useRef(null);
   const measureCtxRef = useRef(null);
   const videoElRef = useRef(null);
   const previewGenRef = useRef(0);
@@ -1427,7 +1430,9 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   const [barLayoutBusy, setBarLayoutBusy] = useState(false);
   const [processedSrc, setProcessedSrc] = useState(null);
   const [noteColumns, setNoteColumns] = useState([]);
-  // Click-placement state (video-extraction blocks only — see hasClickMeta below).
+  // Click-placement state — the placement UI itself (word queue, click/snap/confirm/undo/nudge) is
+  // now identical for every block regardless of whether it has linked audio; only playback-dependent
+  // bits (auto-preview, the independent play bar, time-range text) key off hasAudio below.
   const [videoMeta, setVideoMeta] = useState(null);
   const [lineText, setLineText] = useState('');
   const [pendingXPct, setPendingXPct] = useState(null);
@@ -1442,7 +1447,11 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
 
   const eff = effectiveImageSettings(item, defaults);
   const resolvedItemSrc = resolvedSrc(item);
-  const hasClickMeta = !!(item.timeRange && item.videoSourceId);
+  // hasVideoSource: this item points at video-extraction audio data. hasAudio: that data has actually
+  // finished loading into the <video> element, so playback (auto-preview, the play bar, time text) is
+  // usable. The click-placement UI itself no longer checks either — it always works, image-only.
+  const hasVideoSource = !!(item.timeRange && item.videoSourceId);
+  const hasAudio = hasVideoSource && !!videoMeta;
   const start = item.timeRange ? item.timeRange.start : 0;
   const end = item.timeRange ? item.timeRange.end : 0;
 
@@ -1464,20 +1473,20 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   }, []);
 
   useEffect(() => {
-    if (!hasClickMeta) return;
+    if (!hasVideoSource) return;
     let cancelled = false;
     loadVideoSourceMeta(item.videoSourceId).then(m => { if (!cancelled) setVideoMeta(m); });
     return () => { cancelled = true; };
-  }, [item.videoSourceId, hasClickMeta]);
+  }, [item.videoSourceId, hasVideoSource]);
 
   // Drives the independent play bar's fill/play-state — reads the shared video element directly,
   // so it stays in sync whether currentTime moved from the bar itself or from a placement preview.
-  // Depends on videoMeta (not just hasClickMeta) because the <video> itself only mounts once that
+  // Depends on videoMeta (not just hasVideoSource) because the <video> itself only mounts once that
   // finishes loading — without it here, this effect's first run finds videoElRef.current still
   // null (ref attaches after this render) and never re-attaches once the element actually appears.
   useEffect(() => {
     const video = videoElRef.current;
-    if (!video || !hasClickMeta) return;
+    if (!video || !hasAudio) return;
     function onTimeUpdate() {
       const dur = Math.max(0.001, end - start);
       setBarPos01(Math.min(1, Math.max(0, (video.currentTime - start) / dur)));
@@ -1492,24 +1501,21 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
       video.removeEventListener('play', onPlay);
       video.removeEventListener('pause', onPause);
     };
-  }, [hasClickMeta, videoMeta, start, end]);
+  }, [hasAudio, videoMeta, start, end]);
 
   function redraw() {
     if (!imgRef.current || !canvasRef.current) return;
     const result = drawProcessed(canvasRef.current, imgRef.current, effectiveImageSettings(item, defaults));
     setPlayheadRuns((result && result.playheadRuns) || []);
-    // The lyric-placement reference image below should show the same PROCESSED (background-removed/
-    // cropped/despeckled) image the TAB preview above shows — not the raw upload — so lyric positions
-    // are set against what will actually be exported, not an image whose cropped/removed regions won't
-    // even be there in the final result.
+    // The lyric-placement image (now the block's ONLY rendered image — see the removed standalone
+    // top preview) shows this same PROCESSED (background-removed/cropped/despeckled) canvas, not the
+    // raw upload, so lyric positions are set against what will actually be exported.
     setProcessedSrc(canvasRef.current.toDataURL('image/png'));
-    // Magnet-snap candidates for click placement — computed here (once per redraw) since this is
-    // already where the processed canvas's ImageData is at hand (same pass playhead detection uses).
-    if (item.timeRange && item.videoSourceId) {
-      const canvas = canvasRef.current;
-      const imageData = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height);
-      setNoteColumns(detectNoteColumns(imageData, canvas.width, canvas.height));
-    }
+    // Magnet-snap candidates for click placement — purely image-based (note/fret-number columns), so
+    // computed unconditionally regardless of whether this item has any linked audio.
+    const canvas = canvasRef.current;
+    const imageData = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height);
+    setNoteColumns(detectNoteColumns(imageData, canvas.width, canvas.height));
   }
 
   function updateOverride(patch) {
@@ -1535,10 +1541,10 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     setPickingColor(true);
   }
 
-  function handleCanvasClick(e) {
-    if (!pickingColor || !canvasRef.current || !imgRef.current) return;
+  function handleRefStripClick(e) {
+    if (!pickingColor || !canvasRef.current || !imgRef.current || !refStripInnerRef.current) return;
     const canvas = canvasRef.current;
-    const rect = canvas.getBoundingClientRect();
+    const rect = refStripInnerRef.current.getBoundingClientRect();
     const xPx = ((e.clientX - rect.left) / rect.width) * canvas.width;
     const yPx = ((e.clientY - rect.top) / rect.height) * canvas.height;
     // sample from a crop-only render of the ORIGINAL image (no bg-removal/threshold applied yet),
@@ -1606,7 +1612,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   function startMarkerDrag(e, markerId) {
     e.preventDefault();
     e.stopPropagation();
-    const rect = canvasRef.current.getBoundingClientRect();
+    const rect = refStripInnerRef.current.getBoundingClientRect();
     let moved = false;
     const startX = e.clientX;
     function onMove(ev) {
@@ -1628,10 +1634,9 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   const laneHeightRatio = lyricsObj.areaHeightRatio != null ? lyricsObj.areaHeightRatio : (defaultLyricAreaHeight / (laneWidth || 700));
   const laneHeight = Math.round(laneHeightRatio * (laneWidth || 700));
   // Left/right margin reserved on the click-placement track (and, so the reference image above it
-  // stays x-aligned with it, on that image's own row too) — video-extraction blocks only. A plain
-  // manually-uploaded block keeps marginFrac at 0, i.e. the image/lane span edge-to-edge exactly
-  // like before this feature existed.
-  const marginFrac = hasClickMeta ? LYRIC_MARGIN_PCT / (100 + 2 * LYRIC_MARGIN_PCT) : 0;
+  // stays x-aligned with it, on that image's own row too) — applied uniformly for every block now,
+  // since the image+click-track structure itself no longer depends on whether audio is linked.
+  const marginFrac = LYRIC_MARGIN_PCT / (100 + 2 * LYRIC_MARGIN_PCT);
   const contentWidthPx = (laneWidth || 700) * (1 - 2 * marginFrac);
   // Full reference image (no more 30%-height/translucent peek) — purely visual, not a click target;
   // its own height is derived from the CONTENT width (excluding the margin columns) so its aspect
@@ -1783,7 +1788,6 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   }
 
   function handleTrackClick(e) {
-    if (!hasClickMeta) return;
     if (selectedTagId) { setSelectedTagId(null); return; }
     const raw = xPctFromClientX(e.clientX);
     const { xPct, snapped } = snapXPct(raw);
@@ -1839,7 +1843,6 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   }
 
   function handleLyricFocusKeyDown(e) {
-    if (!hasClickMeta || !videoMeta) return;
     // Fires only when this wrapper itself has focus — while the user types in the line-text
     // textarea, a manual tag's text input, or the selected-word text input, every key (Enter/
     // Backspace included) behaves as normal text editing instead of a placement command.
@@ -1909,32 +1912,11 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
         </div>
       </div>
 
-      <div className={pickingColor ? 'canvas-overlay-wrap picking' : 'canvas-overlay-wrap'}>
-        <canvas ref={canvasRef} className="preview" onClick={handleCanvasClick} />
-        {eff.playheadRemove && playheadRuns.length > 0 && (
-          <div className="playhead-overlay">
-            {playheadRuns.map(run => {
-              const excluded = (item.playheadExcluded || []).includes(run.key);
-              return (
-                <div key={run.key}
-                  className={excluded ? 'playhead-run-highlight excluded' : 'playhead-run-highlight'}
-                  style={{ left: run.centerXPct + '%', width: '10px', marginLeft: '-5px' }}
-                  title={excluded ? '클릭하면 다시 제거 대상에 포함' : '클릭하면 제거 대상에서 제외'}
-                  onClick={() => togglePlayheadExcluded(run.key)} />
-              );
-            })}
-          </div>
-        )}
-        {barEditOpen && (
-          <div className="barline-overlay">
-            {barMarkers.map(m => (
-              <div key={m.id} className="bar-marker" style={{ left: m.xPct + '%' }} onPointerDown={e => startMarkerDrag(e, m.id)}>
-                <button className="bar-marker-del" onPointerDown={e => e.stopPropagation()} onClick={() => deleteMarker(m.id)}>×</button>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
+      {/* Off-screen render target only — drawProcessed paints into this and it's read back via
+          toDataURL/getImageData for processedSrc, playhead/note-column detection, and the eyedropper.
+          Nothing draws it visibly; the "가사 배치" section below is now the block's only visible
+          image, so there's no more duplicate rendering of the same TAB image. */}
+      <canvas ref={canvasRef} style={{ display: 'none' }} />
 
       {settingsOpen && (
       <div className="controls">
@@ -1954,33 +1936,34 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
               배경 제거 (사진 배경 → 흰색)
             </label>
             {eff.removeBg && (
-              <React.Fragment>
-                <label>
-                  <input type="checkbox" checked={eff.invert} onChange={e => updateOverride({ invert: e.target.checked })} />
-                  어두운 사진 배경 (밝은 글씨/선을 검정으로 변환)
-                </label>
-                <div>
-                  <div className="slider-label">배경 제거 강도 ({eff.threshold})</div>
-                  <input type="range" min="0" max="255" step="1" value={eff.threshold}
-                    onChange={e => updateOverride({ threshold: Number(e.target.value) })} />
-                </div>
-                <div>
-                  <div className="slider-label">부드러운 경계 — 안티앨리어싱 유지 ({eff.softness})</div>
-                  <input type="range" min="0" max="60" step="1" value={eff.softness}
-                    onChange={e => updateOverride({ softness: Number(e.target.value) })} />
-                </div>
-                <label>
-                  <input type="checkbox" checked={eff.despeckle} onChange={e => updateOverride({ despeckle: e.target.checked })} />
-                  잡티(고립 노이즈) 제거
-                </label>
-                {eff.despeckle && (
-                  <div>
-                    <div className="slider-label">제거할 잡티 크기 ({eff.despeckleSize}px 이하)</div>
-                    <input type="range" min="1" max="12" step="1" value={eff.despeckleSize}
-                      onChange={e => updateOverride({ despeckleSize: Number(e.target.value) })} />
-                  </div>
-                )}
-              </React.Fragment>
+              <label>
+                <input type="checkbox" checked={eff.invert} onChange={e => updateOverride({ invert: e.target.checked })} />
+                어두운 사진 배경 (밝은 글씨/선을 검정으로 변환)
+              </label>
+            )}
+            {/* Same full item set as the global "기본 설정" panel (threshold/softness/despeckle were
+                previously hidden here whenever removeBg was off, unlike the global panel where they're
+                always visible) — kept unconditional now so this panel always has parity with global. */}
+            <div>
+              <div className="slider-label">배경 제거 강도 ({eff.threshold})</div>
+              <input type="range" min="0" max="255" step="1" value={eff.threshold}
+                onChange={e => updateOverride({ threshold: Number(e.target.value) })} />
+            </div>
+            <div>
+              <div className="slider-label">부드러운 경계 — 안티앨리어싱 유지 ({eff.softness})</div>
+              <input type="range" min="0" max="60" step="1" value={eff.softness}
+                onChange={e => updateOverride({ softness: Number(e.target.value) })} />
+            </div>
+            <label>
+              <input type="checkbox" checked={eff.despeckle} onChange={e => updateOverride({ despeckle: e.target.checked })} />
+              잡티(고립 노이즈) 제거
+            </label>
+            {eff.despeckle && (
+              <div>
+                <div className="slider-label">제거할 잡티 크기 ({eff.despeckleSize}px 이하)</div>
+                <input type="range" min="1" max="12" step="1" value={eff.despeckleSize}
+                  onChange={e => updateOverride({ despeckleSize: Number(e.target.value) })} />
+              </div>
             )}
             <label>
               <input type="checkbox" checked={!!eff.playheadRemove} onChange={e => updateOverride({ playheadRemove: e.target.checked })} />
@@ -2031,38 +2014,60 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
       </div>
       )}
 
-      <div id={'lyric-focus-' + item.id} className="lyric-section" tabIndex={hasClickMeta ? 0 : undefined} onKeyDown={handleLyricFocusKeyDown}>
-        {hasClickMeta && (
-          <React.Fragment>
-            <div className="lyric-head-mini">
-              <span>이 줄 가사 — 띄어쓰기로 단어가 나뉩니다. 아래 트랙을 클릭해 배치하세요.</span>
-            </div>
-            <textarea className="onset-line-input" placeholder="이 줄의 가사를 붙여넣거나 입력하세요 (띄어쓰기 기준으로 단어가 나뉩니다)"
-              value={lineText} onChange={e => setLineText(e.target.value)} rows={2} />
-            <div className="onset-syllable-queue">
-              {words.length === 0 && <span className="hint-text">위에 가사를 입력하면 단어가 여기 표시됩니다.</span>}
-              {words.slice(placedCount).map((w, i) => (
-                <span key={placedCount + i} className={'syllable-chip' + (i === 0 ? ' active' : '')}>{w}</span>
-              ))}
-            </div>
-            {!videoMeta && <div className="hint-text">이 이미지의 원본 영상 데이터를 찾을 수 없어 클릭 배치를 사용할 수 없습니다.</div>}
-          </React.Fragment>
-        )}
+      <div id={'lyric-focus-' + item.id} className="lyric-section" tabIndex={0} onKeyDown={handleLyricFocusKeyDown}>
+        <div className="lyric-head-mini">
+          <span>이 줄 가사 — 띄어쓰기로 단어가 나뉩니다. 아래 트랙을 클릭해 배치하세요.</span>
+        </div>
+        <textarea className="onset-line-input" placeholder="이 줄의 가사를 붙여넣거나 입력하세요 (띄어쓰기 기준으로 단어가 나뉩니다)"
+          value={lineText} onChange={e => setLineText(e.target.value)} rows={2} />
+        <div className="onset-syllable-queue">
+          {words.length === 0 && <span className="hint-text">위에 가사를 입력하면 단어가 여기 표시됩니다.</span>}
+          {words.slice(placedCount).map((w, i) => (
+            <span key={placedCount + i} className={'syllable-chip' + (i === 0 ? ' active' : '')}>{w}</span>
+          ))}
+        </div>
 
         <div className="lyric-head-mini">
-          <span>가사 배치 — 위: 참고용 TAB 이미지 (클릭 대상 아님) · 아래: {hasClickMeta ? '클릭으로 배치하는 트랙' : '손잡이(⠿)로 위치 이동'}</span>
+          <span>가사 배치 — 이미지를 보고 그 아래 트랙에서 같은 x 위치를 클릭해 가사를 배치하세요 (수동으로 추가한 가사는 ⠿ 손잡이로 끌어서 이동)</span>
           <button className="icon-btn" onClick={addTag}>+ 가사 추가</button>
         </div>
         <div className="lane-wrap">
           {refStripHeight > 0 && processedSrc && (
             <div className="lane-ref-strip-standalone" style={{ height: refStripHeight + 'px' }}>
-              <img src={processedSrc} alt="" draggable={false}
-                style={{ position: 'absolute', top: 0, left: (marginFrac * 100) + '%', width: (100 - 2 * marginFrac * 100) + '%', height: '100%' }} />
+              <div ref={refStripInnerRef} className={pickingColor ? 'ref-img-inner picking' : 'ref-img-inner'}
+                style={{ position: 'absolute', top: 0, left: (marginFrac * 100) + '%', width: (100 - 2 * marginFrac * 100) + '%', height: '100%' }}
+                onClick={handleRefStripClick}>
+                <img src={processedSrc} alt="" draggable={false}
+                  style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%' }} />
+                {eff.playheadRemove && playheadRuns.length > 0 && (
+                  <div className="playhead-overlay">
+                    {playheadRuns.map(run => {
+                      const excluded = (item.playheadExcluded || []).includes(run.key);
+                      return (
+                        <div key={run.key}
+                          className={excluded ? 'playhead-run-highlight excluded' : 'playhead-run-highlight'}
+                          style={{ left: run.centerXPct + '%', width: '10px', marginLeft: '-5px' }}
+                          title={excluded ? '클릭하면 다시 제거 대상에 포함' : '클릭하면 제거 대상에서 제외'}
+                          onClick={e => { e.stopPropagation(); togglePlayheadExcluded(run.key); }} />
+                      );
+                    })}
+                  </div>
+                )}
+                {barEditOpen && (
+                  <div className="barline-overlay">
+                    {barMarkers.map(m => (
+                      <div key={m.id} className="bar-marker" style={{ left: m.xPct + '%' }} onPointerDown={e => startMarkerDrag(e, m.id)}>
+                        <button className="bar-marker-del" onPointerDown={e => e.stopPropagation()} onClick={() => deleteMarker(m.id)}>×</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
           )}
-          <div className={(refStripHeight > 0 ? 'lyric-lane' : 'lyric-lane no-ref') + (hasClickMeta ? ' clickable' : '')}
+          <div className={(refStripHeight > 0 ? 'lyric-lane clickable' : 'lyric-lane no-ref clickable')}
             ref={laneRef} style={{ height: laneHeight + 'px' }} onClick={handleTrackClick}>
-            {hasClickMeta && marginFrac > 0 && (
+            {marginFrac > 0 && (
               <React.Fragment>
                 <div className="lane-margin-zone" style={{ left: 0, width: (marginFrac * 100) + '%' }} />
                 <div className="lane-margin-zone" style={{ right: 0, width: (marginFrac * 100) + '%' }} />
@@ -2070,7 +2075,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
             )}
             {tags.filter(t => !t.viaClick).length === 0 && chunks.length === 0 && (
               <div className="lane-empty">
-                {hasClickMeta ? '위에 가사를 입력하고 트랙을 클릭해 배치하거나, "+ 가사 추가"로 자유롭게 추가하세요.' : '"+ 가사 추가"로 가사를 추가한 뒤 원하는 위치로 끌어서 놓으세요.'}
+                위에 가사를 입력하고 트랙을 클릭해 배치하거나, "+ 가사 추가"로 자유롭게 추가하세요.
               </div>
             )}
             {tags.filter(t => !t.viaClick).map(t => (
@@ -2086,7 +2091,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
                 </div>
               </div>
             ))}
-            {hasClickMeta && chunks.map(c => (
+            {chunks.map(c => (
               <div key={c.ids[0]}
                 className={'click-tag-chunk' + (c.ids.includes(selectedTagId) ? ' selected' : '')}
                 style={{ left: imageXPctToWrapPct(c.xPct) + '%', top: CLICK_LYRIC_Y_PCT + '%' }}
@@ -2094,7 +2099,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
                 {c.text}
               </div>
             ))}
-            {hasClickMeta && pendingXPct !== null && (
+            {pendingXPct !== null && (
               <div className={'click-marker ' + (pendingSnapped ? 'snapped' : 'free')}
                 style={{ left: imageXPctToWrapPct(pendingXPct) + '%' }} />
             )}
@@ -2102,7 +2107,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
           </div>
         </div>
 
-        {hasClickMeta && selectedTag && (
+        {selectedTag && (
           <div className="click-selected-row">
             <span className="hint-text" style={{ margin: 0 }}>선택됨 — ←/→ 미세 이동(Shift 크게), Enter/Esc 선택 해제:</span>
             <input type="text" value={selectedText}
@@ -2110,20 +2115,18 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
             <button className="icon-btn" onClick={() => { removeClickTagById(selectedTag.id); setSelectedTagId(null); }}>삭제</button>
           </div>
         )}
-        {hasClickMeta && (
-          <div className="onset-status-row">
-            <span className="save-msg">이 줄 구간 {start.toFixed(2)}s ~ {end.toFixed(2)}s (좌우 여백 포함 클릭 가능)</span>
-            {guidance && <span className="save-msg onset-guidance">{guidance}</span>}
-          </div>
-        )}
-        {hasClickMeta && (
-          <p className="hint-text onset-keys-hint">
-            트랙 클릭으로 위치 지정(자석 스냅 자동 적용, 초록 테두리=스냅됨/회색=자유 배치) · Enter 확정 후 근방 미리듣기 ·
-            Backspace 마지막 배치 취소 · Shift+Enter 또는 PageDown 다음 줄로 이동 (모두 배치해야 이동됨) ·
-            배치된 단어를 클릭하면 텍스트 수정/방향키 미세조정이 가능합니다 (조정할 때마다 미리듣기 재생).
-          </p>
-        )}
-        {hasClickMeta && videoMeta && <video ref={videoElRef} src={videoMeta.objectUrl} preload="auto" className="hidden-video" muted={false} />}
+        <div className="onset-status-row">
+          {hasAudio && <span className="save-msg">이 줄 구간 {start.toFixed(2)}s ~ {end.toFixed(2)}s (좌우 여백 포함 클릭 가능)</span>}
+          {!hasAudio && hasVideoSource && <span className="save-msg">영상 음원 불러오는 중...</span>}
+          {!hasVideoSource && <span className="save-msg">음원이 연결되지 않아 미리듣기 없이 이미지 기준으로만 배치합니다.</span>}
+          {guidance && <span className="save-msg onset-guidance">{guidance}</span>}
+        </div>
+        <p className="hint-text onset-keys-hint">
+          트랙 클릭으로 위치 지정(자석 스냅 자동 적용, 초록 테두리=스냅됨/회색=자유 배치) · Enter 확정{hasAudio ? ' 후 근방 미리듣기' : ''} ·
+          Backspace 마지막 배치 취소 · Shift+Enter 또는 PageDown 다음 줄로 이동 (모두 배치해야 이동됨) ·
+          배치된 단어를 클릭하면 텍스트 수정/방향키 미세조정이 가능합니다{hasAudio ? ' (조정할 때마다 미리듣기 재생)' : ''}.
+        </p>
+        {hasAudio && <video ref={videoElRef} src={videoMeta.objectUrl} preload="auto" className="hidden-video" muted={false} />}
       </div>
 
       <div className="barline-section">
@@ -2151,7 +2154,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
         )}
       </div>
 
-      {hasClickMeta && videoMeta && (
+      {hasAudio && (
         <div className="play-bar-section">
           <div className="lyric-head-mini">
             <span>이 줄 재생 — 막대를 클릭하면 그 지점부터 재생됩니다 (배치 미리듣기와는 별개)</span>
