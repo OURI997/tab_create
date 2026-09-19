@@ -73,11 +73,15 @@
   .click-marker.snapped{background:#2ecc71;box-shadow:0 0 0 1px #fff;}
   .click-marker.free{background:#888;}
   .click-tag-chunk{
-    position:absolute;transform:translate(-50%,-50%);background:#fff;border:1.5px solid var(--border-strong);
-    border-radius:6px;padding:2px 7px;font-size:12.5px;white-space:pre;cursor:pointer;box-shadow:0 1px 2px rgba(0,0,0,.1);
+    /* Horizontally left-aligned on its anchor (xPct) — the anchor is always the leftmost/
+       earliest-placed word's own click position, which must never visually shift as later
+       words merge into the same box (only vertical centering is kept from the old transform). */
+    position:absolute;transform:translateY(-50%);background:#fff;border:1.5px solid var(--border-strong);
+    border-radius:6px;padding:2px 7px;font-size:12.5px;white-space:pre;cursor:default;box-shadow:0 1px 2px rgba(0,0,0,.1);
     max-width:220px;overflow:hidden;text-overflow:ellipsis;z-index:1;
   }
-  .click-tag-chunk.selected{border-color:var(--accent);box-shadow:0 0 0 2px rgba(0,0,0,.08);}
+  .click-tag-word{cursor:pointer;}
+  .click-tag-word.selected{color:var(--accent);font-weight:600;text-decoration:underline;text-underline-offset:2px;}
   .click-selected-row{display:flex;align-items:center;gap:8px;margin-bottom:8px;}
   .click-selected-row input{flex:1;box-sizing:border-box;font-size:13px;padding:5px 8px;border:1px solid var(--border-strong);border-radius:8px;}
   .onset-status-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;}
@@ -1391,10 +1395,11 @@ function mergeOverlappingLabels(orderedTags, laneWidthPx, fontSize, letterSpacin
     const last = chunks[chunks.length - 1];
     if (last && xPx < last.rightPx) {
       last.ids.push(t.id);
+      last.words.push({ id: t.id, text: t.text });
       last.text += ' ' + t.text;
       last.rightPx += measureLyricText(' ' + t.text, fontSize, letterSpacing);
     } else {
-      chunks.push({ ids: [t.id], text: t.text, xPct: t.xPct, rightPx: xPx + textWidth });
+      chunks.push({ ids: [t.id], words: [{ id: t.id, text: t.text }], text: t.text, xPct: t.xPct, rightPx: xPx + textWidth });
     }
   }
   return chunks;
@@ -1877,6 +1882,11 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     // textarea, a manual tag's text input, or the selected-word text input, every key (Enter/
     // Backspace included) behaves as normal text editing instead of a placement command.
     if (e.target !== e.currentTarget) return;
+    // Play/pause toggle — always available regardless of selection/merge state, and independent
+    // of the "재생" button. The e.target !== e.currentTarget guard above already keeps this out of
+    // the way of the lyric textarea, a manual tag's text input, and the selected-word text input
+    // (Space there still just types a space, as normal).
+    if (e.key === ' ' || e.code === 'Space') { e.preventDefault(); toggleBarPlay(); return; }
     if (selectedTagId) {
       if (e.key === 'ArrowLeft') { e.preventDefault(); nudgeSelected(e.shiftKey ? -NUDGE_LARGE_PCT : -NUDGE_SMALL_PCT); return; }
       if (e.key === 'ArrowRight') { e.preventDefault(); nudgeSelected(e.shiftKey ? NUDGE_LARGE_PCT : NUDGE_SMALL_PCT); return; }
@@ -2152,11 +2162,15 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
               </div>
             ))}
             {chunks.map(c => (
-              <div key={c.ids[0]}
-                className={'click-tag-chunk' + (c.ids.includes(selectedTagId) ? ' selected' : '')}
-                style={{ left: imageXPctToWrapPct(c.xPct) + '%', top: CLICK_LYRIC_Y_PCT + '%' }}
-                onClick={e => { e.stopPropagation(); if (c.ids.length === 1) selectTag(c.ids[0]); }}>
-                {c.text}
+              <div key={c.ids[0]} className="click-tag-chunk"
+                style={{ left: imageXPctToWrapPct(c.xPct) + '%', top: CLICK_LYRIC_Y_PCT + '%' }}>
+                {c.words.map((w, i) => (
+                  <span key={w.id}
+                    className={'click-tag-word' + (w.id === selectedTagId ? ' selected' : '')}
+                    onClick={e => { e.stopPropagation(); selectTag(w.id); }}>
+                    {(i > 0 ? ' ' : '') + w.text}
+                  </span>
+                ))}
               </div>
             ))}
             {pendingXPct !== null && (
