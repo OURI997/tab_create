@@ -1777,18 +1777,44 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     if (!video) return;
     const myGen = ++previewGenRef.current;
     const t = Math.max(0, timeSec);
-    video.pause();
-    video.currentTime = Math.max(0, t - PREVIEW_LEAD_SEC);
+    const seekTo = Math.max(0, t - PREVIEW_LEAD_SEC);
     const stopAt = t + PREVIEW_TAIL_SEC;
-    video.play().catch(() => {});
-    function onTimeUpdate() {
-      if (previewGenRef.current !== myGen) { video.removeEventListener('timeupdate', onTimeUpdate); return; }
-      if (video.currentTime >= stopAt) {
-        video.pause();
-        video.removeEventListener('timeupdate', onTimeUpdate);
+    video.pause();
+    // Wait for the seek to actually land before calling play() — starting playback immediately
+    // after setting currentTime races the browser's own seek algorithm: reading currentTime right
+    // back after the assignment already reports the NEW value even though the real seek is still
+    // pending, so that readback can't be used to detect "did it actually land" — only the 'seeked'
+    // event (or an unchanged position, checked BEFORE assigning) can. Without this wait, play() can
+    // start from wherever the video already was and only jump to the real position later, which is
+    // exactly the "audio starts a few seconds late" symptom this fixes.
+    const wasAlready = Math.abs(video.currentTime - seekTo) < 0.001;
+    function startPlayback() {
+      if (previewGenRef.current !== myGen) return;
+      video.play().catch(() => {});
+      function onTimeUpdate() {
+        if (previewGenRef.current !== myGen) { video.removeEventListener('timeupdate', onTimeUpdate); return; }
+        if (video.currentTime >= stopAt) {
+          video.pause();
+          video.removeEventListener('timeupdate', onTimeUpdate);
+        }
       }
+      video.addEventListener('timeupdate', onTimeUpdate);
     }
-    video.addEventListener('timeupdate', onTimeUpdate);
+    if (wasAlready) {
+      startPlayback();
+    } else {
+      // A 'seeked' event can also arrive here from an UNRELATED, still-pending seek — e.g. the
+      // previous playback's own stop handler snapping currentTime back to its stop position, which
+      // schedules its own async 'seeked' that can land after this new seek has already started. That
+      // stale event must not be mistaken for confirmation that THIS seek landed, so re-check the
+      // actual position on every 'seeked' and keep waiting if it doesn't match yet.
+      video.addEventListener('seeked', function onSeeked() {
+        if (Math.abs(video.currentTime - seekTo) > 0.05) return;
+        video.removeEventListener('seeked', onSeeked);
+        startPlayback();
+      });
+      video.currentTime = seekTo;
+    }
   }
 
   function handleTrackClick(e) {
@@ -1884,17 +1910,39 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
       // rAF is throttled while the tab is backgrounded/unfocused, which let this run past `end`
       // and on to the end of the whole video instead of stopping there.
       const myGen = ++previewGenRef.current;
-      if (video.currentTime < start || video.currentTime > end) video.currentTime = start;
-      video.play().catch(() => {});
-      function onTimeUpdate() {
-        if (previewGenRef.current !== myGen) { video.removeEventListener('timeupdate', onTimeUpdate); return; }
-        if (video.currentTime >= end) {
-          video.pause();
-          video.currentTime = end;
-          video.removeEventListener('timeupdate', onTimeUpdate);
+      const needsSeek = video.currentTime < start || video.currentTime >= end;
+      const seekTo = needsSeek ? start : null;
+      function startPlayback() {
+        if (previewGenRef.current !== myGen) return;
+        video.play().catch(() => {});
+        function onTimeUpdate() {
+          if (previewGenRef.current !== myGen) { video.removeEventListener('timeupdate', onTimeUpdate); return; }
+          if (video.currentTime >= end) {
+            video.pause();
+            video.currentTime = end;
+            video.removeEventListener('timeupdate', onTimeUpdate);
+          }
         }
+        video.addEventListener('timeupdate', onTimeUpdate);
       }
-      video.addEventListener('timeupdate', onTimeUpdate);
+      if (seekTo === null) {
+        startPlayback();
+      } else {
+        // Same reasoning as playSnippetAround: wait for the seek to actually land before playing,
+        // instead of racing play() against the async seek (currentTime reads back as the new value
+        // immediately even before the seek really lands, so it can't be used to detect completion —
+        // only 'seeked', or an unchanged position checked before assigning, as done above via
+        // needsSeek). Also re-check the landed position on every 'seeked', not just the first one to
+        // arrive — a still-pending 'seeked' from the PREVIOUS playback's own stop handler (which snaps
+        // currentTime back to `end`) can otherwise be mistaken for confirmation that this new seek
+        // (to `start`) has landed.
+        video.addEventListener('seeked', function onSeeked() {
+          if (Math.abs(video.currentTime - seekTo) > 0.05) return;
+          video.removeEventListener('seeked', onSeeked);
+          startPlayback();
+        });
+        video.currentTime = seekTo;
+      }
     } else {
       video.pause();
     }
