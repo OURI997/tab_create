@@ -203,6 +203,10 @@
   .preview-modal-body img{width:100%;display:block;}
 
   .playhead-overlay,.barline-overlay{position:absolute;inset:0;pointer-events:none;}
+  .playback-cursor{
+    position:absolute;top:0;bottom:0;width:2px;margin-left:-1px;pointer-events:none;z-index:4;
+    background:#e0342f;box-shadow:0 0 0 1px rgba(255,255,255,0.7),0 0 4px rgba(224,52,47,0.6);
+  }
   .playhead-run-highlight{
     position:absolute;top:0;bottom:0;background:rgba(230,60,60,0.28);
     cursor:pointer;pointer-events:auto;border-left:1px dashed rgba(230,60,60,0.7);border-right:1px dashed rgba(230,60,60,0.7);
@@ -2061,6 +2065,14 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
                       </div>
                     ))}
                   </div>
+                )}
+                {/* Playback position cursor — barPos01/barPlaying already track the ONE shared
+                    <video> element via native play/pause/timeupdate listeners regardless of whether
+                    playback was started from the play bar below or from a placement/nudge auto-preview
+                    (playSnippetAround calls play()/pause() on that same element), so no separate state
+                    is needed to cover both sources. */}
+                {hasAudio && barPlaying && (
+                  <div className="playback-cursor" style={{ left: (barPos01 * 100) + '%' }} />
                 )}
               </div>
             </div>
