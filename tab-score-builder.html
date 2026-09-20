@@ -320,12 +320,23 @@ function isScoreKey(k) {
 // One-time sweep (run at load) that deletes __video_source__ entries no item in the draft or any
 // saved score still references by videoSourceId — cleans up whatever accumulated while this key
 // space was (bug) showing up in the saved-score list instead of being treated as internal cache.
-async function cleanupOrphanVideoSources(allKeys) {
+//
+// `currentDraftItems` must be the actual in-memory item list the page is about to use for the
+// draft (after merging any just-consumed __video_import__ batch), NOT re-read from DRAFT_KEY on
+// disk — right after a video import, the merged items exist only in React state for up to 800ms
+// (the debounced autosave hasn't flushed yet) while this sweep runs in that same load. Re-reading
+// DRAFT_KEY here used to see the OLD (pre-import) draft, so a freshly-imported item's videoSourceId
+// never made it into `referenced`, and its just-written video blob got deleted as "orphaned" within
+// the very same load that imported it — before the user ever touched refresh.
+async function cleanupOrphanVideoSources(allKeys, currentDraftItems) {
   const sourceKeys = allKeys.filter(k => k.startsWith(VIDEO_SOURCE_KEY_PREFIX));
   if (sourceKeys.length === 0) return;
   const referenced = new Set();
-  const dataKeys = allKeys.filter(k => k === DRAFT_KEY || isScoreKey(k));
-  for (const k of dataKeys) {
+  for (const it of currentDraftItems || []) {
+    if (it && it.videoSourceId) referenced.add(VIDEO_SOURCE_KEY_PREFIX + it.videoSourceId);
+  }
+  const otherScoreKeys = allKeys.filter(isScoreKey);
+  for (const k of otherScoreKeys) {
     try {
       const data = await dbGet(k);
       for (const it of (data && data.items) || []) {
@@ -2495,9 +2506,11 @@ function TabScoreBuilder() {
     (async () => {
       try {
         const draft = await dbGet(DRAFT_KEY);
+        let draftItems = [];
         if (draft) {
+          draftItems = draft.items || [];
           setTitle(draft.title || '');
-          setItems(draft.items || []);
+          setItems(draftItems);
           if (draft.defaults) setDefaults({ ...DEFAULTS_INIT, ...draft.defaults });
           if (draft.titleFontSize) setTitleFontSize(draft.titleFontSize);
           if (draft.lyricFontSize) setLyricFontSize(draft.lyricFontSize);
@@ -2506,14 +2519,19 @@ function TabScoreBuilder() {
         // Consumed once, right after the draft above (so it appends on top rather than racing it) —
         // deleted immediately after reading so a page refresh never re-imports the same batch.
         const imported = await dbGet(VIDEO_IMPORT_KEY);
+        let mergedItems = draftItems;
         if (imported && Array.isArray(imported.items) && imported.items.length > 0) {
+          mergedItems = [...draftItems, ...imported.items];
           setItems(prev => [...prev, ...imported.items]);
           await dbDelete(VIDEO_IMPORT_KEY);
           setSaveMsg('영상에서 추출한 이미지 ' + imported.items.length + '장을 불러왔습니다.');
           setTimeout(() => setSaveMsg(''), 3000);
         }
         const keys = await dbAllKeys();
-        await cleanupOrphanVideoSources(keys);
+        // Pass the actual merged item list in memory, not a re-read of DRAFT_KEY — see
+        // cleanupOrphanVideoSources' own comment for why that used to delete a freshly-imported
+        // video's blob before the debounced autosave had a chance to persist it.
+        await cleanupOrphanVideoSources(keys, mergedItems);
         setSavedList(keys.filter(isScoreKey));
       } catch (e) {
         console.warn('IndexedDB 사용 불가:', e);
