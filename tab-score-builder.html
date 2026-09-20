@@ -1035,9 +1035,17 @@ async function buildScoreLayout(items, title, targetW, opts) {
   // marginPx on each side, so the export never fills edge-to-edge.
   const marginPx = Math.round(W * EXPORT_MARGIN_RATIO);
   const contentW = Math.max(1, W - marginPx * 2);
+  // Same left/right CLICK-TRACK margin the editing UI reserves around every image (LYRIC_MARGIN_PCT,
+  // via imageXPctToWrapPct) — a tag's xPct is relative to the image's own width and can fall outside
+  // [0,100] for lyrics placed in that margin. The image itself must be drawn narrower than `contentW`
+  // (not full width) so that reserved space actually exists here too, or an out-of-range tag has
+  // nowhere to go but squeezed flush against the image edge, overlapping whatever content is there.
+  const lyricMarginFrac = LYRIC_MARGIN_PCT / (100 + 2 * LYRIC_MARGIN_PCT);
+  const imageWidthFrac = 1 - 2 * lyricMarginFrac;
 
   const processed = rawProcessed.map(({ item: it, canvas: off }) => {
-    const scaledH = Math.round(off.height * contentW / off.width);
+    const imageW = Math.round(contentW * imageWidthFrac);
+    const scaledH = Math.round(off.height * imageW / off.width);
     const tags = ((it.lyrics && it.lyrics.tags) || []).filter(t => (t.text || '').trim() !== '');
     const ratio = (it.lyrics && it.lyrics.areaHeightRatio != null) ? it.lyrics.areaHeightRatio : defaultLyricRatio;
     const laneH = tags.length > 0 ? Math.max(lyricLineH, Math.round(ratio * contentW)) : 0;
@@ -1049,7 +1057,7 @@ async function buildScoreLayout(items, title, targetW, opts) {
   totalH += PAD;
 
   return {
-    W, marginPx, contentW, PAD, titleH, gapAfterImage, titleFont, titleFontPx, lyricFont, lyricFontPx, lyricLineH,
+    W, marginPx, contentW, lyricMarginFrac, PAD, titleH, gapAfterImage, titleFont, titleFontPx, lyricFont, lyricFontPx, lyricLineH,
     lyricLetterSpacingPx, processed, totalH: Math.max(Math.round(totalH), titleH + PAD * 2),
   };
 }
@@ -1088,9 +1096,15 @@ function drawScoreTitle(ctx, W, title, layout, y) {
 // canvas width, so they line up with the image's own (now-inset) edges.
 function drawScoreItem(ctx, p, y, layout, scale) {
   scale = scale || 1;
-  const contentW = layout.contentW;
-  const dw = Math.round(contentW * scale);
-  const dx = layout.marginPx + Math.round((contentW - dw) / 2);
+  const contentW = layout.contentW; // full row width, including the L/R lyric-margin columns
+  const rowW = Math.round(contentW * scale);
+  const rowX = layout.marginPx + Math.round((contentW - rowW) / 2);
+  // The image itself only fills the MIDDLE (1 - 2*lyricMarginFrac) of the row — the same fraction
+  // the editing UI's reference strip uses — leaving the two margin columns free on either side for
+  // tags placed there (see imageXPctToWrapPct below) instead of drawing edge-to-edge across the
+  // full row, which left no room for them and squeezed them flush against the image edge.
+  const dw = Math.round(rowW * (1 - 2 * layout.lyricMarginFrac));
+  const dx = rowX + Math.round(rowW * layout.lyricMarginFrac);
   const dh = Math.round(p.scaledH * scale);
   ctx.textAlign = 'left';
   ctx.drawImage(p.canvas, dx, y, dw, dh);
@@ -1105,7 +1119,11 @@ function drawScoreItem(ctx, p, y, layout, scale) {
     ctx.fillStyle = '#1a1a1a';
     ctx.textBaseline = 'middle';
     for (const t of p.tags) {
-      const tx = layout.marginPx + Math.min(contentW - 4, Math.max(4, (t.xPct / 100) * contentW));
+      // t.xPct is relative to the IMAGE's own width (0-100, can fall outside for margin-placed
+      // lyrics) — imageXPctToWrapPct maps that onto the FULL row (image + both margins), exactly
+      // matching how the editing UI positions the same tag over its own reference image.
+      const wrapPct = imageXPctToWrapPct(t.xPct);
+      const tx = rowX + Math.min(rowW - 4, Math.max(4, (wrapPct / 100) * rowW));
       const half = lyricLineH / 2;
       const cy = y + Math.min(laneH - half, Math.max(half, (t.yPct / 100) * laneH));
       fillTextWithSpacing(ctx, t.text, tx, cy, lyricLetterSpacingPx);
