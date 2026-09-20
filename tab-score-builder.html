@@ -1906,6 +1906,25 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     playSnippetAround(start + (nextXPct / 100) * (end - start));
   }
 
+  // Before Enter confirms a placement — move the pending (unconfirmed) marker between detected
+  // note/fret-number candidates one at a time, the same candidate list the click-to-place magnet
+  // snap already uses, instead of only being reachable by clicking each one directly.
+  function movePendingToAdjacentNote(direction) {
+    if (pendingXPct === null || !noteColumns || noteColumns.length === 0) return;
+    const sorted = [...noteColumns].sort((a, b) => a - b);
+    let next;
+    if (direction > 0) {
+      next = sorted.find(c => c > pendingXPct + 1e-6);
+      if (next === undefined) next = sorted[sorted.length - 1];
+    } else {
+      const before = sorted.filter(c => c < pendingXPct - 1e-6);
+      next = before.length ? before[before.length - 1] : sorted[0];
+    }
+    setPendingXPct(next);
+    setPendingSnapped(true);
+    playSnippetAround(start + (next / 100) * (end - start));
+  }
+
   function handleLyricFocusKeyDown(e) {
     // Fires only when this wrapper itself has focus — while the user types in the line-text
     // textarea, a manual tag's text input, or the selected-word text input, every key (Enter/
@@ -1932,6 +1951,8 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     // textarea, a manual tag's text input, and the selected-word text input (Space there still
     // just types a space, as normal).
     if (isSpace) { e.preventDefault(); toggleBarPlay(); return; }
+    if (pendingXPct !== null && e.key === 'ArrowLeft') { e.preventDefault(); movePendingToAdjacentNote(-1); return; }
+    if (pendingXPct !== null && e.key === 'ArrowRight') { e.preventDefault(); movePendingToAdjacentNote(1); return; }
     if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); advanceLine(); return; }
     if (e.key === 'PageDown') { e.preventDefault(); advanceLine(); return; }
     if (e.key === 'Enter') { e.preventDefault(); confirmPlacement(); return; }
