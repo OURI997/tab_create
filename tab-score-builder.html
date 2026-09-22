@@ -1118,16 +1118,29 @@ function drawScoreItem(ctx, p, y, layout, scale) {
     ctx.font = lyricFont;
     ctx.fillStyle = '#1a1a1a';
     ctx.textBaseline = 'middle';
-    for (const t of p.tags) {
-      // t.xPct is relative to the IMAGE's own width (0-100, can fall outside for margin-placed
+    const half = lyricLineH / 2;
+    function drawAt(text, xPct, yPct) {
+      // xPct is relative to the IMAGE's own width (0-100, can fall outside for margin-placed
       // lyrics) — imageXPctToWrapPct maps that onto the FULL row (image + both margins), exactly
       // matching how the editing UI positions the same tag over its own reference image.
-      const wrapPct = imageXPctToWrapPct(t.xPct);
+      const wrapPct = imageXPctToWrapPct(xPct);
       const tx = rowX + Math.min(rowW - 4, Math.max(4, (wrapPct / 100) * rowW));
-      const half = lyricLineH / 2;
-      const cy = y + Math.min(laneH - half, Math.max(half, (t.yPct / 100) * laneH));
-      fillTextWithSpacing(ctx, t.text, tx, cy, lyricLetterSpacingPx);
+      const cy = y + Math.min(laneH - half, Math.max(half, (yPct / 100) * laneH));
+      fillTextWithSpacing(ctx, text, tx, cy, lyricLetterSpacingPx);
     }
+    // Manually placed tags (free-dragged, "+ 가사 추가") never overlap-merge in the editing UI
+    // either — each keeps its own xPct/yPct and draws independently, same as before.
+    for (const t of p.tags) {
+      if (!t.viaClick) drawAt(t.text, t.xPct, t.yPct);
+    }
+    // Click-placed words DO overlap-merge in the editing UI (mergeOverlappingLabels) whenever two
+    // consecutive words' rendered text would collide — reusing that exact same function here (same
+    // row width, same font/letter-spacing at this export's scale) so a merged "word1 word2" label
+    // renders identically in the export instead of the two words drawing independently and
+    // overlapping into unreadable mashed text.
+    const clickTags = p.tags.filter(t => t.viaClick).sort((a, b) => a.xPct - b.xPct);
+    const chunks = mergeOverlappingLabels(clickTags, rowW, lyricFontPx, lyricLetterSpacingPx);
+    for (const c of chunks) drawAt(c.text, c.xPct, CLICK_LYRIC_Y_PCT);
     ctx.textBaseline = 'alphabetic';
     y += laneH;
   }
