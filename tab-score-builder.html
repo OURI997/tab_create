@@ -1995,7 +1995,11 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); advanceLine(); return; }
     if (e.key === 'PageDown') { e.preventDefault(); advanceLine(); return; }
     if (e.key === 'Enter') { e.preventDefault(); confirmPlacement(); return; }
-    if (e.key === 'Backspace') { e.preventDefault(); undoLast(); return; }
+    // Ctrl+Z / Cmd+Z alongside Backspace — same undoLast(), same placement in this branch (so it's
+    // a no-op while a word is selected, exactly like Backspace already is above).
+    if (e.key === 'Backspace' || ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === 'z' || e.key === 'Z'))) {
+      e.preventDefault(); undoLast(); return;
+    }
     if (e.key === 'Escape') { e.preventDefault(); setPendingXPct(null); setGuidance(''); return; }
   }
 
