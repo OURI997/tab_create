@@ -1780,7 +1780,17 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   // ---- click placement (video-extraction blocks only) ----
   const clickTags = tags.filter(t => t.viaClick).sort((a, b) => a.xPct - b.xPct);
   const words = tokenizeWords(lineText);
-  const placedCount = clickTags.length;
+  // How many of the FRONT of `words` already have a matching placed tag, in the same order —
+  // deliberately NOT just clickTags.length, which silently diverges from the actual current line
+  // text whenever the two fall out of sync: deleting some already-placed tags and then typing
+  // different/shorter text, or simply reopening the page (tags persist in item.lyrics; lineText is
+  // per-session React state that resets to '' on reload). When that happens, slicing `words` by a
+  // stale clickTags.length can run past the end of `words` — an empty slice, i.e. the reported "no
+  // word chips at all" bug — instead of showing whatever of the current text is actually unplaced.
+  let placedCount = 0;
+  while (placedCount < clickTags.length && placedCount < words.length && clickTags[placedCount].text === words[placedCount]) {
+    placedCount++;
+  }
   const lastPlacedXPct = clickTags.length > 0 ? clickTags[clickTags.length - 1].xPct : -LYRIC_MARGIN_PCT - 1;
   const chunks = mergeOverlappingLabels(clickTags, laneWidth, lyricFontSize, lyricLetterSpacing);
   const selectedTag = selectedTagId ? tags.find(t => t.id === selectedTagId) : null;
