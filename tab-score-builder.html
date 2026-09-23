@@ -78,7 +78,7 @@
        words merge into the same box (only vertical centering is kept from the old transform). */
     position:absolute;transform:translateY(-50%);background:#fff;border:1.5px solid var(--border-strong);
     border-radius:6px;padding:2px 7px;font-size:12.5px;white-space:pre;cursor:default;box-shadow:0 1px 2px rgba(0,0,0,.1);
-    max-width:220px;overflow:hidden;text-overflow:ellipsis;z-index:1;
+    z-index:1;
   }
   .click-tag-word{cursor:pointer;}
   .click-tag-word.selected{color:var(--accent);font-weight:600;text-decoration:underline;text-underline-offset:2px;}
@@ -1912,10 +1912,26 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     }
   }
 
+  // Nudging a word that's part of a merged chunk needs to know whether it's the chunk's ANCHOR
+  // (its first/leftmost word — the one the chunk's whole on-screen position is pinned to) or a
+  // later word merged in after it. Moving the anchor moves the whole chunk together (so it stays
+  // one merged label at its new position); moving any other word splits it — and everything after
+  // it in the same chunk — off to move independently, leaving the earlier word(s) exactly where
+  // they were. No explicit "split" bookkeeping is needed: chunks are recomputed from xPct on every
+  // render, so this natural regroups/ungroups itself the next time mergeOverlappingLabels runs.
   function nudgeSelected(deltaPct) {
     if (!selectedTag) return;
+    const chunk = chunks.find(c => c.ids.includes(selectedTagId));
+    let idsToMove;
+    if (!chunk || chunk.words[0].id === selectedTagId) {
+      idsToMove = chunk ? chunk.ids : [selectedTagId];
+    } else {
+      const idx = chunk.words.findIndex(w => w.id === selectedTagId);
+      idsToMove = chunk.words.slice(idx).map(w => w.id);
+    }
+    const idSet = new Set(idsToMove);
+    updateLyrics({ tags: tags.map(t => idSet.has(t.id) ? { ...t, xPct: t.xPct + deltaPct } : t) });
     const nextXPct = selectedTag.xPct + deltaPct;
-    updateClickTagXPct(selectedTag.id, nextXPct);
     playSnippetAround(start + (nextXPct / 100) * (end - start));
   }
 
