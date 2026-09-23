@@ -1492,8 +1492,11 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   const [selectedText, setSelectedText] = useState('');
   const [guidance, setGuidance] = useState('');
   // Independent play bar state — this line's own scrub bar, separate from the auto-preview clip
-  // that plays after every placement/nudge.
+  // that plays after every placement/nudge. barPos01 is a POSITION (xPct/100, piecewise-calibrated
+  // — see below), not a plain time fraction, so it can no longer be multiplied back out by
+  // (end-start) to recover elapsed seconds for display; barElapsedSec tracks that directly instead.
   const [barPos01, setBarPos01] = useState(0);
+  const [barElapsedSec, setBarElapsedSec] = useState(0);
   const [barPlaying, setBarPlaying] = useState(false);
 
   const eff = effectiveImageSettings(item, defaults);
@@ -1538,9 +1541,31 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   useEffect(() => {
     const video = videoElRef.current;
     if (!video || !hasAudio) return;
+    // Same piecewise xPct<->time calibration as xPctToTime/timeToXPct below (duplicated here, not
+    // called directly, because those are declared later in this component and this effect's own
+    // deps must be evaluable at the top — see the calibration comment further down for the
+    // reasoning). item.lyrics is used directly rather than the derived `tags`/`clickTags` consts
+    // for the same reason, and is also why item.lyrics is a dependency: this must re-subscribe
+    // whenever a placement's calibration point set changes, not just when hasAudio/start/end do.
     function onTimeUpdate() {
+      const pts = ((item.lyrics && item.lyrics.tags) || [])
+        .filter(t => t.viaClick)
+        .map(t => ({ xPct: t.xPct, time: t.time != null ? t.time : start + (t.xPct / 100) * (end - start) }))
+        .sort((a, b) => a.xPct - b.xPct);
       const dur = Math.max(0.001, end - start);
-      setBarPos01(Math.min(1, Math.max(0, (video.currentTime - start) / dur)));
+      let xPct = ((video.currentTime - start) / dur) * 100;
+      if (pts.length >= 2 && video.currentTime >= pts[0].time && video.currentTime <= pts[pts.length - 1].time) {
+        for (let i = 0; i < pts.length - 1; i++) {
+          const a = pts[i], b = pts[i + 1];
+          if (video.currentTime >= a.time && video.currentTime <= b.time) {
+            const frac = (video.currentTime - a.time) / ((b.time - a.time) || 1);
+            xPct = a.xPct + frac * (b.xPct - a.xPct);
+            break;
+          }
+        }
+      }
+      setBarPos01(Math.min(1, Math.max(0, xPct / 100)));
+      setBarElapsedSec(Math.min(dur, Math.max(0, video.currentTime - start)));
     }
     function onPlay() { setBarPlaying(true); }
     function onPause() { setBarPlaying(false); }
@@ -1552,7 +1577,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
       video.removeEventListener('play', onPlay);
       video.removeEventListener('pause', onPause);
     };
-  }, [hasAudio, videoMeta, start, end]);
+  }, [hasAudio, videoMeta, start, end, item.lyrics]);
 
   function redraw() {
     if (!imgRef.current || !canvasRef.current) return;
@@ -1714,15 +1739,18 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   // largest xPct" — since placement order and xPct order are the same thing (order is enforced at
   // confirm time), this already supports any number of consecutive undos with no extra history
   // structure needed, so a fixed-depth "20 steps" stack would just be redundant bookkeeping here.
-  function addClickTag(text, xPct) {
+  // `time` is stored alongside xPct (not just recomputed on the fly from the global [start,end]
+  // line) so calibration points can actually diverge from that line — capturing whatever
+  // xPctToTime/the calibration already in effect from OTHER confirmed points says AT THE MOMENT of
+  // confirm/nudge, not a value that's always trivially back on the flat line. See the calibPoints
+  // comment below for why recomputing every point from the flat formula on every render would make
+  // "piecewise" a no-op (every point would always land exactly back on that same line).
+  function addClickTag(text, xPct, time) {
     const id = Date.now() + '_' + Math.random().toString(36).slice(2);
-    updateLyrics({ tags: [...tags, { id, text, xPct, yPct: CLICK_LYRIC_Y_PCT, viaClick: true }] });
+    updateLyrics({ tags: [...tags, { id, text, xPct, time, yPct: CLICK_LYRIC_Y_PCT, viaClick: true }] });
   }
   function updateClickTagText(id, text) {
     updateLyrics({ tags: tags.map(t => t.id === id ? { ...t, text } : t) });
-  }
-  function updateClickTagXPct(id, xPct) {
-    updateLyrics({ tags: tags.map(t => t.id === id ? { ...t, xPct } : t) });
   }
   function removeClickTagById(id) {
     updateLyrics({ tags: tags.filter(t => t.id !== id) });
@@ -1794,6 +1822,52 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   const lastPlacedXPct = clickTags.length > 0 ? clickTags[clickTags.length - 1].xPct : -LYRIC_MARGIN_PCT - 1;
   const chunks = mergeOverlappingLabels(clickTags, laneWidth, lyricFontSize, lyricLetterSpacing);
   const selectedTag = selectedTagId ? tags.find(t => t.id === selectedTagId) : null;
+
+  // Calibration points for xPct<->time conversion — each already-confirmed click-placed word is a
+  // real, ear-verified anchor ("this x position sounds right at this time"; the user nudged it by
+  // ear until the preview matched), not just a guess. A real song rarely moves through a line at one
+  // constant rate (tempo changes, rests), so interpolating PIECEWISE between consecutive confirmed
+  // points — instead of one straight line across the whole [start,end] range — tracks that
+  // unevenness instead of forcing everything back onto a single line.
+  //
+  // Uses each tag's STORED `time` (set by addClickTag/nudgeSelected at the moment it was
+  // confirmed/nudged, using whatever calibration was already in effect from the OTHER points at
+  // that moment), not a value recomputed here from the flat global formula — recomputing every
+  // point that way would make every single point land exactly back on the [start,end] line by
+  // construction (new points are only ever confirmed at or past the previous rightmost xPct, which
+  // is precisely the range where xPctToTime falls back to that same flat line), making "piecewise"
+  // a no-op. Falls back to the flat-line formula only for legacy tags saved before this field
+  // existed. clickTags is sorted by xPct ascending; time is expected to follow the same order.
+  const calibPoints = clickTags.map(t => ({
+    xPct: t.xPct,
+    time: t.time != null ? t.time : start + (t.xPct / 100) * (end - start),
+  }));
+  function xPctToTime(xPct) {
+    if (calibPoints.length < 2 || xPct < calibPoints[0].xPct || xPct > calibPoints[calibPoints.length - 1].xPct) {
+      return start + (xPct / 100) * (end - start);
+    }
+    for (let i = 0; i < calibPoints.length - 1; i++) {
+      const a = calibPoints[i], b = calibPoints[i + 1];
+      if (xPct >= a.xPct && xPct <= b.xPct) {
+        const frac = (xPct - a.xPct) / ((b.xPct - a.xPct) || 1);
+        return a.time + frac * (b.time - a.time);
+      }
+    }
+    return start + (xPct / 100) * (end - start);
+  }
+  function timeToXPct(time) {
+    if (calibPoints.length < 2 || time < calibPoints[0].time || time > calibPoints[calibPoints.length - 1].time) {
+      return ((time - start) / ((end - start) || 1)) * 100;
+    }
+    for (let i = 0; i < calibPoints.length - 1; i++) {
+      const a = calibPoints[i], b = calibPoints[i + 1];
+      if (time >= a.time && time <= b.time) {
+        const frac = (time - a.time) / ((b.time - a.time) || 1);
+        return a.xPct + frac * (b.xPct - a.xPct);
+      }
+    }
+    return ((time - start) / ((end - start) || 1)) * 100;
+  }
 
   useEffect(() => {
     if (selectedTag) setSelectedText(selectedTag.text);
@@ -1887,7 +1961,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     setPendingXPct(null);
     setSelectedTagId(id);
     const tag = tags.find(t => t.id === id);
-    if (tag) playSnippetAround(start + (tag.xPct / 100) * (end - start));
+    if (tag) playSnippetAround(xPctToTime(tag.xPct));
   }
 
   function confirmPlacement() {
@@ -1897,8 +1971,9 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
       setGuidance('이미 배치한 단어보다 앞에는 놓을 수 없습니다 — 시간 순서대로만 배치할 수 있습니다.');
       return;
     }
-    addClickTag(words[placedCount], pendingXPct);
-    playSnippetAround(start + (pendingXPct / 100) * (end - start));
+    const confirmedTime = xPctToTime(pendingXPct);
+    addClickTag(words[placedCount], pendingXPct, confirmedTime);
+    playSnippetAround(confirmedTime);
     setPendingXPct(null);
     setPendingSnapped(false);
     setGuidance('');
@@ -1940,9 +2015,15 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
       idsToMove = chunk.words.slice(idx).map(w => w.id);
     }
     const idSet = new Set(idsToMove);
-    updateLyrics({ tags: tags.map(t => idSet.has(t.id) ? { ...t, xPct: t.xPct + deltaPct } : t) });
+    // Each moved tag's `time` is recalibrated too (not just xPct) — using the calibration already
+    // in effect from the OTHER (unmoved) points, same as a fresh confirm would — so a corrective
+    // nudge actually updates what this point contributes as a calibration anchor for its neighbors,
+    // instead of leaving it pinned to whatever the flat line said when it was first confirmed.
+    updateLyrics({
+      tags: tags.map(t => idSet.has(t.id) ? { ...t, xPct: t.xPct + deltaPct, time: xPctToTime(t.xPct + deltaPct) } : t),
+    });
     const nextXPct = selectedTag.xPct + deltaPct;
-    playSnippetAround(start + (nextXPct / 100) * (end - start));
+    playSnippetAround(xPctToTime(nextXPct));
   }
 
   // Before Enter confirms a placement — move the pending (unconfirmed) marker between detected
@@ -1961,7 +2042,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     }
     setPendingXPct(next);
     setPendingSnapped(true);
-    playSnippetAround(start + (next / 100) * (end - start));
+    playSnippetAround(xPctToTime(next));
   }
 
   function handleLyricFocusKeyDown(e) {
@@ -1977,7 +2058,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
       // same spot rather than toggling continuous play/pause of the whole line.
       if (isSpace) {
         e.preventDefault();
-        if (selectedTag) playSnippetAround(start + (selectedTag.xPct / 100) * (end - start));
+        if (selectedTag) playSnippetAround(xPctToTime(selectedTag.xPct));
         return;
       }
       if (e.key === 'ArrowLeft') { e.preventDefault(); nudgeSelected(e.shiftKey ? -NUDGE_LARGE_PCT : -NUDGE_SMALL_PCT); return; }
@@ -2010,7 +2091,9 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     const video = videoElRef.current;
     if (!video) return;
     video.pause();
-    video.currentTime = start + pct * (end - start);
+    // pct is the same 0-1 position space barPos01/the bar fill use, so route it through the same
+    // piecewise calibration (pct*100 == xPct) instead of assuming a constant rate across the bar.
+    video.currentTime = xPctToTime(pct * 100);
   }
   function toggleBarPlay() {
     const video = videoElRef.current;
@@ -2343,7 +2426,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
             <div className="play-bar-track" onClick={handleBarClick}>
               <div className="play-bar-fill" style={{ width: (barPos01 * 100) + '%' }} />
             </div>
-            <span className="save-msg play-bar-time">{(barPos01 * (end - start)).toFixed(1)}s / {(end - start).toFixed(1)}s</span>
+            <span className="save-msg play-bar-time">{barElapsedSec.toFixed(1)}s / {(end - start).toFixed(1)}s</span>
           </div>
         </div>
       )}
