@@ -1510,6 +1510,12 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   // silently drops joins that no longer describe the same two words instead of mis-gluing others.
   const [chipJoins, setChipJoins] = useState({});
   const [dragChipIdx, setDragChipIdx] = useState(null);
+  // Mirrors {tags, pendingXPct, chainActive} and is written through SYNCHRONOUSLY (not just via
+  // setState) at the moment each Enter-placement decision is made — see the comment further down
+  // by computePlacementState() for why this exists (a second Enter fired before React re-renders
+  // from the first would otherwise see a stale, pre-placement snapshot and duplicate/misplace a
+  // word).
+  const placementRef = useRef(null);
   // Independent play bar state — this line's own scrub bar, separate from the auto-preview clip
   // that plays after every placement/nudge. barPos01 is a POSITION (xPct/100, piecewise-calibrated
   // — see below), not a plain time fraction, so it can no longer be multiplied back out by
@@ -1726,6 +1732,10 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
 
   const lyricsObj = item.lyrics || { tags: [], areaHeightRatio: null };
   const tags = lyricsObj.tags || [];
+  if (!placementRef.current) placementRef.current = { tags, pendingXPct, chainActive };
+  placementRef.current.tags = tags;
+  placementRef.current.pendingXPct = pendingXPct;
+  placementRef.current.chainActive = chainActive;
   const laneHeightRatio = lyricsObj.areaHeightRatio != null ? lyricsObj.areaHeightRatio : (defaultLyricAreaHeight / (laneWidth || 700));
   const laneHeight = Math.round(laneHeightRatio * (laneWidth || 700));
   // Left/right margin reserved on the click-placement track (and, so the reference image above it
@@ -1977,15 +1987,19 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
 
   function handleTrackClick(e) {
     if (selectedTagId) { setSelectedTagId(null); return; }
+    placementRef.current.chainActive = false;
     setChainActive(false);
     const raw = xPctFromClientX(e.clientX);
     const { xPct, snapped } = snapXPct(raw);
+    placementRef.current.pendingXPct = xPct;
     setPendingXPct(xPct);
     setPendingSnapped(snapped);
     setGuidance('');
   }
 
   function selectTag(id) {
+    placementRef.current.chainActive = false;
+    placementRef.current.pendingXPct = null;
     setChainActive(false);
     setPendingXPct(null);
     setSelectedTagId(id);
@@ -1998,6 +2012,30 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   // merged chunk in `baseTags` (one space between words). The result is the same data every merged
   // chunk already is — an anchor tag plus following tags that mergeOverlappingLabels folds into one
   // label — so anchor-nudge / split-on-middle-nudge / export need no special casing.
+  // Recomputes clickTags/placedCount/chipUnits/lastPlacedXPct from placementRef.current.tags (the
+  // synchronously-fresh mirror, not the outer `tags`/`placedCount`/`chipUnits`/`lastPlacedXPct`
+  // consts closed over at the last render) — confirmPlacement/appendNextToChain/undoLast call this
+  // FRESH each time instead of reading those outer consts, so a second Enter dispatched before
+  // React re-renders from the first still sees the real just-placed word instead of replaying the
+  // same stale decision (which is what produced the "같은 같은" duplicate-word bug: two Enters,
+  // no render in between, both closures read the pre-placement tags array).
+  function computePlacementState() {
+    const curTags = placementRef.current.tags;
+    const curClickTags = curTags.filter(t => t.viaClick).sort((a, b) => a.xPct - b.xPct);
+    let curPlacedCount = 0;
+    while (curPlacedCount < curClickTags.length && curPlacedCount < words.length && curClickTags[curPlacedCount].text === words[curPlacedCount]) {
+      curPlacedCount++;
+    }
+    const curIsJoinedIdx = i => i > curPlacedCount && i < words.length && chipJoins[i] === words[i - 1] + '\u0000' + words[i];
+    const curChipUnits = [];
+    for (let i = curPlacedCount; i < words.length; i++) {
+      if (curIsJoinedIdx(i) && curChipUnits.length) curChipUnits[curChipUnits.length - 1].push(i);
+      else curChipUnits.push([i]);
+    }
+    const curLastPlacedXPct = curClickTags.length > 0 ? curClickTags[curClickTags.length - 1].xPct : -LYRIC_MARGIN_PCT - 1;
+    return { curTags, curClickTags, curPlacedCount, curChipUnits, curLastPlacedXPct };
+  }
+
   function appendJoinedTags(baseTags, texts) {
     let cur = baseTags;
     const times = [];
@@ -2017,22 +2055,27 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   }
 
   function confirmPlacement() {
-    if (placedCount >= words.length) { setGuidance('먼저 이 줄의 가사를 입력하세요.'); return; }
-    if (pendingXPct === null) { setGuidance('먼저 트랙 위를 클릭해 위치를 지정하세요.'); return; }
-    if (pendingXPct < lastPlacedXPct) {
+    const { curTags, curPlacedCount, curChipUnits, curLastPlacedXPct } = computePlacementState();
+    const curPendingXPct = placementRef.current.pendingXPct;
+    if (curPlacedCount >= words.length) { setGuidance('먼저 이 줄의 가사를 입력하세요.'); return; }
+    if (curPendingXPct === null) { setGuidance('먼저 트랙 위를 클릭해 위치를 지정하세요.'); return; }
+    if (curPendingXPct < curLastPlacedXPct) {
       setGuidance('이미 배치한 단어보다 앞에는 놓을 수 없습니다 — 시간 순서대로만 배치할 수 있습니다.');
       return;
     }
-    const confirmedTime = xPctToTime(pendingXPct);
-    const unit = chipUnits[0];
+    const confirmedTime = xPctToTime(curPendingXPct);
+    const unit = curChipUnits[0];
     const anchorId = Date.now() + '_' + Math.random().toString(36).slice(2);
-    let nextTags = [...tags, { id: anchorId, text: words[unit[0]], xPct: pendingXPct, time: confirmedTime, yPct: CLICK_LYRIC_Y_PCT, viaClick: true }];
+    let nextTags = [...curTags, { id: anchorId, text: words[unit[0]], xPct: curPendingXPct, time: confirmedTime, yPct: CLICK_LYRIC_Y_PCT, viaClick: true }];
     if (unit.length > 1) nextTags = appendJoinedTags(nextTags, unit.slice(1).map(i => words[i])).tags;
+    placementRef.current.tags = nextTags;
     updateLyrics({ tags: nextTags });
     playSnippetAround(confirmedTime);
+    placementRef.current.pendingXPct = null;
     setPendingXPct(null);
     setPendingSnapped(false);
     setGuidance('');
+    placementRef.current.chainActive = true;
     setChainActive(true);
   }
 
@@ -2040,9 +2083,11 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   // (the anchor stays fixed; only text grows to the right). Falls back to the normal "click first"
   // guidance when nothing is chained or the line is used up.
   function appendNextToChain() {
-    if (placedCount >= words.length) { setGuidance('이 줄의 가사를 모두 배치했습니다.'); return; }
-    const unit = chipUnits[0];
-    const { tags: nextTags, times } = appendJoinedTags(tags, unit.map(i => words[i]));
+    const { curTags, curPlacedCount, curChipUnits } = computePlacementState();
+    if (curPlacedCount >= words.length) { setGuidance('이 줄의 가사를 모두 배치했습니다.'); return; }
+    const unit = curChipUnits[0];
+    const { tags: nextTags, times } = appendJoinedTags(curTags, unit.map(i => words[i]));
+    placementRef.current.tags = nextTags;
     updateLyrics({ tags: nextTags });
     playSnippetAround(times[0]);
     setGuidance('');
@@ -2073,15 +2118,19 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   }
 
   function undoLast() {
-    if (clickTags.length === 0) return;
-    const last = clickTags[clickTags.length - 1];
-    removeClickTagById(last.id);
+    const { curClickTags } = computePlacementState();
+    if (curClickTags.length === 0) return;
+    const last = curClickTags[curClickTags.length - 1];
+    const nextTags = placementRef.current.tags.filter(t => t.id !== last.id);
+    placementRef.current.tags = nextTags;
+    updateLyrics({ tags: nextTags });
     // Undoing an appended word keeps the chain going; undoing an anchor ends it.
-    if (!last.joined) setChainActive(false);
+    if (!last.joined) { placementRef.current.chainActive = false; setChainActive(false); }
     setGuidance('');
   }
 
   function advanceLine() {
+    placementRef.current.chainActive = false;
     setChainActive(false);
     if (placedCount < words.length) {
       setGuidance('아직 배치하지 않은 가사가 있습니다 — 모두 배치한 뒤 다음 줄로 이동할 수 있습니다.');
@@ -2119,11 +2168,12 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     // A split-off word (first moved word that wasn't the anchor) stops being glued to the word
     // before it — it becomes the anchor of its own chunk; the words after it stay joined to it.
     const splitId = chunk && chunk.words[0].id !== selectedTagId ? selectedTagId : null;
-    updateLyrics({
-      tags: tags.map(t => idSet.has(t.id)
-        ? { ...t, xPct: t.xPct + deltaPct, time: xPctToTime(t.xPct + deltaPct), ...(t.id === splitId ? { joined: false } : {}) }
-        : t),
-    });
+    const nudgedTags = tags.map(t => idSet.has(t.id)
+      ? { ...t, xPct: t.xPct + deltaPct, time: xPctToTime(t.xPct + deltaPct), ...(t.id === splitId ? { joined: false } : {}) }
+      : t);
+    placementRef.current.tags = nudgedTags;
+    updateLyrics({ tags: nudgedTags });
+    placementRef.current.chainActive = false;
     setChainActive(false);
     const nextXPct = selectedTag.xPct + deltaPct;
     playSnippetAround(xPctToTime(nextXPct));
@@ -2143,6 +2193,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
       const before = sorted.filter(c => c < pendingXPct - 1e-6);
       next = before.length ? before[before.length - 1] : sorted[0];
     }
+    placementRef.current.pendingXPct = next;
     setPendingXPct(next);
     setPendingSnapped(true);
     playSnippetAround(xPctToTime(next));
@@ -2180,7 +2231,12 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     if (e.key === 'PageDown') { e.preventDefault(); advanceLine(); return; }
     if (e.key === 'Enter') {
       e.preventDefault();
-      if (pendingXPct === null && chainActive && clickTags.length > 0) appendNextToChain();
+      // Read the synchronously-fresh mirror, not the pendingXPct/chainActive/clickTags closed over
+      // at the last render — see computePlacementState()'s comment.
+      const curPendingXPct = placementRef.current.pendingXPct;
+      const curChainActive = placementRef.current.chainActive;
+      const curClickTagsLen = placementRef.current.tags.filter(t => t.viaClick).length;
+      if (curPendingXPct === null && curChainActive && curClickTagsLen > 0) appendNextToChain();
       else confirmPlacement();
       return;
     }
@@ -2189,7 +2245,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     if (e.key === 'Backspace' || ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === 'z' || e.key === 'Z'))) {
       e.preventDefault(); undoLast(); return;
     }
-    if (e.key === 'Escape') { e.preventDefault(); setPendingXPct(null); setChainActive(false); setGuidance(''); return; }
+    if (e.key === 'Escape') { e.preventDefault(); placementRef.current.pendingXPct = null; placementRef.current.chainActive = false; setPendingXPct(null); setChainActive(false); setGuidance(''); return; }
   }
 
   // ---- independent play bar (bottom of block) ----
