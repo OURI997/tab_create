@@ -2273,7 +2273,28 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
       }
       if (e.key === 'ArrowLeft') { e.preventDefault(); nudgeSelected(e.shiftKey ? -NUDGE_LARGE_PCT : -NUDGE_SMALL_PCT); return; }
       if (e.key === 'ArrowRight') { e.preventDefault(); nudgeSelected(e.shiftKey ? NUDGE_LARGE_PCT : NUDGE_SMALL_PCT); return; }
-      if (e.key === 'Escape' || e.key === 'Enter') { e.preventDefault(); setSelectedTagId(null); return; }
+      if (e.key === 'Escape') { e.preventDefault(); setSelectedTagId(null); return; }
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        // Resuming the chain: selecting the very LAST placed word (the tail of the whole clickTags
+        // sequence — by construction always the last word of the last chunk, however many chunks
+        // there are) and pressing Enter appends the next unplaced word/unit right after it, exactly
+        // like a bare Enter right after confirmPlacement does — same anchor-fixed, text-grows-right
+        // rule, since it goes through the identical appendNextToChain()/appendJoinedTags() routine.
+        // Selecting anything else (an earlier word, or a middle/non-tail word of the last chunk)
+        // just deselects, same as before — resuming from the middle of an already-placed sequence
+        // would mean inserting before already-placed words, which conflicts with the "always advance
+        // in time order" rule every other placement here follows, so it's deliberately not supported.
+        const { curClickTags, curPlacedCount } = computePlacementState();
+        const isChainTail = curClickTags.length > 0 && curClickTags[curClickTags.length - 1].id === selectedTagId;
+        setSelectedTagId(null);
+        if (isChainTail && curPlacedCount < words.length) {
+          placementRef.current.chainActive = true;
+          setChainActive(true);
+          appendNextToChain();
+        }
+        return;
+      }
       return;
     }
     // Play/pause toggle for the whole line — only when no word is selected (see above). The
