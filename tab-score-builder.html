@@ -1028,7 +1028,13 @@ async function buildScoreLayout(items, title, targetW, opts) {
   const gapAfterImage = Math.round((opts.imageGap != null ? opts.imageGap : 18) * scale);
   const titleFontPx = Math.max(10, Math.round((opts.titleFontSize || 44) * scale));
   const titleFont = 'bold ' + titleFontPx + 'px serif';
-  const lyricFontPx = Math.max(8, Math.round((opts.lyricFontSize || 26) * scale));
+  // NOT rounded to an integer px (unlike titleFontPx) — mergeOverlappingLabels' merge/no-merge
+  // decision is a ratio of this against contentW (see measureLyricLaneWidth()'s comment on why that
+  // ratio must match the edit-time lyricFontSize:laneWidth ratio exactly), and at high export
+  // resolutions rounding to the nearest integer px can shift that ratio just enough to flip a
+  // decision right at its boundary — merged in the edit view, drawn as two separate (and then
+  // actually overlapping) labels in the export. ctx.font accepts a fractional px value fine.
+  const lyricFontPx = Math.max(8, (opts.lyricFontSize || 26) * scale);
   const lyricFont = lyricFontPx + 'px Georgia, "Noto Serif KR", serif';
   const lyricLineH = Math.round(lyricFontPx * 1.3);
   // Scales with resolution the same way lyricFontPx does, so letter-spacing stays visually
@@ -1117,7 +1123,8 @@ function drawScoreItem(ctx, p, y, layout, scale) {
   ctx.drawImage(p.canvas, dx, y, dw, dh);
   y += dh;
   if (p.tags.length > 0) {
-    const lyricFontPx = Math.max(8, Math.round(layout.lyricFontPx * scale));
+    // See buildScoreLayout's comment on why this stays unrounded.
+    const lyricFontPx = Math.max(8, layout.lyricFontPx * scale);
     const lyricFont = lyricFontPx + 'px Georgia, "Noto Serif KR", serif';
     const lyricLineH = Math.round(layout.lyricLineH * scale);
     const lyricLetterSpacingPx = layout.lyricLetterSpacingPx * scale;
@@ -1436,10 +1443,22 @@ const PREVIEW_TAIL_SEC = 2.0;
 // instead of drawing one on top of the other. Purely a rendering-time view: nothing in storage
 // changes, so undoing the placement that caused the overlap (removing the last tag) makes the
 // chunk un-merge on its own the next time this runs — no separate "undo the merge" logic needed.
+//
+// `xPx` MUST go through imageXPctToWrapPct the same way every actual draw call does (the CSS
+// `left: imageXPctToWrapPct(xPct)%` in the editing UI, and `drawAt`'s `tx` in drawScoreItem/
+// composeScore) — a tag's `xPct` is relative to the IMAGE only, but text is actually positioned
+// within the WIDER row that also reserves LYRIC_MARGIN_PCT of margin on each side, so raw
+// `(xPct/100)*laneWidthPx` understates the real pixel position by that margin's compression.
+// Skipping this (as an earlier version of this function did) doesn't matter much in the editing UI,
+// where the chunk boxes render at a small, fixed CSS font well under the real lyricFontSize used for
+// this width math — the mismatch is swallowed by that cushion — but the export draws at the REAL
+// matching font size with none of that slack, so the same understated gap becomes actual, visible
+// overlap. Going through the same conversion here as every real draw call closes that gap in BOTH
+// places at once, instead of two call sites quietly assuming two different coordinate spaces.
 function mergeOverlappingLabels(orderedTags, laneWidthPx, fontSize, letterSpacing) {
   const chunks = [];
   for (const t of orderedTags) {
-    const xPx = (t.xPct / 100) * laneWidthPx;
+    const xPx = (imageXPctToWrapPct(t.xPct) / 100) * laneWidthPx;
     const textWidth = measureLyricText(t.text, fontSize, letterSpacing);
     const last = chunks[chunks.length - 1];
     // `joined` = explicitly attached to the previous word (pre-joined chips / consecutive-Enter
@@ -1457,11 +1476,35 @@ function mergeOverlappingLabels(orderedTags, laneWidthPx, fontSize, letterSpacin
   return chunks;
 }
 
+// Single shared definition of "what real on-screen pixel width represents the lyric-placement
+// lane" — mergeOverlappingLabels' overlap/merge decision is a ratio of text width to this value, so
+// the LIVE editing UI (ImageBlock's own `laneWidth`, measured off its own .lyric-lane) and the
+// exported PNG/PDF (buildScoreLayout's `scale`, derived from `referenceWidth`) must agree on it, or
+// a chunk that merges cleanly on screen can render as two overlapping, unmerged labels in the
+// export. Previously the export side measured `.list` (the outer column, no padding of its own)
+// while the edit side measured `.lyric-lane` (nested inside `.block`'s 16px padding) — two
+// DIFFERENT elements, permanently ~32px apart — so the two could disagree even though both called
+// the same mergeOverlappingLabels(). Measuring the same selector from both places removes that
+// whole class of drift instead of just patching this one instance of it.
+function measureLyricLaneWidth() {
+  const el = document.querySelector('.lyric-lane');
+  const w = el && el.getBoundingClientRect().width;
+  return (w && w > 0) ? w : null;
+}
+
 // Converts an image-relative xPct (can be <0 or >100, see above) into a % position within the
 // WRAPPER element, which additionally reserves LYRIC_MARGIN_PCT-worth of room on each side.
 function imageXPctToWrapPct(xPct) {
   const m = (LYRIC_MARGIN_PCT / (100 + 2 * LYRIC_MARGIN_PCT)) * 100;
   return m + (xPct / 100) * (100 - 2 * m);
+}
+// Inverse of imageXPctToWrapPct — needed wherever a pixel/percent position computed in WRAPPER
+// space (e.g. a merged chunk's rightPx from mergeOverlappingLabels, which now goes through
+// imageXPctToWrapPct internally — see its comment) has to be converted back into an image-relative
+// xPct for storage, such as appendJoinedTags placing a new word right after a chunk's current end.
+function wrapPctToImageXPct(wrapPct) {
+  const m = (LYRIC_MARGIN_PCT / (100 + 2 * LYRIC_MARGIN_PCT)) * 100;
+  return ((wrapPct - m) / (100 - 2 * m)) * 100;
 }
 
 
@@ -1548,7 +1591,20 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   useEffect(() => { redraw(); }, [item, defaults]);
 
   useEffect(() => {
-    if (laneRef.current) setLaneWidth(laneRef.current.offsetWidth || 700);
+    const el = laneRef.current;
+    if (!el) return;
+    setLaneWidth(el.offsetWidth || 700);
+    // Keeps `laneWidth` (and therefore every overlap-merge decision keyed off it) matched to the
+    // real on-screen lane at all times, not just at mount — a stale measurement after a window
+    // resize is the same class of edit-vs-export drift as measuring the wrong element outright (see
+    // measureLyricLaneWidth()), just triggered by a resize instead of a permanent layout gap.
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(entries => {
+      const w = entries[0] && entries[0].contentRect && entries[0].contentRect.width;
+      if (w) setLaneWidth(w);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
   }, []);
 
   useEffect(() => {
@@ -2044,8 +2100,8 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
       const ordered = cur.filter(t => t.viaClick).sort((a, b) => a.xPct - b.xPct);
       const ch = mergeOverlappingLabels(ordered, laneWidth, lyricFontSize, lyricLetterSpacing);
       const tail = ch[ch.length - 1];
-      const rawPct = ((tail.rightPx + spaceW) / Math.max(1, laneWidth)) * 100;
-      const xPct = Math.min(100 + LYRIC_MARGIN_PCT, rawPct);
+      const rawWrapPct = ((tail.rightPx + spaceW) / Math.max(1, laneWidth)) * 100;
+      const xPct = Math.min(100 + LYRIC_MARGIN_PCT, wrapPctToImageXPct(rawWrapPct));
       const time = xPctToTime(xPct);
       times.push(time);
       const id = Date.now() + '_' + Math.random().toString(36).slice(2);
@@ -2841,6 +2897,16 @@ function TabScoreBuilder() {
   const fileInputRef = useRef(null);
   const listRef = useRef(null);
   function getReferenceWidth() {
+    // Must match what ImageBlock's own `laneWidth` measures (its .lyric-lane), NOT `.list` — see
+    // measureLyricLaneWidth()'s comment. Divided by (1 - 2*EXPORT_MARGIN_RATIO) to compensate for
+    // buildScoreLayout shrinking `referenceWidth` down to `contentW` by that same fraction before
+    // computing its font/width scale — without this, the export's effective lyricFontPx:contentW
+    // ratio would still be off from the edit-time lyricFontSize:laneWidth ratio by exactly that
+    // margin, even after fixing which DOM element gets measured. listRef is kept only as a
+    // last-resort fallback for when no .lyric-lane is in the DOM yet (e.g. exporting with zero
+    // images, or before first paint).
+    const laneW = measureLyricLaneWidth();
+    if (laneW) return laneW / (1 - 2 * EXPORT_MARGIN_RATIO);
     return (listRef.current && listRef.current.getBoundingClientRect().width) || 780;
   }
 
