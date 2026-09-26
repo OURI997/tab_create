@@ -1457,6 +1457,15 @@ const PREVIEW_TAIL_SEC = 2.0;
 // places at once, instead of two call sites quietly assuming two different coordinate spaces.
 function mergeOverlappingLabels(orderedTags, laneWidthPx, fontSize, letterSpacing) {
   const chunks = [];
+  // Two SEPARATE (non-merged) chunks only need this much real gap between them to read as
+  // properly word-spaced instead of jammed together — the same width a real space character
+  // contributes INSIDE a merged chunk (`last.text += ' ' + t.text`). Without this margin, the
+  // overlap test's bare `xPx < last.rightPx` only guarantees the gap is non-negative, which lets
+  // two chunks land a fraction of a pixel apart and still count as "safely separate" — technically
+  // not overlapping, but visually indistinguishable from touching/overlapping text once rendered
+  // (this is what actually produced "alright"+"I" reading as "alrightI": mergeOverlappingLabels
+  // correctly left them unmerged, but by a margin far too thin to read as a space).
+  const minGapPx = measureLyricText(' ', fontSize, letterSpacing);
   for (const t of orderedTags) {
     const xPx = (imageXPctToWrapPct(t.xPct) / 100) * laneWidthPx;
     const textWidth = measureLyricText(t.text, fontSize, letterSpacing);
@@ -1464,7 +1473,7 @@ function mergeOverlappingLabels(orderedTags, laneWidthPx, fontSize, letterSpacin
     // `joined` = explicitly attached to the previous word (pre-joined chips / consecutive-Enter
     // append), so it stays in the same chunk regardless of how far apart the measured widths land
     // at a different lane width; otherwise the plain overlap test decides, as before.
-    if (last && (t.joined || xPx < last.rightPx)) {
+    if (last && (t.joined || xPx < last.rightPx + minGapPx)) {
       last.ids.push(t.id);
       last.words.push({ id: t.id, text: t.text });
       last.text += ' ' + t.text;
