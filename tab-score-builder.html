@@ -68,6 +68,13 @@
   .onset-line-input{width:100%;box-sizing:border-box;font-size:13px;padding:6px 8px;border:1px solid var(--border-strong);border-radius:8px;resize:vertical;margin-bottom:8px;font-family:inherit;}
   .onset-syllable-queue{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;}
   .syllable-chip{display:inline-block;padding:2px 7px;border-radius:6px;font-size:13px;background:var(--card);border:1px solid var(--border);color:var(--text2);}
+  .chip-unit{display:inline-flex;gap:0;border-radius:6px;}
+  .chip-unit.joined{outline:1px solid var(--accent);}
+  .chip-unit.joined .syllable-chip{border-radius:0;cursor:pointer;}
+  .chip-unit.joined .syllable-chip:first-child{border-radius:6px 0 0 6px;}
+  .chip-unit.joined .syllable-chip:last-child{border-radius:0 6px 6px 0;}
+  .syllable-chip{cursor:grab;}
+  .syllable-chip.dragging{opacity:.4;}
   .syllable-chip.active{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600;}
   .click-marker{position:absolute;top:0;bottom:0;width:3px;margin-left:-1.5px;pointer-events:none;border-radius:2px;z-index:2;}
   .click-marker.snapped{background:#2ecc71;box-shadow:0 0 0 1px #fff;}
@@ -1435,7 +1442,10 @@ function mergeOverlappingLabels(orderedTags, laneWidthPx, fontSize, letterSpacin
     const xPx = (t.xPct / 100) * laneWidthPx;
     const textWidth = measureLyricText(t.text, fontSize, letterSpacing);
     const last = chunks[chunks.length - 1];
-    if (last && xPx < last.rightPx) {
+    // `joined` = explicitly attached to the previous word (pre-joined chips / consecutive-Enter
+    // append), so it stays in the same chunk regardless of how far apart the measured widths land
+    // at a different lane width; otherwise the plain overlap test decides, as before.
+    if (last && (t.joined || xPx < last.rightPx)) {
       last.ids.push(t.id);
       last.words.push({ id: t.id, text: t.text });
       last.text += ' ' + t.text;
@@ -1491,6 +1501,15 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   const [selectedTagId, setSelectedTagId] = useState(null);
   const [selectedText, setSelectedText] = useState('');
   const [guidance, setGuidance] = useState('');
+  // True right after a placement (or an append) until something else happens (track click, select,
+  // undo of the anchor, ...): while it's on, a bare Enter appends the NEXT word/unit to the end of
+  // the chunk just placed instead of demanding a fresh track click.
+  const [chainActive, setChainActive] = useState(false);
+  // Pre-joined chips: { [wordIndex]: 'prev\u0000cur' } — "word i is glued to word i-1". The stored
+  // text pair is re-validated against the current words on every render, so editing the lyric text
+  // silently drops joins that no longer describe the same two words instead of mis-gluing others.
+  const [chipJoins, setChipJoins] = useState({});
+  const [dragChipIdx, setDragChipIdx] = useState(null);
   // Independent play bar state — this line's own scrub bar, separate from the auto-preview clip
   // that plays after every placement/nudge. barPos01 is a POSITION (xPct/100, piecewise-calibrated
   // — see below), not a plain time fraction, so it can no longer be multiplied back out by
@@ -1819,6 +1838,14 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   while (placedCount < clickTags.length && placedCount < words.length && clickTags[placedCount].text === words[placedCount]) {
     placedCount++;
   }
+  const isJoinedIdx = i => i > placedCount && i < words.length && chipJoins[i] === words[i - 1] + '\u0000' + words[i];
+  // Unplaced words grouped into placement UNITS: [[startIdx,...], ...] — a unit is one word, or
+  // several chips the user glued together; either way it's placed with ONE click+Enter.
+  const chipUnits = [];
+  for (let i = placedCount; i < words.length; i++) {
+    if (isJoinedIdx(i) && chipUnits.length) chipUnits[chipUnits.length - 1].push(i);
+    else chipUnits.push([i]);
+  }
   const lastPlacedXPct = clickTags.length > 0 ? clickTags[clickTags.length - 1].xPct : -LYRIC_MARGIN_PCT - 1;
   const chunks = mergeOverlappingLabels(clickTags, laneWidth, lyricFontSize, lyricLetterSpacing);
   const selectedTag = selectedTagId ? tags.find(t => t.id === selectedTagId) : null;
@@ -1950,6 +1977,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
 
   function handleTrackClick(e) {
     if (selectedTagId) { setSelectedTagId(null); return; }
+    setChainActive(false);
     const raw = xPctFromClientX(e.clientX);
     const { xPct, snapped } = snapXPct(raw);
     setPendingXPct(xPct);
@@ -1958,10 +1986,34 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   }
 
   function selectTag(id) {
+    setChainActive(false);
     setPendingXPct(null);
     setSelectedTagId(id);
     const tag = tags.find(t => t.id === id);
     if (tag) playSnippetAround(xPctToTime(tag.xPct));
+  }
+
+  // THE single routine both "chips pre-joined above the track" and "consecutive Enter" go through:
+  // appends each of `texts` as a `joined` tag flowing right after the current end of the last
+  // merged chunk in `baseTags` (one space between words). The result is the same data every merged
+  // chunk already is — an anchor tag plus following tags that mergeOverlappingLabels folds into one
+  // label — so anchor-nudge / split-on-middle-nudge / export need no special casing.
+  function appendJoinedTags(baseTags, texts) {
+    let cur = baseTags;
+    const times = [];
+    const spaceW = measureLyricText(' ', lyricFontSize, lyricLetterSpacing);
+    for (const text of texts) {
+      const ordered = cur.filter(t => t.viaClick).sort((a, b) => a.xPct - b.xPct);
+      const ch = mergeOverlappingLabels(ordered, laneWidth, lyricFontSize, lyricLetterSpacing);
+      const tail = ch[ch.length - 1];
+      const rawPct = ((tail.rightPx + spaceW) / Math.max(1, laneWidth)) * 100;
+      const xPct = Math.min(100 + LYRIC_MARGIN_PCT, rawPct);
+      const time = xPctToTime(xPct);
+      times.push(time);
+      const id = Date.now() + '_' + Math.random().toString(36).slice(2);
+      cur = [...cur, { id, text, xPct, time, yPct: CLICK_LYRIC_Y_PCT, viaClick: true, joined: true }];
+    }
+    return { tags: cur, times };
   }
 
   function confirmPlacement() {
@@ -1972,20 +2024,65 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
       return;
     }
     const confirmedTime = xPctToTime(pendingXPct);
-    addClickTag(words[placedCount], pendingXPct, confirmedTime);
+    const unit = chipUnits[0];
+    const anchorId = Date.now() + '_' + Math.random().toString(36).slice(2);
+    let nextTags = [...tags, { id: anchorId, text: words[unit[0]], xPct: pendingXPct, time: confirmedTime, yPct: CLICK_LYRIC_Y_PCT, viaClick: true }];
+    if (unit.length > 1) nextTags = appendJoinedTags(nextTags, unit.slice(1).map(i => words[i])).tags;
+    updateLyrics({ tags: nextTags });
     playSnippetAround(confirmedTime);
     setPendingXPct(null);
     setPendingSnapped(false);
     setGuidance('');
+    setChainActive(true);
+  }
+
+  // Bare Enter right after a placement: glue the next unit onto the end of the chunk just placed
+  // (the anchor stays fixed; only text grows to the right). Falls back to the normal "click first"
+  // guidance when nothing is chained or the line is used up.
+  function appendNextToChain() {
+    if (placedCount >= words.length) { setGuidance('이 줄의 가사를 모두 배치했습니다.'); return; }
+    const unit = chipUnits[0];
+    const { tags: nextTags, times } = appendJoinedTags(tags, unit.map(i => words[i]));
+    updateLyrics({ tags: nextTags });
+    playSnippetAround(times[0]);
+    setGuidance('');
+  }
+
+  // Chip pre-join: glue unit containing word `i` to the adjacent unit at boundary `boundary`
+  // (the index of the right-hand word) — only ever between two adjacent unplaced words.
+  function joinChipsAt(boundary) {
+    if (boundary <= placedCount || boundary >= words.length) return;
+    setChipJoins(prev => ({ ...prev, [boundary]: words[boundary - 1] + '\u0000' + words[boundary] }));
+  }
+  function unjoinChipsAt(boundary) {
+    setChipJoins(prev => { const n = { ...prev }; delete n[boundary]; return n; });
+  }
+  function handleChipDrop(fromIdx, toIdx) {
+    if (fromIdx === null || fromIdx === toIdx) return;
+    const uf = chipUnits.find(u => u.includes(fromIdx));
+    const ut = chipUnits.find(u => u.includes(toIdx));
+    if (!uf || !ut || uf === ut) return;
+    if (uf[uf.length - 1] + 1 === ut[0]) joinChipsAt(ut[0]);
+    else if (ut[ut.length - 1] + 1 === uf[0]) joinChipsAt(uf[0]);
+  }
+  function handleChipClick(i) {
+    const u = chipUnits.find(g => g.includes(i));
+    if (!u || u.length < 2) return;
+    // a later word splits the group right before itself; the first word splits right after itself
+    unjoinChipsAt(i === u[0] ? u[1] : i);
   }
 
   function undoLast() {
     if (clickTags.length === 0) return;
-    removeClickTagById(clickTags[clickTags.length - 1].id);
+    const last = clickTags[clickTags.length - 1];
+    removeClickTagById(last.id);
+    // Undoing an appended word keeps the chain going; undoing an anchor ends it.
+    if (!last.joined) setChainActive(false);
     setGuidance('');
   }
 
   function advanceLine() {
+    setChainActive(false);
     if (placedCount < words.length) {
       setGuidance('아직 배치하지 않은 가사가 있습니다 — 모두 배치한 뒤 다음 줄로 이동할 수 있습니다.');
       return;
@@ -2019,9 +2116,15 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     // in effect from the OTHER (unmoved) points, same as a fresh confirm would — so a corrective
     // nudge actually updates what this point contributes as a calibration anchor for its neighbors,
     // instead of leaving it pinned to whatever the flat line said when it was first confirmed.
+    // A split-off word (first moved word that wasn't the anchor) stops being glued to the word
+    // before it — it becomes the anchor of its own chunk; the words after it stay joined to it.
+    const splitId = chunk && chunk.words[0].id !== selectedTagId ? selectedTagId : null;
     updateLyrics({
-      tags: tags.map(t => idSet.has(t.id) ? { ...t, xPct: t.xPct + deltaPct, time: xPctToTime(t.xPct + deltaPct) } : t),
+      tags: tags.map(t => idSet.has(t.id)
+        ? { ...t, xPct: t.xPct + deltaPct, time: xPctToTime(t.xPct + deltaPct), ...(t.id === splitId ? { joined: false } : {}) }
+        : t),
     });
+    setChainActive(false);
     const nextXPct = selectedTag.xPct + deltaPct;
     playSnippetAround(xPctToTime(nextXPct));
   }
@@ -2075,13 +2178,18 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     if (pendingXPct !== null && e.key === 'ArrowRight') { e.preventDefault(); movePendingToAdjacentNote(1); return; }
     if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); advanceLine(); return; }
     if (e.key === 'PageDown') { e.preventDefault(); advanceLine(); return; }
-    if (e.key === 'Enter') { e.preventDefault(); confirmPlacement(); return; }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (pendingXPct === null && chainActive && clickTags.length > 0) appendNextToChain();
+      else confirmPlacement();
+      return;
+    }
     // Ctrl+Z / Cmd+Z alongside Backspace — same undoLast(), same placement in this branch (so it's
     // a no-op while a word is selected, exactly like Backspace already is above).
     if (e.key === 'Backspace' || ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === 'z' || e.key === 'Z'))) {
       e.preventDefault(); undoLast(); return;
     }
-    if (e.key === 'Escape') { e.preventDefault(); setPendingXPct(null); setGuidance(''); return; }
+    if (e.key === 'Escape') { e.preventDefault(); setPendingXPct(null); setChainActive(false); setGuidance(''); return; }
   }
 
   // ---- independent play bar (bottom of block) ----
@@ -2272,8 +2380,19 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
           value={lineText} onChange={e => setLineText(e.target.value)} rows={2} />
         <div className="onset-syllable-queue">
           {words.length === 0 && <span className="hint-text">위에 가사를 입력하면 단어가 여기 표시됩니다.</span>}
-          {words.slice(placedCount).map((w, i) => (
-            <span key={placedCount + i} className={'syllable-chip' + (i === 0 ? ' active' : '')}>{w}</span>
+          {chipUnits.map((u, ui) => (
+            <span key={u[0]} className={'chip-unit' + (u.length > 1 ? ' joined' : '')}>
+              {u.map(i => (
+                <span key={i} draggable
+                  className={'syllable-chip' + (ui === 0 ? ' active' : '') + (dragChipIdx === i ? ' dragging' : '')}
+                  title={u.length > 1 ? '클릭하면 여기서 분리' : '이웃 칩 위로 끌어다 놓으면 하나로 합쳐집니다'}
+                  onDragStart={e => { setDragChipIdx(i); e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', String(i)); } catch (_) {} }}
+                  onDragOver={e => e.preventDefault()}
+                  onDrop={e => { e.preventDefault(); handleChipDrop(dragChipIdx, i); setDragChipIdx(null); }}
+                  onDragEnd={() => setDragChipIdx(null)}
+                  onClick={() => handleChipClick(i)}>{words[i]}</span>
+              ))}
+            </span>
           ))}
         </div>
 
