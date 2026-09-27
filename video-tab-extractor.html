@@ -1685,7 +1685,7 @@ const SCROLL_PLAYHEAD_HUE_TOLERANCE_DEFAULT = 35;
 const SCROLL_PLAYHEAD_SAT_MIN_DEFAULT = 0.35;
 
 const SCROLL_DEFAULTS_INIT = {
-  removeBg: true, invertMode: 'auto', threshold: 140, softness: 18,
+  removeBg: true, invertMode: 'auto', threshold: 110, softness: 12,
   despeckle: true, despeckleSize: 3,
   playheadRemove: false, playheadColor: null, // null = SCROLL_PLAYHEAD_* 기본값 사용
 };
@@ -1714,6 +1714,26 @@ function scrollApplyPreprocInPlace(canvas, opts) {
     if (opts.despeckle) despeckleBinary(imageData, w, h, opts.despeckleSize || 0);
     ctx.putImageData(imageData, 0, 0);
   }
+}
+
+// 표시(미리보기)용으로만 쓰는 고품질 축소 — 브라우저의 drawImage 한 번으로 큰 비율(예: 7~8배)을
+// 한꺼번에 축소하면 이진화된 가는 선/도트에서 무아레(지글거림)가 두드러진다. 목표 폭의 2배보다
+// 클 동안 절반씩 반복해서 줄이면(각 단계가 대략 박스 필터처럼 작동) 훨씬 매끄럽다. destCanvas에
+// 그리는 게 전부이고 원본(srcCanvas)은 건드리지 않으므로, 실제 저장/스티칭에 쓰는 원본 해상도
+// 데이터에는 영향이 없다.
+function drawDownscaledStaged(srcCanvas, destCanvas, targetW) {
+  let cur = srcCanvas;
+  while (cur.width > targetW * 2) {
+    const half = document.createElement('canvas');
+    half.width = Math.max(1, Math.round(cur.width / 2));
+    half.height = Math.max(1, Math.round(cur.height / 2));
+    half.getContext('2d').drawImage(cur, 0, 0, half.width, half.height);
+    cur = half;
+  }
+  const scale = Math.min(1, targetW / cur.width);
+  destCanvas.width = Math.max(1, Math.round(cur.width * scale));
+  destCanvas.height = Math.max(1, Math.round(cur.height * scale));
+  destCanvas.getContext('2d').drawImage(cur, 0, 0, destCanvas.width, destCanvas.height);
 }
 
 // ---- NCC 기반 겹침 탐색 + 이어붙이기 — scroll-stitch-test.html에서 그대로 이식 ----
@@ -2242,6 +2262,14 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
   const rangeDragRef = useRef(null); // 'start' | 'end' | null
   const rangeStartRef = useRef(0);
   const rangeEndRef = useRef(0);
+  // roi/scrollDefaults를 ref로도 미러링 — 아래 range-drag용 useEffect는 deps=[](pointermove/up을
+  // 드래그 내내 딱 한 번만 붙여야 하므로)라서, 거기서 부르는 onMove가 "마운트 시점의" roi/
+  // scrollDefaults를 닫아버리는 stale closure가 된다(updatePreprocPreview 자체는 매 렌더 새로
+  // 만들어지지만, onMove가 붙잡고 있는 건 마운트 시점의 그 함수 하나뿐). updatePreprocPreview가
+  // roi/scrollDefaults를 직접 읽지 않고 이 ref들의 .current만 읽게 하면, 어느 렌더의 onMove가
+  // 호출되든 항상 최신 값을 보게 된다.
+  const roiRef = useRef(null);
+  const scrollDefaultsRef = useRef(null);
   const [videoFile, setVideoFile] = useState(null);
   const [videoLoaded, setVideoLoaded] = useState(false);
   const [duration, setDuration] = useState(0);
@@ -2265,6 +2293,8 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
   useEffect(() => { durationRef.current = duration; }, [duration]);
   useEffect(() => { rangeStartRef.current = rangeStart; }, [rangeStart]);
   useEffect(() => { rangeEndRef.current = rangeEnd; }, [rangeEnd]);
+  useEffect(() => { roiRef.current = roi; }, [roi]);
+  useEffect(() => { scrollDefaultsRef.current = scrollDefaults; }, [scrollDefaults]);
 
   function log(msg) { setStatusMsg(msg); }
 
@@ -2331,26 +2361,26 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
 
   // 전/후 비교 미리보기 — ROI/설정을 바꿀 때 확인 없이도 결과를 가늠할 수 있게, "원본(ROI 크롭만)"과
   // "전처리 후"를 현재 프레임 기준으로 나란히 보여준다. 반드시 원본 해상도로 처리한 뒤 표시용으로만
-  // 축소한다(despeckle 스펙클 노이즈 방지 — 스티칭 단계와 동일한 순서).
+  // 축소한다(despeckle 스펙클 노이즈 방지 — 스티칭 단계와 동일한 순서). 실제 저장/스티칭에 쓰이는
+  // 원본 해상도 데이터(captured, full)는 이 함수 밖으로 나가지 않으므로 아래 단계적 축소는 순수히
+  // "여기서 어떻게 보여줄지"에만 영향을 준다.
   function updatePreprocPreview() {
     const video = videoRef.current;
     if (!video || !video.videoWidth) return;
-    const captured = captureRoiNative(video, roi); // 원본 해상도 크롭 (모듈 공용 캔버스 → dataURL로 즉시 회수)
+    const captured = captureRoiNative(video, roiRef.current); // 원본 해상도 크롭
     const raw = ppRawRef.current, processed = ppProcessedRef.current;
     if (!raw || !processed) return;
     loadImage(captured.dataUrl).then(img => {
-      const maxW = 420;
-      const scale = Math.min(1, maxW / img.naturalWidth);
-      const dw = Math.round(img.naturalWidth * scale), dh = Math.round(img.naturalHeight * scale);
-      raw.width = dw; raw.height = dh;
-      raw.getContext('2d').drawImage(img, 0, 0, dw, dh);
-
       const full = document.createElement('canvas');
       full.width = img.naturalWidth; full.height = img.naturalHeight;
       full.getContext('2d').drawImage(img, 0, 0);
-      scrollApplyPreprocInPlace(full, scrollDefaults); // 원본 해상도에서 처리
-      processed.width = dw; processed.height = dh;
-      processed.getContext('2d').drawImage(full, 0, 0, dw, dh); // 표시용으로만 축소
+      drawDownscaledStaged(full, raw, 420);
+
+      const processedFull = document.createElement('canvas');
+      processedFull.width = img.naturalWidth; processedFull.height = img.naturalHeight;
+      processedFull.getContext('2d').drawImage(img, 0, 0);
+      scrollApplyPreprocInPlace(processedFull, scrollDefaultsRef.current); // 원본 해상도에서 처리
+      drawDownscaledStaged(processedFull, processed, 420); // 표시용으로만, 2배씩 단계적으로 축소
     });
   }
   // ROI나 전처리 설정이 바뀔 때마다 갱신 — 드래그 중 과도하게 자주 다시 그리지 않도록 살짝 debounce.
@@ -2398,6 +2428,11 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
     const totalSteps = Math.max(1, Math.ceil((rangeE - rangeS) / step));
     const times = [], diffs = [];
     let prevSample = null;
+    let lastProgress = -1; // 프로토타입(순수 JS)과 달리 React는 상태가 바뀔 때마다 이 컴포넌트
+    // 트리 전체를 다시 렌더링한다 — 매 스텝마다(초당 수십 번) setAnalyzeProgress를 부르면 값이
+    // 실제로는 안 바뀐 프레임에서도 리렌더가 도는 게 체감 속도 저하의 큰 부분이었다. 표시되는
+    // 정수 %가 실제로 바뀔 때만 갱신해서 리렌더 횟수를 총 진행 스텝 수(수백 번일 수 있음)에서
+    // 100번 이하로 줄인다.
     try {
       let t = rangeS, idx = 0;
       while (t < rangeE) {
@@ -2407,7 +2442,8 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
         if (prevSample) diffs.push(diffScore(prevSample, sample));
         prevSample = sample;
         idx++;
-        setAnalyzeProgress(Math.min(100, Math.round((idx / totalSteps) * 100)));
+        const pct = Math.min(100, Math.round((idx / totalSteps) * 100));
+        if (pct !== lastProgress) { lastProgress = pct; setAnalyzeProgress(pct); }
         if (idx % 10 === 0) log('분석 중... ' + t.toFixed(1) + 's / ' + rangeE.toFixed(1) + 's');
         t += step;
       }
@@ -2793,7 +2829,10 @@ function GroupOverridePanel({ videoRef, scrollDefaults, roi, onApply, onCancel }
 
 function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onModeBack }) {
   const { videoFile, roi, direction, directionNcc, repFrameTimes, stitchedCanvas, seams, bursts } = scrollCapture;
-  const [groupSize, setGroupSize] = useState(4);
+  // "몇 마디씩 묶기(목표)"의 기본값 — 사용자가 아직 직접 입력하지 않았다면(null) 이미 감지된 총
+  // 마디 수를 그대로 따라가며 채워둔다(감지 결과가 바뀌면 같이 갱신). 한 번이라도 직접 타이핑하면
+  // 그 이후로는 항상 사용자가 입력한 값을 그대로 쓴다 — wholeImageFallback과 동일한 패턴.
+  const [groupSizeUser, setGroupSizeUser] = useState(null);
   const [maxBarsPerGroup, setMaxBarsPerGroup] = useState(8);
   const [overrides, setOverrides] = useState({}); // key `${startIdx}-${endIdx}` -> dataUrl
   const [overrideOpenKey, setOverrideOpenKey] = useState(null);
@@ -2820,6 +2859,7 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
   const bars = detection.bars;
   const staffFound = detection.staffFound;
   const measureCount = Math.max(0, bars.length - 1);
+  const groupSize = groupSizeUser != null ? groupSizeUser : Math.max(1, measureCount || 4);
 
   // 마디선이 0개(또는 부족)여도 다음 단계를 막지 않는다 — "마디선 없이 스티칭 결과 전체를 그대로
   // 하나의 이미지로 사용" 폴백. 사용자가 아직 이 체크박스를 직접 만지지 않았다면 마디가 1개 미만일
@@ -2926,7 +2966,7 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
         <div className="hr" />
         <div className="toolbar">
           <label>몇 마디씩 묶기(목표): <input type="number" min="1" max="16" value={groupSize} disabled={effectiveFallback}
-            onChange={e => setGroupSize(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
+            onChange={e => setGroupSizeUser(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
           <label>그룹당 최대 마디수: <input type="number" min="1" max="20" value={maxBarsPerGroup} disabled={effectiveFallback}
             onChange={e => setMaxBarsPerGroup(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
           <span className="save-msg">{measureCount}마디 → {groups.length}개 그룹</span>
