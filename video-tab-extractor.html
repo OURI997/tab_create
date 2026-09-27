@@ -61,6 +61,15 @@
   }
   .notice-banner b{color:var(--accent);}
 
+  .mode-card-row{display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;}
+  .mode-card{
+    flex:1;min-width:220px;text-align:left;background:var(--card);border:2px solid var(--border-strong);
+    border-radius:12px;padding:18px;cursor:pointer;font-family:inherit;
+  }
+  .mode-card:hover{border-color:var(--accent);background:var(--accent-bg);}
+  .mode-card .mode-card-title{font-size:16px;font-weight:700;margin-bottom:6px;}
+  .mode-card .mode-card-desc{font-size:12.5px;color:var(--text2);line-height:1.5;}
+
   .step-nav{display:flex;gap:6px;align-items:center;font-size:12.5px;color:var(--text2);}
   .step-nav .step{padding:4px 10px;border-radius:999px;border:1px solid var(--border);}
   .step-nav .step.active{border-color:var(--accent);color:var(--accent);background:var(--accent-bg);font-weight:600;}
@@ -120,7 +129,7 @@
 <body>
 <div id="root"></div>
 <script type="text/babel">
-const { useState, useRef, useEffect } = React;
+const { useState, useRef, useEffect, useMemo } = React;
 
 // ==== copied (near-)verbatim from tab-score-builder.html so preprocessing here reproduces exactly
 // what will happen after handoff — these two files are fully independent static pages with no shared
@@ -1906,6 +1915,27 @@ function detectBarLines(g, top, bottom, darkThresh, barFrac) {
   return merged;
 }
 
+// staffThresh/barThresh를 결과 화면 슬라이더로 실시간 조정할 수 있어야 해서(재클릭 없이 즉시
+// 재검출), 마디선 검출을 한 번만 도는 runScrollStage3에서 분리해 이 함수로 뽑아뒀다 — 항상 이
+// 함수 하나만 거치므로 "이름을 바꾸는 과정에서 실제 호출부 연결이 끊기는" 종류의 문제가 다시
+// 생길 여지가 없다(호출부가 하나뿐). 입력은 반드시 seam 표시선 등 오버레이가 없는 깨끗한
+// stitched canvas여야 한다 — runScrollStage3의 out은 애초에 그런 오버레이를 그리지 않는 clean
+// canvas라서 (프로토타입과 달리 별도 cleanOut이 필요 없음) 그대로 넘기면 된다.
+function detectStaffAndBars(canvas, staffThresh, barThresh) {
+  const g = scrollGetFullGrayData(canvas);
+  const darkThresh = 140;
+  const staffLines = detectStaffYBand(g, darkThresh, staffThresh);
+  let bars = [];
+  if (staffLines.length >= 2) {
+    const top = staffLines[0], bottom = staffLines[staffLines.length - 1];
+    bars = detectBarLines(g, top, bottom, darkThresh, barThresh);
+    if (bars.length && (canvas.width - bars[bars.length - 1]) > canvas.width * 0.02) {
+      bars = [...bars, canvas.width - 1];
+    }
+  }
+  return { staffLines, bars, staffFound: staffLines.length >= 2 };
+}
+
 // ---- N마디씩 그룹핑 — 프로토타입의 단순 고정-N 슬라이싱을 이번 스펙대로 교체 ----
 // N은 고정값이 아니라 "목표값": 목표 픽셀폭 = 이 영상의 평균 마디 폭 × N (해상도 무관, 영상마다
 // 자동 계산). 각 마디선 경계에서, 누적 폭이 목표폭에 가장 가까워지는 마디 수(1~maxBarsPerGroup)를
@@ -2039,20 +2069,10 @@ async function runScrollStage3(repFrames, scrollDefaults, directionPref) {
     }
   }
 
-  // 3) 마디(bar-line) 검출
-  const g = scrollGetFullGrayData(out);
-  const darkThresh = 140, staffLineFrac = 0.6, barFrac = 0.85;
-  const staffLines = detectStaffYBand(g, darkThresh, staffLineFrac);
-  let bars = [];
-  if (staffLines.length >= 2) {
-    const top = staffLines[0], bottom = staffLines[staffLines.length - 1];
-    bars = detectBarLines(g, top, bottom, darkThresh, barFrac);
-    if (bars.length && (out.width - bars[bars.length - 1]) > out.width * 0.02) {
-      bars = [...bars, out.width - 1];
-    }
-  }
-
-  return { direction, directionNcc, canvas: out, seams, bars, staffFound: staffLines.length >= 2 };
+  // 3) 마디(bar-line) 검출은 여기서 한 번만 하지 않는다 — staffThresh/barThresh를 결과 화면에서
+  // 슬라이더로 바꿀 때마다 재검출해야 하므로, 그 하나의 공용 함수(detectStaffAndBars)를 결과 화면이
+  // 직접 호출한다. 여기서는 깨끗한(오버레이 없는) stitched canvas만 돌려준다.
+  return { direction, directionNcc, canvas: out, seams };
 }
 // ---- ROI 드래그 선택 UI — CaptureStep과 같은 패턴(별도 컴포넌트로 분리해 스크롤/페이지 두
 // 플로우가 각자의 캔버스 ref를 갖게 함, 상태 공유 없음) ----
@@ -2218,10 +2238,16 @@ function ScrollPreprocPanel({ scrollDefaults, setScrollDefaults }) {
 
 function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone, onModeBack }) {
   const durationRef = useRef(0);
+  const rangeTrackRef = useRef(null);
+  const rangeDragRef = useRef(null); // 'start' | 'end' | null
+  const rangeStartRef = useRef(0);
+  const rangeEndRef = useRef(0);
   const [videoFile, setVideoFile] = useState(null);
   const [videoLoaded, setVideoLoaded] = useState(false);
   const [duration, setDuration] = useState(0);
   const [seekT, setSeekT] = useState(0);
+  const [rangeStart, setRangeStart] = useState(0);
+  const [rangeEnd, setRangeEnd] = useState(0);
   const [roi, setRoi] = useState(null);
   const [direction, setDirection] = useState('auto');
   const [stepSec, setStepSec] = useState(0.2);
@@ -2233,8 +2259,12 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
   const [confirming, setConfirming] = useState(false);
   const [statusMsg, setStatusMsg] = useState('스크롤형 영상 파일을 선택하세요.');
   const chartRef = useRef(null);
+  const ppRawRef = useRef(null);
+  const ppProcessedRef = useRef(null);
 
   useEffect(() => { durationRef.current = duration; }, [duration]);
+  useEffect(() => { rangeStartRef.current = rangeStart; }, [rangeStart]);
+  useEffect(() => { rangeEndRef.current = rangeEnd; }, [rangeEnd]);
 
   function log(msg) { setStatusMsg(msg); }
 
@@ -2251,9 +2281,12 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
       setVideoLoaded(true);
       setDuration(video.duration);
       setSeekT(0);
+      setRangeStart(0);
+      setRangeEnd(video.duration);
       log('영상 로드됨: ' + video.duration.toFixed(2) + '초, ' + video.videoWidth + 'x' + video.videoHeight + '. TAB 영역을 드래그로 지정하세요.');
       try { await video.play(); video.pause(); } catch (err) {}
       await seekTo(video, 0);
+      updatePreprocPreview();
     };
   }
 
@@ -2261,7 +2294,71 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
     const t = parseFloat(e.target.value);
     setSeekT(t);
     await seekTo(videoRef.current, t);
+    updatePreprocPreview();
   }
+
+  function startRangeDrag(e, which) {
+    e.preventDefault();
+    rangeDragRef.current = which;
+  }
+  useEffect(() => {
+    async function onMove(e) {
+      const which = rangeDragRef.current;
+      const dur = durationRef.current;
+      if (!which || !rangeTrackRef.current || !dur) return;
+      const rect = rangeTrackRef.current.getBoundingClientRect();
+      const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      let t = pct * dur;
+      if (which === 'start') {
+        t = Math.max(0, Math.min(t, rangeEndRef.current - 0.1));
+        setRangeStart(t);
+      } else {
+        t = Math.min(dur, Math.max(t, rangeStartRef.current + 0.1));
+        setRangeEnd(t);
+      }
+      setSeekT(t);
+      await seekTo(videoRef.current, t);
+      updatePreprocPreview();
+    }
+    function onUp() { rangeDragRef.current = null; }
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+  }, []);
+
+  // 전/후 비교 미리보기 — ROI/설정을 바꿀 때 확인 없이도 결과를 가늠할 수 있게, "원본(ROI 크롭만)"과
+  // "전처리 후"를 현재 프레임 기준으로 나란히 보여준다. 반드시 원본 해상도로 처리한 뒤 표시용으로만
+  // 축소한다(despeckle 스펙클 노이즈 방지 — 스티칭 단계와 동일한 순서).
+  function updatePreprocPreview() {
+    const video = videoRef.current;
+    if (!video || !video.videoWidth) return;
+    const captured = captureRoiNative(video, roi); // 원본 해상도 크롭 (모듈 공용 캔버스 → dataURL로 즉시 회수)
+    const raw = ppRawRef.current, processed = ppProcessedRef.current;
+    if (!raw || !processed) return;
+    loadImage(captured.dataUrl).then(img => {
+      const maxW = 420;
+      const scale = Math.min(1, maxW / img.naturalWidth);
+      const dw = Math.round(img.naturalWidth * scale), dh = Math.round(img.naturalHeight * scale);
+      raw.width = dw; raw.height = dh;
+      raw.getContext('2d').drawImage(img, 0, 0, dw, dh);
+
+      const full = document.createElement('canvas');
+      full.width = img.naturalWidth; full.height = img.naturalHeight;
+      full.getContext('2d').drawImage(img, 0, 0);
+      scrollApplyPreprocInPlace(full, scrollDefaults); // 원본 해상도에서 처리
+      processed.width = dw; processed.height = dh;
+      processed.getContext('2d').drawImage(full, 0, 0, dw, dh); // 표시용으로만 축소
+    });
+  }
+  // ROI나 전처리 설정이 바뀔 때마다 갱신 — 드래그 중 과도하게 자주 다시 그리지 않도록 살짝 debounce.
+  useEffect(() => {
+    if (!videoLoaded) return;
+    const t = setTimeout(updatePreprocPreview, 150);
+    return () => clearTimeout(t);
+  }, [roi, scrollDefaults, videoLoaded]);
 
   function drawChart(times, diffs, th) {
     const canvas = chartRef.current;
@@ -2294,13 +2391,16 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
     setAnalysis(null);
     const video = videoRef.current;
     const step = parseFloat(stepSec) || 0.2;
-    const dur = video.duration;
-    const totalSteps = Math.max(1, Math.ceil(dur / step));
+    // 트림된 구간(rangeStart~rangeEnd) 안에서만 분석 — 페이지 전환형 CaptureStep과 동일하게, 불필요한
+    // 인트로/아웃트로가 diff/burst 판정에 끼어들지 않도록 기본값은 영상 전체(0~duration)로 시작한다.
+    const rangeS = Math.max(0, Math.min(rangeStart, video.duration));
+    const rangeE = Math.max(rangeS, Math.min(rangeEnd || video.duration, video.duration));
+    const totalSteps = Math.max(1, Math.ceil((rangeE - rangeS) / step));
     const times = [], diffs = [];
     let prevSample = null;
     try {
-      let t = 0, idx = 0;
-      while (t < dur) {
+      let t = rangeS, idx = 0;
+      while (t < rangeE) {
         await seekTo(video, t);
         const sample = getRoiPixelsForDiff(video, roi);
         times.push(t);
@@ -2308,7 +2408,7 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
         prevSample = sample;
         idx++;
         setAnalyzeProgress(Math.min(100, Math.round((idx / totalSteps) * 100)));
-        if (idx % 10 === 0) log('분석 중... ' + t.toFixed(1) + 's / ' + dur.toFixed(1) + 's');
+        if (idx % 10 === 0) log('분석 중... ' + t.toFixed(1) + 's / ' + rangeE.toFixed(1) + 's');
         t += step;
       }
       setAnalyzeProgress(100);
@@ -2349,14 +2449,13 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
         repFrames.push({ time: t, canvas: c });
         log('대표 프레임 추출 중... ' + (k + 1) + '/' + repIdx.length);
       }
-      log('전처리 · 이어붙이기 · 마디선 검출 진행 중...');
+      log('전처리 · 이어붙이기 진행 중...');
       const stage3 = await runScrollStage3(repFrames, scrollDefaults, direction);
       const flaggedBursts = flagOutlierBursts(bursts, times);
       onDone({
         videoFile, roi, direction: stage3.direction, directionNcc: stage3.directionNcc,
         repFrameTimes: repFrames.map(f => f.time),
-        stitchedCanvas: stage3.canvas, seams: stage3.seams, bars: stage3.bars,
-        staffFound: stage3.staffFound, bursts: flaggedBursts,
+        stitchedCanvas: stage3.canvas, seams: stage3.seams, bursts: flaggedBursts,
       });
     } catch (err) {
       log('처리 중 오류: ' + err.message);
@@ -2371,7 +2470,8 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
         <p className="hint-text">
           화면이 계속 흐르듯 넘어가는(스크롤형) 영상용입니다. 영상을 고른 뒤 TAB 영역을 드래그로 지정하고,
           "분석 시작"으로 이동/정지 구간을 계산한 다음 임계값 슬라이더로 스크롤 구간을 조정하세요.
-          "대표 프레임 확정"을 누르면 전처리 → 이어붙이기 → 마디선 검출까지 자동으로 이어서 진행됩니다.
+          "대표 프레임 확정"을 누르면 전처리 → 이어붙이기까지 자동으로 이어서 진행되고, 마디선 검출은
+          다음 화면에서 슬라이더로 직접 조정하며 확인할 수 있습니다.
         </p>
         <div className="controls">
           <label>영상 파일: <input type="file" accept="video/*" onChange={handleFileChange} /></label>
@@ -2399,12 +2499,47 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
             <span className="slider-label" style={{ margin: 0, whiteSpace: 'nowrap' }}>{seekT.toFixed(1)}s / {duration.toFixed(1)}s</span>
           </label>
         </div>
+
+        <div className="slider-label" style={{ marginTop: '10px' }}>
+          분석할 구간 선택 — {rangeStart.toFixed(1)}s ~ {rangeEnd.toFixed(1)}s (비워두면 영상 전체가 대상 — 불필요한 인트로/아웃트로를
+          빼면 스크롤(burst) 판정이 더 정확해집니다)
+        </div>
+        {videoLoaded && (
+          <div className="range-slider-track" ref={rangeTrackRef}>
+            <div className="range-slider-fill" style={{
+              left: (rangeStart / duration * 100) + '%',
+              width: ((rangeEnd - rangeStart) / duration * 100) + '%',
+            }} />
+            <div className="range-slider-handle" style={{ left: (rangeStart / duration * 100) + '%' }}
+              onPointerDown={e => startRangeDrag(e, 'start')} title={'시작: ' + rangeStart.toFixed(1) + 's'} />
+            <div className="range-slider-handle" style={{ left: (rangeEnd / duration * 100) + '%' }}
+              onPointerDown={e => startRangeDrag(e, 'end')} title={'끝: ' + rangeEnd.toFixed(1) + 's'} />
+          </div>
+        )}
         <div className="toolbar">
+          <button className="icon-btn" onClick={() => { setRangeStart(0); setRangeEnd(duration); }} disabled={!videoLoaded}>구간 초기화(전체)</button>
           <button className="icon-btn" onClick={() => setRoi(null)} disabled={!roi}>영역 초기화</button>
         </div>
       </div>
 
       <ScrollPreprocPanel scrollDefaults={scrollDefaults} setScrollDefaults={setScrollDefaults} />
+
+      {videoLoaded && (
+        <div className="block">
+          <div className="block-head"><span>전처리 전/후 미리보기 (현재 프레임 기준)</span></div>
+          <p className="hint-text">ROI를 지정하거나 위 전처리 설정을 바꾸면 자동으로 갱신됩니다. 실제로는 항상 원본 해상도로 처리한 뒤 여기서는 표시용으로만 축소합니다.</p>
+          <div className="row" style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+            <div>
+              <div className="slider-label">원본 (ROI 크롭만)</div>
+              <canvas ref={ppRawRef} style={{ maxWidth: '420px', height: 'auto', border: '1px solid var(--border-strong)' }} />
+            </div>
+            <div>
+              <div className="slider-label">전처리 후</div>
+              <canvas ref={ppProcessedRef} style={{ maxWidth: '420px', height: 'auto', border: '1px solid var(--border-strong)' }} />
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="block">
         <div className="toolbar">
@@ -2657,7 +2792,7 @@ function GroupOverridePanel({ videoRef, scrollDefaults, roi, onApply, onCancel }
 }
 
 function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onModeBack }) {
-  const { videoFile, roi, direction, directionNcc, repFrameTimes, stitchedCanvas, seams, bars, staffFound, bursts } = scrollCapture;
+  const { videoFile, roi, direction, directionNcc, repFrameTimes, stitchedCanvas, seams, bursts } = scrollCapture;
   const [groupSize, setGroupSize] = useState(4);
   const [maxBarsPerGroup, setMaxBarsPerGroup] = useState(8);
   const [overrides, setOverrides] = useState({}); // key `${startIdx}-${endIdx}` -> dataUrl
@@ -2665,14 +2800,44 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
   const [sending, setSending] = useState(false);
   const groupResultRef = useRef(null);
 
+  // 마디선 감지 임계값 — 재클릭 없이 슬라이더로 바로 조정 가능해야 하므로 여기서 상태로 갖고
+  // 있다가, detectStaffAndBars 하나만(재이름 과정에서 다른 호출부가 남아있을 여지 자체가 없음)
+  // 항상 거쳐서 재검출한다. 슬라이더를 드래그하는 동안 매 틱마다 O(전체 픽셀) 재계산이 도는 걸
+  // 막기 위해 표시값(Input)과 실제 계산에 쓰는 값(Thresh)을 분리해 살짝 debounce한다.
+  const [staffThreshInput, setStaffThreshInput] = useState(0.6);
+  const [barThreshInput, setBarThreshInput] = useState(0.85);
+  const [staffThresh, setStaffThresh] = useState(0.6);
+  const [barThresh, setBarThresh] = useState(0.85);
+  useEffect(() => {
+    const t = setTimeout(() => { setStaffThresh(staffThreshInput); setBarThresh(barThreshInput); }, 200);
+    return () => clearTimeout(t);
+  }, [staffThreshInput, barThreshInput]);
+
+  const detection = useMemo(
+    () => detectStaffAndBars(stitchedCanvas, staffThresh, barThresh),
+    [stitchedCanvas, staffThresh, barThresh]
+  );
+  const bars = detection.bars;
+  const staffFound = detection.staffFound;
   const measureCount = Math.max(0, bars.length - 1);
-  // 파라미터(N, 최대 마디수)를 바꾸면 버튼 재클릭 없이 여기서 즉시 재계산(리플로우) — 스티칭/
-  // 마디선 검출은 다시 하지 않고 캐시된 stitchedCanvas/bars를 그대로 재사용한다.
-  const groups = groupBarsByTargetWidth(bars, groupSize, maxBarsPerGroup);
+
+  // 마디선이 0개(또는 부족)여도 다음 단계를 막지 않는다 — "마디선 없이 스티칭 결과 전체를 그대로
+  // 하나의 이미지로 사용" 폴백. 사용자가 아직 이 체크박스를 직접 만지지 않았다면 마디가 1개 미만일
+  // 때 자동으로 제안(선택)해두고, 한 번이라도 직접 바꾸면 그 이후로는 마디 수와 무관하게 사용자
+  // 선택을 그대로 따른다.
+  const [wholeImageFallback, setWholeImageFallback] = useState(null);
+  const effectiveFallback = wholeImageFallback !== null ? wholeImageFallback : measureCount < 1;
+  const stitchAxisLen = direction === 'vertical' ? stitchedCanvas.height : stitchedCanvas.width;
+
+  // 파라미터(N, 최대 마디수, 임계값, 폴백)를 바꾸면 버튼 재클릭 없이 여기서 즉시 재계산(리플로우) —
+  // 스티칭은 다시 하지 않고 캐시된 stitchedCanvas를 그대로 재사용한다.
+  const groups = effectiveFallback
+    ? [{ startIdx: 0, endIdx: measureCount, startX: 0, endX: stitchAxisLen, count: measureCount || null, whole: true }]
+    : groupBarsByTargetWidth(bars, groupSize, maxBarsPerGroup);
 
   const groupsWithMeta = groups.map((g, idx) => {
     const confidence = groupConfidence(seams, g.startX, g.endX);
-    const key = g.startIdx + '-' + g.endIdx;
+    const key = g.whole ? 'whole' : (g.startIdx + '-' + g.endIdx);
     const override = overrides[key];
     const timeRange = frameTimeRangeForSpan(seams, repFrameTimes, g.startX, g.endX);
     return { ...g, key, confidence, lowConfidence: confidence < 0.7, override, timeRange };
@@ -2724,17 +2889,45 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
         <div className="block-head"><span>결과 — 이어붙이기 · 마디선 · 그룹 (재조정 가능)</span></div>
         <p className="hint-text">
           방향: {direction === 'vertical' ? '세로' : '가로'} 스크롤{directionNcc != null ? ' (첫 이음매 NCC=' + directionNcc.toFixed(3) + ')' : ''} ·
-          이어붙인 프레임 {repFrameTimes.length}장 · {staffFound ? ('6선 감지됨, 마디 ' + measureCount + '개') : '6선을 찾지 못했습니다 — 마디 인식 임계값 조정이 필요할 수 있습니다.'}
+          이어붙인 프레임 {repFrameTimes.length}장
         </p>
         {outlierBursts.length > 0 && (
           <p className="hint-text" style={{ color: '#c0392b' }}>
             ⚠ 다른 구간보다 유독 길거나 짧은 스크롤 구간이 {outlierBursts.length}개 있습니다 (아래 그룹 중 테두리가 강조된 곳을 확인하세요).
           </p>
         )}
+
+        <div className="hr" />
         <div className="toolbar">
-          <label>몇 마디씩 묶기(목표): <input type="number" min="1" max="16" value={groupSize}
+          <label style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span className="slider-label" style={{ margin: 0, whiteSpace: 'nowrap' }}>6선 감지 임계값</span>
+            <input type="range" min="0.1" max="0.95" step="0.01" value={staffThreshInput} style={{ flex: 1 }}
+              onChange={e => setStaffThreshInput(parseFloat(e.target.value))} />
+            <span className="slider-label" style={{ margin: 0 }}>{staffThreshInput.toFixed(2)}</span>
+          </label>
+        </div>
+        <div className="toolbar">
+          <label style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span className="slider-label" style={{ margin: 0, whiteSpace: 'nowrap' }}>마디선 감지 임계값</span>
+            <input type="range" min="0.1" max="0.98" step="0.01" value={barThreshInput} style={{ flex: 1 }}
+              onChange={e => setBarThreshInput(parseFloat(e.target.value))} />
+            <span className="slider-label" style={{ margin: 0 }}>{barThreshInput.toFixed(2)}</span>
+          </label>
+        </div>
+        <p className="hint-text" style={{ margin: '4px 0' }}>
+          {staffFound ? ('6선 감지됨 · 마디선 ' + bars.length + '개 (마디 ' + measureCount + '개) 검출됨') : '6선을 찾지 못했습니다.'}
+          {measureCount < 1 && ' — 마디선이 부족합니다. 임계값을 낮춰보거나, 아래 "마디선 없이 전체 사용"을 켜세요.'}
+        </p>
+        <div className="toolbar">
+          <label><input type="checkbox" checked={effectiveFallback} onChange={e => setWholeImageFallback(e.target.checked)} />
+            마디선 없이 스티칭 결과 전체를 그대로 하나의 이미지로 사용</label>
+        </div>
+
+        <div className="hr" />
+        <div className="toolbar">
+          <label>몇 마디씩 묶기(목표): <input type="number" min="1" max="16" value={groupSize} disabled={effectiveFallback}
             onChange={e => setGroupSize(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
-          <label>그룹당 최대 마디수: <input type="number" min="1" max="20" value={maxBarsPerGroup}
+          <label>그룹당 최대 마디수: <input type="number" min="1" max="20" value={maxBarsPerGroup} disabled={effectiveFallback}
             onChange={e => setMaxBarsPerGroup(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
           <span className="save-msg">{measureCount}마디 → {groups.length}개 그룹</span>
         </div>
@@ -2764,7 +2957,7 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
               <div key={g.key} className="block" style={g.lowConfidence ? { borderColor: '#c0392b', borderWidth: '2px' } : undefined}>
                 <div className="block-head">
                   <span>
-                    그룹 {idx + 1}: {g.count}마디
+                    그룹 {idx + 1}: {g.whole ? '전체 (마디선 미사용)' : (g.count + '마디')}
                     {g.lowConfidence && <b style={{ color: '#c0392b' }}> · 저신뢰 구간 (NCC {g.confidence.toFixed(2)})</b>}
                     {g.override && <span className="save-msg"> · 수동으로 다시 만듦</span>}
                   </span>
@@ -2787,7 +2980,7 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
       <div className="toolbar">
         <button className="icon-btn" onClick={onBack} disabled={sending}>← 대표 프레임 다시 고르기</button>
         <button className="icon-btn" onClick={onModeBack} disabled={sending}>모드 다시 선택</button>
-        <button onClick={handleSendToScoreBuilder} disabled={sending || groups.length === 0}>
+        <button onClick={handleSendToScoreBuilder} disabled={sending}>
           {sending ? '전달 중...' : 'TAB 악보 만들기로 넘기기 (' + groups.length + '개) →'}
         </button>
       </div>
@@ -2867,13 +3060,16 @@ function App() {
       {mode === null && (
         <div className="block">
           <div className="block-head"><span>1단계 — 영상 종류 선택</span></div>
-          <p className="hint-text">
-            영상이 화면 전체가 툭툭 바뀌며 넘어가면 "페이지 전환형", 화면이 스크롤하듯 계속 흐르면(예: 화면이 옆으로 밀려가는
-            TAB) "스크롤형"을 고르세요.
-          </p>
-          <div className="toolbar">
-            <button onClick={() => setMode('page')}>페이지 전환형</button>
-            <button onClick={() => setMode('scroll')}>스크롤형</button>
+          <p className="hint-text">영상이 어떤 방식으로 넘어가는지에 따라 처리 방식이 완전히 다릅니다 — 맞는 쪽을 골라주세요.</p>
+          <div className="mode-card-row">
+            <button className="mode-card" onClick={() => setMode('page')}>
+              <div className="mode-card-title">페이지 전환형</div>
+              <div className="mode-card-desc">화면이 통째로 다음 페이지로 넘어가는 영상</div>
+            </button>
+            <button className="mode-card" onClick={() => setMode('scroll')}>
+              <div className="mode-card-title">스크롤형</div>
+              <div className="mode-card-desc">화면이 멈추지 않고 계속 옆/위로 흘러가듯 넘어가는 영상</div>
+            </button>
           </div>
         </div>
       )}
