@@ -232,6 +232,93 @@ function despeckleBinary(imageData, w, h, maxArea) {
   }
 }
 
+// Copied verbatim from tab-score-builder.html (rgbToHsv/hueDist/scanVerticalRuns/detectPlayheadRuns/
+// removePlayheadRuns) — used only by the new scroll-mode pipeline further down this file, through its
+// own applyPreprocInPlace. The page-transition flow's drawProcessed above never calls these (see its
+// comment).
+function rgbToHsv(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  const d = max - min;
+  let h = 0;
+  if (d !== 0) {
+    if (max === r) h = ((g - b) / d) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+    if (h < 0) h += 360;
+  }
+  const s = max === 0 ? 0 : d / max;
+  return { h, s, v: max };
+}
+function hueDist(a, b) {
+  const d = Math.abs(a - b) % 360;
+  return d > 180 ? 360 - d : d;
+}
+function scanVerticalRuns(imageData, w, h, isMatchFn, minRunRatio, maxRunWidthPx) {
+  const d = imageData.data;
+  const colMatch = new Uint8Array(w);
+  for (let x = 0; x < w; x++) {
+    let hits = 0;
+    for (let y = 0; y < h; y++) {
+      const i = (y * w + x) * 4;
+      if (isMatchFn(d[i], d[i + 1], d[i + 2])) hits++;
+    }
+    colMatch[x] = (hits / h) >= minRunRatio ? 1 : 0;
+  }
+  const runs = [];
+  let x = 0;
+  while (x < w) {
+    if (!colMatch[x]) { x++; continue; }
+    const startX = x;
+    while (x < w && colMatch[x]) x++;
+    const endX = x;
+    if (!maxRunWidthPx || (endX - startX) <= maxRunWidthPx) {
+      runs.push({ startX, endX, centerXPct: ((startX + endX) / 2 / w) * 100 });
+    }
+  }
+  return runs;
+}
+function detectPlayheadRuns(imageData, w, h, colorBand) {
+  const band = colorBand || { hue: 210, hueTolerance: 35, satMin: 0.35 };
+  const isMatch = (r, g, b) => {
+    const { h: hue, s: sat } = rgbToHsv(r, g, b);
+    return sat >= band.satMin && hueDist(hue, band.hue) <= band.hueTolerance;
+  };
+  const runs = scanVerticalRuns(imageData, w, h, isMatch, 0.6, 14);
+  return runs.map(r => ({ ...r, key: Math.round(r.centerXPct * 2) / 2 }));
+}
+function removePlayheadRuns(imageData, w, h, runs, excludedKeys, fillColor) {
+  const fill = fillColor || { r: 255, g: 255, b: 255 };
+  const excluded = new Set(excludedKeys || []);
+  const d = imageData.data;
+  for (const run of runs) {
+    if (excluded.has(run.key)) continue;
+    const x0 = Math.max(0, run.startX - 1), x1 = Math.min(w, run.endX + 1);
+    for (let y = 0; y < h; y++) {
+      for (let x = x0; x < x1; x++) {
+        const i = (y * w + x) * 4;
+        d[i] = fill.r; d[i + 1] = fill.g; d[i + 2] = fill.b; d[i + 3] = 255;
+      }
+    }
+  }
+}
+// avg luminance from an already-captured canvas (not an Image element) — same downscale+average
+// approach as sampleAvgLuminance above, adapted for the scroll pipeline's canvas-based frames instead
+// of re-wrapping them as <img> elements just to reuse that function.
+function computeAvgLuminanceFromCanvas(canvas) {
+  const w = 60;
+  const h = Math.max(1, Math.round((60 * canvas.height) / canvas.width));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const ctx = c.getContext('2d');
+  ctx.drawImage(canvas, 0, 0, w, h);
+  const d = ctx.getImageData(0, 0, w, h).data;
+  let sum = 0, n = 0;
+  for (let i = 0; i < d.length; i += 4) { sum += 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2]; n++; }
+  return sum / n;
+}
+
 function clampPct(v) { return Math.min(100, Math.max(0, v || 0)); }
 function clampCropPair(a, b) {
   a = clampPct(a); b = clampPct(b);
@@ -245,9 +332,11 @@ function clampCropPair(a, b) {
 }
 
 // drawProcessed itself is copied verbatim from tab-score-builder.html. Its s.playheadRemove branch
-// is dead code here (this page's settings always set playheadRemove:false, since playhead removal
-// isn't exposed in this page's UI — out of this task's scope), so detectPlayheadRuns/removePlayheadRuns
-// are intentionally NOT copied; that branch is simply never entered.
+// stays dead code here (the page-transition flow's own settings always set playheadRemove:false,
+// since playhead removal isn't exposed in THAT flow's UI — out of scope for it) — but
+// detectPlayheadRuns/removePlayheadRuns themselves ARE copied below (also verbatim from
+// tab-score-builder.html), because the new scroll-mode pipeline further down this file does use
+// them, through its own separate applyPreprocInPlace, not through this function.
 function drawProcessed(canvas, img, s) {
   const W = img.naturalWidth, H = img.naturalHeight;
   const [cropTop, cropBottom] = clampCropPair(s.cropTop, s.cropBottom);
@@ -1571,7 +1660,1145 @@ function PreprocessStep({ items, setItems, defaults, setDefaults, videoFile, ons
   );
 }
 
+// ================================================================================================
+// ==== SCROLL MODE (새 모드) — scroll-stitch-test.html에서 검증된 알고리즘을 그대로 이식.
+// 겹침 탐색(NCC)/마디선 기하 검출은 프로토타입 그대로이고, "N마디씩 그룹핑"만 이번 스펙대로
+// (고정 마디수가 아니라 목표 픽셀폭 기반으로) 새로 작성했다. 전처리는 이 파일 상단의 기존
+// applyThreshold/despeckleBinary/detectPlayheadRuns/removePlayheadRuns를 그대로 재사용한다
+// (재구현 없음) — scrollApplyPreprocInPlace는 그 원시 함수들을 drawProcessed와 동일한 순서로
+// "제자리에서"(크롭 없이) 적용하는 아주 얇은 래퍼일 뿐이다.
+// 페이지 전환형(CaptureStep/SelectStep/PreprocessStep, drawProcessed, effectiveImageSettings 등)은
+// 이 섹션에서 전혀 건드리지 않는다 — 이름 충돌이 있는 것만(detectStaffBand) 접두사를 바꿨다.
+// ================================================================================================
+
+const SCROLL_PLAYHEAD_HUE_DEFAULT = 210;
+const SCROLL_PLAYHEAD_HUE_TOLERANCE_DEFAULT = 35;
+const SCROLL_PLAYHEAD_SAT_MIN_DEFAULT = 0.35;
+
+const SCROLL_DEFAULTS_INIT = {
+  removeBg: true, invertMode: 'auto', threshold: 140, softness: 18,
+  despeckle: true, despeckleSize: 3,
+  playheadRemove: false, playheadColor: null, // null = SCROLL_PLAYHEAD_* 기본값 사용
+};
+
+// drawProcessed와 동일한 순서(재생 커서 제거 → 배경 threshold[+자동 반전 판단] → 잡티 제거)로,
+// 이미 원본 해상도로 캡처된 canvas에 "크롭 없이 제자리에서" 적용한다 — 대표 프레임은 스티칭 전에
+// 반드시 이 순서(원본 해상도에서 전처리 먼저, 축소는 나중)를 지켜야 스페클 노이즈가 생기지 않는다.
+function scrollApplyPreprocInPlace(canvas, opts) {
+  if (!opts.removeBg && !opts.playheadRemove) return;
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  if (opts.playheadRemove) {
+    const imageData = ctx.getImageData(0, 0, w, h);
+    const band = opts.playheadColor || {
+      hue: SCROLL_PLAYHEAD_HUE_DEFAULT, hueTolerance: SCROLL_PLAYHEAD_HUE_TOLERANCE_DEFAULT, satMin: SCROLL_PLAYHEAD_SAT_MIN_DEFAULT,
+    };
+    const runs = detectPlayheadRuns(imageData, w, h, band);
+    removePlayheadRuns(imageData, w, h, runs, [], { r: 255, g: 255, b: 255 });
+    ctx.putImageData(imageData, 0, 0);
+  }
+  if (opts.removeBg) {
+    const avg = computeAvgLuminanceFromCanvas(canvas);
+    const invert = opts.invertMode === 'auto' ? (avg < 128) : (opts.invertMode === 'on');
+    const imageData = ctx.getImageData(0, 0, w, h);
+    applyThreshold(imageData, opts.threshold, invert, opts.softness || 0);
+    if (opts.despeckle) despeckleBinary(imageData, w, h, opts.despeckleSize || 0);
+    ctx.putImageData(imageData, 0, 0);
+  }
+}
+
+// ---- NCC 기반 겹침 탐색 + 이어붙이기 — scroll-stitch-test.html에서 그대로 이식 ----
+
+function scrollGetGray(canvas, maxDim) {
+  const w0 = canvas.width, h0 = canvas.height;
+  const scale = maxDim ? Math.min(1, maxDim / Math.max(w0, h0)) : 1;
+  const w = Math.max(1, Math.round(w0 * scale)), h = Math.max(1, Math.round(h0 * scale));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  c.getContext('2d').drawImage(canvas, 0, 0, w, h);
+  const data = c.getContext('2d').getImageData(0, 0, w, h).data;
+  const gray = new Float32Array(w * h);
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    gray[p] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+  }
+  return { gray, w, h, scale };
+}
+
+function scrollNcc(arrA, arrB, n) {
+  let meanA = 0, meanB = 0;
+  for (let i = 0; i < n; i++) { meanA += arrA[i]; meanB += arrB[i]; }
+  meanA /= n; meanB /= n;
+  let num = 0, denA = 0, denB = 0;
+  for (let i = 0; i < n; i++) {
+    const da = arrA[i] - meanA, db = arrB[i] - meanB;
+    num += da * db; denA += da * da; denB += db * db;
+  }
+  if (denA < 1e-6 || denB < 1e-6) return -1;
+  return num / Math.sqrt(denA * denB);
+}
+
+function scrollScoreShift(gA, gB, direction, s, W, H) {
+  const bufA = [], bufB = [];
+  if (direction === 'vertical') {
+    const overlapH = H - s;
+    if (overlapH < 4) return null;
+    for (let y = 0; y < overlapH; y++) {
+      const yA = y + s, yB = y;
+      for (let x = 0; x < W; x++) {
+        bufA.push(gA.gray[yA * gA.w + x]);
+        bufB.push(gB.gray[yB * gB.w + x]);
+      }
+    }
+  } else {
+    const overlapW = W - s;
+    if (overlapW < 4) return null;
+    for (let x = 0; x < overlapW; x++) {
+      const xA = x + s, xB = x;
+      for (let y = 0; y < H; y++) {
+        bufA.push(gA.gray[y * gA.w + xA]);
+        bufB.push(gB.gray[y * gB.w + xB]);
+      }
+    }
+  }
+  return scrollNcc(bufA, bufB, bufA.length);
+}
+
+// 최소-겹침 편향 버그 방지: 최고 NCC 대비 tolerance(0.03) 이내인 shift들 중 "가장 작은 shift"
+// (=가장 많이 겹치는 지점)를 채택 — 단순 최대NCC 채택 금지 (탐색범위 s는 오름차순이므로 첫 번째
+// 통과 항목이 곧 가장 작은 shift다).
+function scrollFindBestShift(canvasA, canvasB, direction) {
+  const SEARCH_MAXDIM = 220;
+  const gA = scrollGetGray(canvasA, SEARCH_MAXDIM);
+  const gB = scrollGetGray(canvasB, SEARCH_MAXDIM);
+  const W = Math.min(gA.w, gB.w), H = Math.min(gA.h, gB.h);
+
+  const totalLen = direction === 'vertical' ? H : W;
+  const minLen = Math.max(2, Math.round(totalLen * 0.15));
+  const maxLen = Math.round(totalLen * 0.85);
+
+  const scores = [];
+  for (let s = minLen; s <= maxLen; s++) {
+    const sc = scrollScoreShift(gA, gB, direction, s, W, H);
+    if (sc !== null) scores.push({ s, ncc: sc });
+  }
+  if (scores.length === 0) return { shift: 0, score: -1, ok: false };
+
+  let bestNcc = -Infinity;
+  for (const it of scores) if (it.ncc > bestNcc) bestNcc = it.ncc;
+
+  const TOLERANCE = 0.03;
+  let chosen = scores[0];
+  for (const it of scores) {
+    if (it.ncc >= bestNcc - TOLERANCE) { chosen = it; break; }
+  }
+
+  const shiftFull = Math.round(chosen.s / gA.scale);
+  return { shift: shiftFull, score: chosen.ncc, ok: chosen.ncc > 0.5 };
+}
+
+function scrollFindBestShiftAuto(canvasA, canvasB) {
+  const v = scrollFindBestShift(canvasA, canvasB, 'vertical');
+  const h = scrollFindBestShift(canvasA, canvasB, 'horizontal');
+  if (h.score > v.score) return { direction: 'horizontal', ...h };
+  return { direction: 'vertical', ...v };
+}
+
+// 중복 프레임 스킵: shift=0 상태(오프셋 탐색 없이 전체 프레임)에서 NCC ≥ 0.9면 "실제 스크롤
+// 없었음"으로 보고 해당 쌍을 스티칭에서 완전히 제외한다.
+const SCROLL_DUP_SIMILARITY_THRESHOLD = 0.9;
+function scrollIsDuplicateFrame(canvasA, canvasB) {
+  const SEARCH_MAXDIM = 220;
+  const gA = scrollGetGray(canvasA, SEARCH_MAXDIM);
+  const gB = scrollGetGray(canvasB, SEARCH_MAXDIM);
+  const W = Math.min(gA.w, gB.w), H = Math.min(gA.h, gB.h);
+  const bufA = [], bufB = [];
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      bufA.push(gA.gray[y * gA.w + x]);
+      bufB.push(gB.gray[y * gB.w + x]);
+    }
+  }
+  const sim = scrollNcc(bufA, bufB, bufA.length);
+  return { isDup: sim >= SCROLL_DUP_SIMILARITY_THRESHOLD, sim };
+}
+
+// ---- 마디선(bar-line) 기하 검출 — scroll-stitch-test.html에서 그대로 이식 (OCR/ML 없음) ----
+// detectStaffBand라는 이름은 이 파일의 기존 배치-합치기(mergeImagesIntoRow) 기능에 이미 쓰이고
+//있어(다른 알고리즘) detectStaffYBand로만 이름을 바꿨다 — 로직 자체는 프로토타입과 동일하다.
+
+function scrollGetFullGrayData(canvas) {
+  const ctx = canvas.getContext('2d');
+  const { width: W, height: H } = canvas;
+  const data = ctx.getImageData(0, 0, W, H).data;
+  const gray = new Float32Array(W * H);
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    gray[p] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+  }
+  return { gray, w: W, h: H };
+}
+
+function detectStaffYBand(g, darkThresh, staffLineFrac) {
+  const rowDark = new Float32Array(g.h);
+  for (let y = 0; y < g.h; y++) {
+    let cnt = 0;
+    const base = y * g.w;
+    for (let x = 0; x < g.w; x++) {
+      if (g.gray[base + x] < darkThresh) cnt++;
+    }
+    rowDark[y] = cnt / g.w;
+  }
+  const candidates = [];
+  for (let y = 0; y < g.h; y++) if (rowDark[y] >= staffLineFrac) candidates.push(y);
+  const lines = [];
+  let cluster = [];
+  for (let i = 0; i < candidates.length; i++) {
+    if (cluster.length === 0 || candidates[i] - cluster[cluster.length - 1] <= 2) {
+      cluster.push(candidates[i]);
+    } else {
+      lines.push(Math.round(cluster.reduce((a, b) => a + b, 0) / cluster.length));
+      cluster = [candidates[i]];
+    }
+  }
+  if (cluster.length) lines.push(Math.round(cluster.reduce((a, b) => a + b, 0) / cluster.length));
+  return lines;
+}
+
+function detectBarLines(g, top, bottom, darkThresh, barFrac) {
+  const pad = Math.max(1, Math.round((bottom - top) * 0.03));
+  const y0 = Math.max(0, top - pad), y1 = Math.min(g.h - 1, bottom + pad);
+  const span = y1 - y0 + 1;
+  const colFrac = new Float32Array(g.w);
+  for (let x = 0; x < g.w; x++) {
+    let cnt = 0;
+    for (let y = y0; y <= y1; y++) {
+      if (g.gray[y * g.w + x] < darkThresh) cnt++;
+    }
+    colFrac[x] = cnt / span;
+  }
+  const candidates = [];
+  for (let x = 0; x < g.w; x++) if (colFrac[x] >= barFrac) candidates.push(x);
+
+  const merged = [];
+  let cluster = [];
+  for (let i = 0; i < candidates.length; i++) {
+    if (cluster.length === 0 || candidates[i] - cluster[cluster.length - 1] <= 3) {
+      cluster.push(candidates[i]);
+    } else {
+      merged.push(Math.round(cluster.reduce((a, b) => a + b, 0) / cluster.length));
+      cluster = [candidates[i]];
+    }
+  }
+  if (cluster.length) merged.push(Math.round(cluster.reduce((a, b) => a + b, 0) / cluster.length));
+
+  if (merged.length >= 3) {
+    const gaps = [];
+    for (let i = 1; i < merged.length; i++) gaps.push(merged[i] - merged[i - 1]);
+    const sortedGaps = [...gaps].sort((a, b) => a - b);
+    const medianGap = sortedGaps[Math.floor(sortedGaps.length / 2)] || 1;
+    const minGap = medianGap * 0.3;
+    const filtered = [merged[0]];
+    for (let i = 1; i < merged.length; i++) {
+      if (merged[i] - filtered[filtered.length - 1] < minGap) continue;
+      filtered.push(merged[i]);
+    }
+    return filtered;
+  }
+  return merged;
+}
+
+// ---- N마디씩 그룹핑 — 프로토타입의 단순 고정-N 슬라이싱을 이번 스펙대로 교체 ----
+// N은 고정값이 아니라 "목표값": 목표 픽셀폭 = 이 영상의 평균 마디 폭 × N (해상도 무관, 영상마다
+// 자동 계산). 각 마디선 경계에서, 누적 폭이 목표폭에 가장 가까워지는 마디 수(1~maxBarsPerGroup)를
+// 그리디하게 선택 — 그래서 목표 N에서 ±1마디 정도는 자연스럽게 유동적으로 허용된다.
+function groupBarsByTargetWidth(bars, targetN, maxBarsPerGroup) {
+  maxBarsPerGroup = Math.max(1, maxBarsPerGroup || 8);
+  const measureCount = bars.length - 1;
+  if (measureCount <= 0) return [];
+  const barWidths = [];
+  for (let i = 0; i < measureCount; i++) barWidths.push(bars[i + 1] - bars[i]);
+  const avgBarWidth = barWidths.reduce((a, b) => a + b, 0) / measureCount;
+  const targetPx = avgBarWidth * Math.max(1, targetN);
+
+  const groups = [];
+  let i = 0;
+  while (i < measureCount) {
+    const upper = Math.min(maxBarsPerGroup, measureCount - i);
+    let bestCount = 1, bestDiff = Infinity;
+    for (let c = 1; c <= upper; c++) {
+      const w = bars[i + c] - bars[i];
+      const diff = Math.abs(w - targetPx);
+      if (diff < bestDiff) { bestDiff = diff; bestCount = c; }
+    }
+    groups.push({ startIdx: i, endIdx: i + bestCount, startX: bars[i], endX: bars[i + bestCount], count: bestCount });
+    i += bestCount;
+  }
+  return groups;
+}
+
+// ---- burst(스크롤 이벤트) 그룹핑 — diffs[i]는 times[i]→times[i+1] 전환 ----
+function groupScrollBursts(diffs, threshold) {
+  const movingIdx = [];
+  for (let i = 0; i < diffs.length; i++) if (diffs[i] > threshold) movingIdx.push(i + 1);
+  const bursts = [];
+  let cur = null;
+  for (const mi of movingIdx) {
+    if (cur && mi - cur.end <= 1) cur.end = mi;
+    else { if (cur) bursts.push(cur); cur = { start: mi, end: mi }; }
+  }
+  if (cur) bursts.push(cur);
+  return bursts;
+}
+
+// 각 burst 전/후 프레임(정지 상태) + 처음/끝 프레임, 중복 제거 — 정렬된 고유 인덱스 배열
+function scrollRepIndices(times, bursts) {
+  const idxs = new Set([0, times.length - 1]);
+  for (const b of bursts) {
+    idxs.add(Math.max(0, b.start - 1));
+    idxs.add(Math.min(times.length - 1, b.end + 1));
+  }
+  return [...idxs].sort((a, b) => a - b);
+}
+
+// burst 지속시간이 다른 burst들 대비 이상치인지 (평균 대비 표준편차 1.5배 초과)
+function flagOutlierBursts(bursts, times) {
+  const durations = bursts.map(b => times[Math.min(times.length - 1, b.end + 1)] - times[Math.max(0, b.start - 1)]);
+  const mean = durations.reduce((a, b) => a + b, 0) / Math.max(1, durations.length);
+  const variance = durations.reduce((a, b) => a + (b - mean) * (b - mean), 0) / Math.max(1, durations.length);
+  const std = Math.sqrt(variance);
+  return bursts.map((b, i) => ({
+    ...b, duration: durations[i],
+    isOutlier: std > 0 && Math.abs(durations[i] - mean) > 1.5 * std,
+  }));
+}
+
+// ---- 대표 프레임 확정 즉시: 전처리 → 스티칭 → 마디선 검출 (4단계 자동 실행, 재클릭 없음) ----
+async function runScrollStage3(repFrames, scrollDefaults, directionPref) {
+  // 1) 전처리 — 반드시 원본 해상도에서 먼저 (despeckle 대상 canvas는 이미 captureRoiNative로
+  // 원본 해상도로 캡처됨. 다운스케일은 스티칭 탐색(scrollGetGray)에서만, 별도의 축소 사본으로.)
+  for (const f of repFrames) scrollApplyPreprocInPlace(f.canvas, scrollDefaults);
+
+  // 2) 방향 자동 감지 (첫 프레임 쌍 기준, 이후 동일 방향 유지) + 스티칭
+  let direction = directionPref;
+  let directionNcc = null;
+  if (direction === 'auto' || !direction) {
+    if (repFrames.length >= 2) {
+      const test = scrollFindBestShiftAuto(repFrames[0].canvas, repFrames[1].canvas);
+      direction = test.direction;
+      directionNcc = test.score;
+    } else {
+      direction = 'vertical';
+    }
+  }
+
+  const first = repFrames[0].canvas;
+  const crossLen = direction === 'vertical' ? first.width : first.height;
+  // First pass: decide shift/score/dup for every seam WITHOUT drawing anything yet, so totalLen
+  // (needed to size the output canvas) is known before allocating it.
+  const seamDecisions = [];
+  let totalLen = direction === 'vertical' ? first.height : first.width;
+  for (let i = 0; i < repFrames.length - 1; i++) {
+    const a = repFrames[i].canvas, b = repFrames[i + 1].canvas;
+    const dup = scrollIsDuplicateFrame(a, b);
+    if (dup.isDup) { seamDecisions.push({ i, shift: 0, score: dup.sim, dup: true, ok: true }); continue; }
+    const { shift, score, ok } = scrollFindBestShift(a, b, direction);
+    seamDecisions.push({ i, shift, score, dup: false, ok });
+    totalLen += Math.max(1, shift);
+  }
+
+  const out = document.createElement('canvas');
+  if (direction === 'vertical') { out.width = crossLen; out.height = totalLen; }
+  else { out.width = totalLen; out.height = crossLen; }
+  const octx = out.getContext('2d');
+  octx.fillStyle = '#ffffff';
+  octx.fillRect(0, 0, out.width, out.height);
+
+  // Second pass: actually draw, recording each seam's `pos` — the pixel coordinate (along the
+  // stitch axis) IN THE FINAL CANVAS where that seam's boundary sits — so the result screen can
+  // later tell which N-bar GROUP (a range of x-coordinates) a given seam's low NCC score falls
+  // into, to highlight that specific group as low-confidence.
+  let cursor = 0;
+  if (direction === 'vertical') { octx.drawImage(first, 0, cursor); cursor += first.height; }
+  else { octx.drawImage(first, cursor, 0); cursor += first.width; }
+  const seams = [];
+  for (let i = 0; i < seamDecisions.length; i++) {
+    const d = seamDecisions[i];
+    seams.push({ ...d, pos: cursor });
+    if (d.dup) continue;
+    const bCanvas = repFrames[i + 1].canvas;
+    const shift = Math.max(1, d.shift);
+    if (direction === 'vertical') {
+      const srcY = Math.max(0, bCanvas.height - shift);
+      const h = bCanvas.height - srcY;
+      octx.drawImage(bCanvas, 0, srcY, bCanvas.width, h, 0, cursor, bCanvas.width, h);
+      cursor += h;
+    } else {
+      const srcX = Math.max(0, bCanvas.width - shift);
+      const w = bCanvas.width - srcX;
+      octx.drawImage(bCanvas, srcX, 0, w, bCanvas.height, cursor, 0, w, bCanvas.height);
+      cursor += w;
+    }
+  }
+
+  // 3) 마디(bar-line) 검출
+  const g = scrollGetFullGrayData(out);
+  const darkThresh = 140, staffLineFrac = 0.6, barFrac = 0.85;
+  const staffLines = detectStaffYBand(g, darkThresh, staffLineFrac);
+  let bars = [];
+  if (staffLines.length >= 2) {
+    const top = staffLines[0], bottom = staffLines[staffLines.length - 1];
+    bars = detectBarLines(g, top, bottom, darkThresh, barFrac);
+    if (bars.length && (out.width - bars[bars.length - 1]) > out.width * 0.02) {
+      bars = [...bars, out.width - 1];
+    }
+  }
+
+  return { direction, directionNcc, canvas: out, seams, bars, staffFound: staffLines.length >= 2 };
+}
+// ---- ROI 드래그 선택 UI — CaptureStep과 같은 패턴(별도 컴포넌트로 분리해 스크롤/페이지 두
+// 플로우가 각자의 캔버스 ref를 갖게 함, 상태 공유 없음) ----
+function ScrollRoiPicker({ videoRef, videoLoaded, roi, setRoi }) {
+  const roiCanvasRef = useRef(null);
+  const roiBoxRef = useRef(null);
+  const dragStartRef = useRef(null);
+  const roiRef = useRef(null);
+
+  function drawRoiBoxOverlay() {
+    const box = roiBoxRef.current, canvas = roiCanvasRef.current;
+    if (!box || !canvas) return;
+    const r = roiRef.current;
+    if (!r) { box.style.display = 'none'; return; }
+    const rect = canvas.getBoundingClientRect();
+    box.style.left = (r.x0 * rect.width) + 'px';
+    box.style.top = (r.y0 * rect.height) + 'px';
+    box.style.width = ((r.x1 - r.x0) * rect.width) + 'px';
+    box.style.height = ((r.y1 - r.y0) * rect.height) + 'px';
+    box.style.display = 'block';
+  }
+  useEffect(() => { roiRef.current = roi; drawRoiBoxOverlay(); }, [roi]);
+  useEffect(() => {
+    window.addEventListener('resize', drawRoiBoxOverlay);
+    return () => window.removeEventListener('resize', drawRoiBoxOverlay);
+  }, []);
+
+  function redrawFrame() {
+    const video = videoRef.current, canvas = roiCanvasRef.current;
+    if (!video || !canvas || !video.videoWidth) return;
+    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0);
+    drawRoiBoxOverlay();
+  }
+  useEffect(() => { if (videoLoaded) redrawFrame(); }, [videoLoaded]);
+  // Exposes a redraw hook the parent can call after every scrub seek (video pixels change but this
+  // component isn't otherwise re-rendered by a scrub).
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.addEventListener('seeked', redrawFrame);
+    return () => video.removeEventListener('seeked', redrawFrame);
+  }, [videoLoaded]);
+
+  function canvasPoint(e) {
+    const canvas = roiCanvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width, scaleY = canvas.height / rect.height;
+    return { x: (e.clientX - rect.left) * scaleX, y: (e.clientY - rect.top) * scaleY, scaleX, scaleY };
+  }
+  function onDown(e) { dragStartRef.current = canvasPoint(e); }
+  function onMove(e) {
+    if (!dragStartRef.current) return;
+    const cur = canvasPoint(e);
+    const box = roiBoxRef.current;
+    const x0 = Math.min(dragStartRef.current.x, cur.x) / cur.scaleX;
+    const y0 = Math.min(dragStartRef.current.y, cur.y) / cur.scaleY;
+    const w = Math.abs(cur.x - dragStartRef.current.x) / cur.scaleX;
+    const h = Math.abs(cur.y - dragStartRef.current.y) / cur.scaleY;
+    box.style.left = x0 + 'px'; box.style.top = y0 + 'px';
+    box.style.width = w + 'px'; box.style.height = h + 'px';
+    box.style.display = 'block';
+  }
+  useEffect(() => {
+    function onUp(e) {
+      if (!dragStartRef.current) return;
+      const canvas = roiCanvasRef.current;
+      const start = dragStartRef.current;
+      dragStartRef.current = null;
+      const cur = canvasPoint(e);
+      const curX = Math.max(0, Math.min(canvas.width, cur.x));
+      const curY = Math.max(0, Math.min(canvas.height, cur.y));
+      const x0 = Math.min(start.x, curX), x1 = Math.max(start.x, curX);
+      const y0 = Math.min(start.y, curY), y1 = Math.max(start.y, curY);
+      if (x1 - x0 < 5 || y1 - y0 < 5) return;
+      setRoi({ x0: x0 / canvas.width, y0: y0 / canvas.height, x1: x1 / canvas.width, y1: y1 / canvas.height });
+    }
+    window.addEventListener('mouseup', onUp);
+    return () => window.removeEventListener('mouseup', onUp);
+  }, []);
+
+  return (
+    <div className="roi-wrap">
+      <canvas ref={roiCanvasRef} className="roi-canvas" onMouseDown={onDown} onMouseMove={onMove} />
+      <div ref={roiBoxRef} className="roi-box" />
+    </div>
+  );
+}
+
+// 전처리 설정 패널 — PreprocessStep의 배경제거 컨트롤과 같은 UI 패턴 + 플레이헤드 제거(스크롤
+// 모드에서만 노출, 페이지 전환형 쪽 defaults 오브젝트/UI는 건드리지 않음).
+function ScrollPreprocPanel({ scrollDefaults, setScrollDefaults }) {
+  const [open, setOpen] = useState(false);
+  function update(patch) { setScrollDefaults(prev => ({ ...prev, ...patch })); }
+  const band = scrollDefaults.playheadColor || {
+    hue: SCROLL_PLAYHEAD_HUE_DEFAULT, hueTolerance: SCROLL_PLAYHEAD_HUE_TOLERANCE_DEFAULT, satMin: SCROLL_PLAYHEAD_SAT_MIN_DEFAULT,
+  };
+  return (
+    <div className="block">
+      <div className="block-head">
+        <span>전처리 설정 (배경 제거 · 잡티 제거 · 재생 커서 제거)</span>
+        <button className="icon-btn" onClick={() => setOpen(o => !o)}>{open ? '접기' : '펼치기'}</button>
+      </div>
+      {open && (
+        <div className="controls">
+          <label>
+            <input type="checkbox" checked={scrollDefaults.removeBg} onChange={e => update({ removeBg: e.target.checked })} />
+            배경 제거 (사진 배경 → 흰색)
+          </label>
+          {scrollDefaults.removeBg && (
+            <React.Fragment>
+              <div>
+                <div className="slider-label">어두운 배경 처리</div>
+                <select value={scrollDefaults.invertMode} onChange={e => update({ invertMode: e.target.value })}>
+                  <option value="auto">자동 감지</option>
+                  <option value="on">항상 반전 (어두운 사진 배경)</option>
+                  <option value="off">항상 일반 (밝은/흰 배경)</option>
+                </select>
+              </div>
+              <div>
+                <div className="slider-label">배경 제거 강도 ({scrollDefaults.threshold})</div>
+                <input type="range" min="0" max="255" step="1" value={scrollDefaults.threshold}
+                  onChange={e => update({ threshold: Number(e.target.value) })} />
+              </div>
+              <div>
+                <div className="slider-label">부드러운 경계 ({scrollDefaults.softness})</div>
+                <input type="range" min="0" max="60" step="1" value={scrollDefaults.softness}
+                  onChange={e => update({ softness: Number(e.target.value) })} />
+              </div>
+              <label>
+                <input type="checkbox" checked={scrollDefaults.despeckle} onChange={e => update({ despeckle: e.target.checked })} />
+                잡티(고립 노이즈) 제거
+              </label>
+              {scrollDefaults.despeckle && (
+                <div>
+                  <div className="slider-label">제거할 잡티 크기 ({scrollDefaults.despeckleSize}px 이하)</div>
+                  <input type="range" min="1" max="12" step="1" value={scrollDefaults.despeckleSize}
+                    onChange={e => update({ despeckleSize: Number(e.target.value) })} />
+                </div>
+              )}
+            </React.Fragment>
+          )}
+          <label>
+            <input type="checkbox" checked={scrollDefaults.playheadRemove}
+              onChange={e => update({ playheadRemove: e.target.checked })} />
+            재생 커서(플레이헤드) 색 제거
+          </label>
+          {scrollDefaults.playheadRemove && (
+            <div className="row" style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+              <label>색상(Hue 0~360): <input type="number" value={band.hue} min="0" max="360"
+                onChange={e => update({ playheadColor: { ...band, hue: Number(e.target.value) } })} /></label>
+              <label>허용범위: <input type="number" value={band.hueTolerance} min="1" max="180"
+                onChange={e => update({ playheadColor: { ...band, hueTolerance: Number(e.target.value) } })} /></label>
+              <label>최소채도: <input type="number" value={band.satMin} step="0.05" min="0" max="1"
+                onChange={e => update({ playheadColor: { ...band, satMin: Number(e.target.value) } })} /></label>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone, onModeBack }) {
+  const durationRef = useRef(0);
+  const [videoFile, setVideoFile] = useState(null);
+  const [videoLoaded, setVideoLoaded] = useState(false);
+  const [duration, setDuration] = useState(0);
+  const [seekT, setSeekT] = useState(0);
+  const [roi, setRoi] = useState(null);
+  const [direction, setDirection] = useState('auto');
+  const [stepSec, setStepSec] = useState(0.2);
+  const [analysis, setAnalysis] = useState(null); // {times, diffs}
+  const [threshold, setThreshold] = useState(10);
+  const [thresholdRange, setThresholdRange] = useState({ min: 0, max: 50, step: 0.1 });
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analyzeProgress, setAnalyzeProgress] = useState(0);
+  const [confirming, setConfirming] = useState(false);
+  const [statusMsg, setStatusMsg] = useState('스크롤형 영상 파일을 선택하세요.');
+  const chartRef = useRef(null);
+
+  useEffect(() => { durationRef.current = duration; }, [duration]);
+
+  function log(msg) { setStatusMsg(msg); }
+
+  function handleFileChange(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const video = videoRef.current;
+    video.src = URL.createObjectURL(file);
+    setVideoLoaded(false);
+    setRoi(null);
+    setAnalysis(null);
+    setVideoFile(file);
+    video.onloadedmetadata = async () => {
+      setVideoLoaded(true);
+      setDuration(video.duration);
+      setSeekT(0);
+      log('영상 로드됨: ' + video.duration.toFixed(2) + '초, ' + video.videoWidth + 'x' + video.videoHeight + '. TAB 영역을 드래그로 지정하세요.');
+      try { await video.play(); video.pause(); } catch (err) {}
+      await seekTo(video, 0);
+    };
+  }
+
+  async function onSeekSliderChange(e) {
+    const t = parseFloat(e.target.value);
+    setSeekT(t);
+    await seekTo(videoRef.current, t);
+  }
+
+  function drawChart(times, diffs, th) {
+    const canvas = chartRef.current;
+    if (!canvas || !diffs || diffs.length === 0) return;
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width = canvas.clientWidth;
+    const h = canvas.height = 120;
+    ctx.clearRect(0, 0, w, h);
+    const maxDiff = Math.max(...diffs, 1) * 1.15;
+    ctx.strokeStyle = '#3c3489';
+    ctx.beginPath();
+    diffs.forEach((d, i) => {
+      const x = (i / Math.max(1, diffs.length - 1)) * w;
+      const y = h - (d / maxDiff) * h;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    const ty = h - (th / maxDiff) * h;
+    ctx.strokeStyle = '#cc3333';
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(0, ty); ctx.lineTo(w, ty); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  useEffect(() => { if (analysis) drawChart(analysis.times, analysis.diffs, threshold); }, [threshold, analysis]);
+
+  async function analyze() {
+    if (!videoLoaded) { log('영상을 먼저 선택하세요.'); return; }
+    setAnalyzing(true);
+    setAnalyzeProgress(0);
+    setAnalysis(null);
+    const video = videoRef.current;
+    const step = parseFloat(stepSec) || 0.2;
+    const dur = video.duration;
+    const totalSteps = Math.max(1, Math.ceil(dur / step));
+    const times = [], diffs = [];
+    let prevSample = null;
+    try {
+      let t = 0, idx = 0;
+      while (t < dur) {
+        await seekTo(video, t);
+        const sample = getRoiPixelsForDiff(video, roi);
+        times.push(t);
+        if (prevSample) diffs.push(diffScore(prevSample, sample));
+        prevSample = sample;
+        idx++;
+        setAnalyzeProgress(Math.min(100, Math.round((idx / totalSteps) * 100)));
+        if (idx % 10 === 0) log('분석 중... ' + t.toFixed(1) + 's / ' + dur.toFixed(1) + 's');
+        t += step;
+      }
+      setAnalyzeProgress(100);
+      setAnalysis({ times, diffs });
+      const maxObserved = Math.max(...diffs, 0.1);
+      setThresholdRange({ min: 0, max: maxObserved * 1.3, step: Math.max(0.001, maxObserved / 200) });
+      const initialThreshold = maxObserved * 0.35;
+      setThreshold(initialThreshold);
+      const bursts = groupScrollBursts(diffs, initialThreshold);
+      log('분석 완료. 스크롤(이동) ' + bursts.length + '회 감지 → 대표 프레임 ' + scrollRepIndices(times, bursts).length + '장 예상. 슬라이더로 임계값을 조절해보세요.');
+    } catch (err) {
+      log('분석 중 오류: ' + err.message);
+    } finally {
+      setAnalyzing(false);
+    }
+  }
+
+  const bursts = analysis ? groupScrollBursts(analysis.diffs, threshold) : [];
+  const repCount = analysis ? scrollRepIndices(analysis.times, bursts).length : 0;
+
+  async function confirmAndRun() {
+    if (!analysis) return;
+    setConfirming(true);
+    try {
+      const { times } = analysis;
+      const repIdx = scrollRepIndices(times, bursts);
+      log('대표 프레임 ' + repIdx.length + '장 추출 중...');
+      const video = videoRef.current;
+      const repFrames = [];
+      for (let k = 0; k < repIdx.length; k++) {
+        const t = times[repIdx[k]];
+        await seekTo(video, t);
+        const captured = captureRoiNative(video, roi);
+        const img = await loadImage(captured.dataUrl);
+        const c = document.createElement('canvas');
+        c.width = captured.w; c.height = captured.h;
+        c.getContext('2d').drawImage(img, 0, 0);
+        repFrames.push({ time: t, canvas: c });
+        log('대표 프레임 추출 중... ' + (k + 1) + '/' + repIdx.length);
+      }
+      log('전처리 · 이어붙이기 · 마디선 검출 진행 중...');
+      const stage3 = await runScrollStage3(repFrames, scrollDefaults, direction);
+      const flaggedBursts = flagOutlierBursts(bursts, times);
+      onDone({
+        videoFile, roi, direction: stage3.direction, directionNcc: stage3.directionNcc,
+        repFrameTimes: repFrames.map(f => f.time),
+        stitchedCanvas: stage3.canvas, seams: stage3.seams, bars: stage3.bars,
+        staffFound: stage3.staffFound, bursts: flaggedBursts,
+      });
+    } catch (err) {
+      log('처리 중 오류: ' + err.message);
+      setConfirming(false);
+    }
+  }
+
+  return (
+    <div>
+      <div className="block">
+        <div className="block-head"><span>스크롤형 — TAB 영역 지정 및 대표 프레임 추출</span></div>
+        <p className="hint-text">
+          화면이 계속 흐르듯 넘어가는(스크롤형) 영상용입니다. 영상을 고른 뒤 TAB 영역을 드래그로 지정하고,
+          "분석 시작"으로 이동/정지 구간을 계산한 다음 임계값 슬라이더로 스크롤 구간을 조정하세요.
+          "대표 프레임 확정"을 누르면 전처리 → 이어붙이기 → 마디선 검출까지 자동으로 이어서 진행됩니다.
+        </p>
+        <div className="controls">
+          <label>영상 파일: <input type="file" accept="video/*" onChange={handleFileChange} /></label>
+          <label>스크롤 방향:
+            <select value={direction} onChange={e => setDirection(e.target.value)} style={{ width: 'auto', marginLeft: '6px' }}>
+              <option value="auto">자동 감지 (첫 이음매로 판단)</option>
+              <option value="vertical">세로 스크롤</option>
+              <option value="horizontal">가로 스크롤</option>
+            </select>
+          </label>
+        </div>
+
+        <ScrollRoiPicker videoRef={videoRef} videoLoaded={videoLoaded} roi={roi} setRoi={setRoi} />
+        <div className="slider-label">
+          {roi
+            ? ('지정된 영역: 가로 ' + (roi.x0 * 100).toFixed(0) + '%~' + (roi.x1 * 100).toFixed(0) + '%, 세로 ' + (roi.y0 * 100).toFixed(0) + '%~' + (roi.y1 * 100).toFixed(0) + '%')
+            : '아직 영역을 지정하지 않았습니다. (지정하지 않으면 화면 전체로 분석합니다)'}
+        </div>
+
+        <div className="toolbar">
+          <label style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
+            영상 상태 확인:
+            <input type="range" min="0" max={duration || 0} step="0.1" value={seekT} disabled={!videoLoaded}
+              style={{ flex: 1 }} onChange={onSeekSliderChange} />
+            <span className="slider-label" style={{ margin: 0, whiteSpace: 'nowrap' }}>{seekT.toFixed(1)}s / {duration.toFixed(1)}s</span>
+          </label>
+        </div>
+        <div className="toolbar">
+          <button className="icon-btn" onClick={() => setRoi(null)} disabled={!roi}>영역 초기화</button>
+        </div>
+      </div>
+
+      <ScrollPreprocPanel scrollDefaults={scrollDefaults} setScrollDefaults={setScrollDefaults} />
+
+      <div className="block">
+        <div className="toolbar">
+          <label>샘플링 간격(초): <input type="number" value={stepSec} step="0.05" min="0.02" onChange={e => setStepSec(e.target.value)} style={{ width: '4em' }} /></label>
+          <button onClick={analyze} disabled={!videoLoaded || analyzing}>{analyzing ? '분석 중...' : '분석 시작 (diff 계산)'}</button>
+        </div>
+        {analyzing && (
+          <div className="progress-bar-wrap">
+            <div className="progress-bar-fill" style={{ width: analyzeProgress + '%' }} />
+            <div className="progress-bar-label">{analyzeProgress}%</div>
+          </div>
+        )}
+        {analysis && (
+          <div className="toolbar">
+            <label style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span className="slider-label" style={{ margin: 0, whiteSpace: 'nowrap' }}>전환(스크롤) 판정 임계값</span>
+              <input type="range" min={thresholdRange.min} max={thresholdRange.max} step={thresholdRange.step}
+                value={threshold} style={{ flex: 1 }} onChange={e => setThreshold(parseFloat(e.target.value))} />
+              <span className="slider-label" style={{ margin: 0 }}>{threshold.toFixed(2)}</span>
+            </label>
+            <span className="save-msg">스크롤 {bursts.length}회 → 대표 프레임 {repCount}장 예상</span>
+          </div>
+        )}
+        <div className="slider-label" style={{ whiteSpace: 'pre-wrap' }}>{statusMsg}</div>
+        <canvas ref={chartRef} className="chart-canvas" />
+      </div>
+
+      <div className="toolbar">
+        <button className="icon-btn" onClick={onModeBack} disabled={confirming}>← 모드 다시 선택</button>
+        <button onClick={confirmAndRun} disabled={!analysis || confirming}>
+          {confirming ? '처리 중...' : '대표 프레임 확정 (이어서 자동 진행) →'}
+        </button>
+      </div>
+    </div>
+  );
+}
+function frameTimeRangeForSpan(seams, repFrameTimes, spanStart, spanEnd) {
+  const boundaries = [0, ...seams.map(s => s.pos)];
+  let minT = Infinity, maxT = -Infinity;
+  for (let k = 0; k < repFrameTimes.length; k++) {
+    const segStart = boundaries[k] != null ? boundaries[k] : 0;
+    const segEnd = k + 1 < boundaries.length ? boundaries[k + 1] : Infinity;
+    if (segEnd > spanStart && segStart < spanEnd) {
+      minT = Math.min(minT, repFrameTimes[k]);
+      maxT = Math.max(maxT, repFrameTimes[k]);
+    }
+  }
+  if (!isFinite(minT)) return { start: repFrameTimes[0], end: repFrameTimes[repFrameTimes.length - 1] };
+  return { start: minT, end: maxT };
+}
+
+// 그룹(마디 범위)의 신뢰도 = 그 범위와 겹치는 이음매(seam)들 중 최저 NCC. 겹치는 이음매가 없으면
+// (그룹이 이음매 없이 한 대표 프레임 안에만 있으면) 신뢰도 문제 없음(=1)으로 본다.
+function groupConfidence(seams, startX, endX) {
+  let minScore = 1;
+  let any = false;
+  for (const s of seams) {
+    if (s.pos > startX - 1 && s.pos < endX + 1) { any = true; if (s.score < minScore) minScore = s.score; }
+  }
+  return any ? minScore : 1;
+}
+
+function cropCanvasRegion(canvas, x0, y0, x1, y1) {
+  const w = Math.max(1, Math.round(x1 - x0)), h = Math.max(1, Math.round(y1 - y0));
+  const out = document.createElement('canvas');
+  out.width = w; out.height = h;
+  out.getContext('2d').drawImage(canvas, x0, y0, w, h, 0, 0, w, h);
+  return out;
+}
+
+// 그룹 목록(현재 N/축 기준)에서 각 그룹의 표시용 canvas를 잘라낸다 — direction에 따라 폭 방향으로
+// 자르는지 높이 방향으로 자르는지가 다르다.
+function cropGroupCanvas(stitchedCanvas, direction, group) {
+  if (direction === 'vertical') {
+    return cropCanvasRegion(stitchedCanvas, 0, group.startX, stitchedCanvas.width, group.endX);
+  }
+  return cropCanvasRegion(stitchedCanvas, group.startX, 0, group.endX, stitchedCanvas.height);
+}
+
+// ---- 5단계: 이미지 업로드 후 크롭 (수동 오버라이드 옵션 b) ----
+function ImageCropPicker({ src, crop, setCrop }) {
+  const canvasRef = useRef(null);
+  const boxRef = useRef(null);
+  const dragStartRef = useRef(null);
+  const [natural, setNatural] = useState(null);
+
+  useEffect(() => {
+    if (!src) return;
+    loadImage(src).then(img => {
+      setNatural({ w: img.naturalWidth, h: img.naturalHeight });
+      const canvas = canvasRef.current;
+      const maxW = 700;
+      const scale = Math.min(1, maxW / img.naturalWidth);
+      canvas.width = Math.round(img.naturalWidth * scale);
+      canvas.height = Math.round(img.naturalHeight * scale);
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+    });
+  }, [src]);
+
+  function canvasPoint(e) {
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    return { x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height };
+  }
+  function onDown(e) { dragStartRef.current = canvasPoint(e); }
+  function onMove(e) {
+    if (!dragStartRef.current) return;
+    const cur = canvasPoint(e);
+    const box = boxRef.current;
+    const canvas = canvasRef.current;
+    const x0 = Math.min(dragStartRef.current.x, cur.x) * canvas.width;
+    const y0 = Math.min(dragStartRef.current.y, cur.y) * canvas.height;
+    const w = Math.abs(cur.x - dragStartRef.current.x) * canvas.width;
+    const h = Math.abs(cur.y - dragStartRef.current.y) * canvas.height;
+    box.style.left = x0 + 'px'; box.style.top = y0 + 'px';
+    box.style.width = w + 'px'; box.style.height = h + 'px';
+    box.style.display = 'block';
+  }
+  useEffect(() => {
+    function onUp(e) {
+      if (!dragStartRef.current || !natural) return;
+      const start = dragStartRef.current;
+      dragStartRef.current = null;
+      const cur = canvasPoint(e);
+      const x0 = Math.max(0, Math.min(1, Math.min(start.x, cur.x)));
+      const x1 = Math.max(0, Math.min(1, Math.max(start.x, cur.x)));
+      const y0 = Math.max(0, Math.min(1, Math.min(start.y, cur.y)));
+      const y1 = Math.max(0, Math.min(1, Math.max(start.y, cur.y)));
+      if (x1 - x0 < 0.01 || y1 - y0 < 0.01) return;
+      setCrop({ x0, y0, x1, y1 });
+    }
+    window.addEventListener('mouseup', onUp);
+    return () => window.removeEventListener('mouseup', onUp);
+  }, [natural]);
+
+  return (
+    <div className="roi-wrap">
+      <canvas ref={canvasRef} className="roi-canvas" onMouseDown={onDown} onMouseMove={onMove} />
+      <div ref={boxRef} className="roi-box" style={crop ? {
+        display: 'block',
+        left: (crop.x0 * 100) + '%', top: (crop.y0 * 100) + '%',
+        width: ((crop.x1 - crop.x0) * 100) + '%', height: ((crop.y1 - crop.y0) * 100) + '%',
+      } : undefined} />
+    </div>
+  );
+}
+
+// ---- 5단계: 저신뢰 그룹 보완용 "이 구간 다시 만들기" ----
+function GroupOverridePanel({ videoRef, scrollDefaults, roi, onApply, onCancel }) {
+  const [mode, setMode] = useState('scrub'); // 'scrub' | 'upload'
+  // scrub 방식
+  const [seekT, setSeekT] = useState(0);
+  const [duration, setDuration] = useState(videoRef.current ? videoRef.current.duration || 0 : 0);
+  const [scrubRoi, setScrubRoi] = useState(roi);
+  // upload 방식
+  const [uploadSrc, setUploadSrc] = useState(null);
+  const [uploadCrop, setUploadCrop] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (video && video.duration) setDuration(video.duration);
+  }, []);
+
+  async function onSeek(e) {
+    const t = parseFloat(e.target.value);
+    setSeekT(t);
+    await seekTo(videoRef.current, t);
+  }
+
+  async function applyFromScrub() {
+    if (!scrubRoi) { alert('영역을 드래그로 지정하세요.'); return; }
+    setBusy(true);
+    try {
+      const captured = captureRoiNative(videoRef.current, scrubRoi);
+      const img = await loadImage(captured.dataUrl);
+      const c = document.createElement('canvas');
+      c.width = captured.w; c.height = captured.h;
+      c.getContext('2d').drawImage(img, 0, 0);
+      scrollApplyPreprocInPlace(c, scrollDefaults);
+      onApply(c.toDataURL('image/png'));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function onUploadFile(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    setUploadSrc(URL.createObjectURL(file));
+    setUploadCrop(null);
+  }
+
+  async function applyFromUpload() {
+    if (!uploadSrc) { alert('이미지를 먼저 선택하세요.'); return; }
+    setBusy(true);
+    try {
+      const img = await loadImage(uploadSrc);
+      const crop = uploadCrop || { x0: 0, y0: 0, x1: 1, y1: 1 };
+      const sx = Math.round(crop.x0 * img.naturalWidth), sy = Math.round(crop.y0 * img.naturalHeight);
+      const sw = Math.max(1, Math.round((crop.x1 - crop.x0) * img.naturalWidth));
+      const sh = Math.max(1, Math.round((crop.y1 - crop.y0) * img.naturalHeight));
+      const c = document.createElement('canvas');
+      c.width = sw; c.height = sh;
+      c.getContext('2d').drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+      scrollApplyPreprocInPlace(c, scrollDefaults);
+      onApply(c.toDataURL('image/png'));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="block" style={{ borderColor: 'var(--accent)' }}>
+      <div className="block-head"><span>이 구간 다시 만들기</span></div>
+      <div className="toolbar">
+        <button className={mode === 'scrub' ? 'icon-btn' : 'icon-btn'} style={mode === 'scrub' ? { borderColor: 'var(--accent)', color: 'var(--accent)' } : undefined} onClick={() => setMode('scrub')}>영상에서 다시 크롭</button>
+        <button style={mode === 'upload' ? { borderColor: 'var(--accent)', color: 'var(--accent)' } : undefined} className="icon-btn" onClick={() => setMode('upload')}>로컬 이미지 업로드</button>
+      </div>
+      {mode === 'scrub' ? (
+        <React.Fragment>
+          <div className="toolbar">
+            <label style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
+              구간 스크럽:
+              <input type="range" min="0" max={duration || 0} step="0.1" value={seekT} style={{ flex: 1 }} onChange={onSeek} />
+              <span className="slider-label" style={{ margin: 0 }}>{seekT.toFixed(1)}s</span>
+            </label>
+          </div>
+          <ScrollRoiPicker videoRef={videoRef} videoLoaded={true} roi={scrubRoi} setRoi={setScrubRoi} />
+          <div className="toolbar">
+            <button onClick={applyFromScrub} disabled={busy}>{busy ? '처리 중...' : '이 프레임으로 대체'}</button>
+          </div>
+        </React.Fragment>
+      ) : (
+        <React.Fragment>
+          <div className="controls">
+            <label>이미지 파일: <input type="file" accept="image/*" onChange={onUploadFile} /></label>
+          </div>
+          {uploadSrc && <ImageCropPicker src={uploadSrc} crop={uploadCrop} setCrop={setUploadCrop} />}
+          <div className="toolbar">
+            <button onClick={applyFromUpload} disabled={busy || !uploadSrc}>{busy ? '처리 중...' : '이 이미지로 대체'}</button>
+          </div>
+        </React.Fragment>
+      )}
+      <div className="toolbar">
+        <button className="icon-btn" onClick={onCancel} disabled={busy}>취소</button>
+      </div>
+    </div>
+  );
+}
+
+function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onModeBack }) {
+  const { videoFile, roi, direction, directionNcc, repFrameTimes, stitchedCanvas, seams, bars, staffFound, bursts } = scrollCapture;
+  const [groupSize, setGroupSize] = useState(4);
+  const [maxBarsPerGroup, setMaxBarsPerGroup] = useState(8);
+  const [overrides, setOverrides] = useState({}); // key `${startIdx}-${endIdx}` -> dataUrl
+  const [overrideOpenKey, setOverrideOpenKey] = useState(null);
+  const [sending, setSending] = useState(false);
+  const groupResultRef = useRef(null);
+
+  const measureCount = Math.max(0, bars.length - 1);
+  // 파라미터(N, 최대 마디수)를 바꾸면 버튼 재클릭 없이 여기서 즉시 재계산(리플로우) — 스티칭/
+  // 마디선 검출은 다시 하지 않고 캐시된 stitchedCanvas/bars를 그대로 재사용한다.
+  const groups = groupBarsByTargetWidth(bars, groupSize, maxBarsPerGroup);
+
+  const groupsWithMeta = groups.map((g, idx) => {
+    const confidence = groupConfidence(seams, g.startX, g.endX);
+    const key = g.startIdx + '-' + g.endIdx;
+    const override = overrides[key];
+    const timeRange = frameTimeRangeForSpan(seams, repFrameTimes, g.startX, g.endX);
+    return { ...g, key, confidence, lowConfidence: confidence < 0.7, override, timeRange };
+  });
+
+  const outlierBursts = bursts.filter(b => b.isOutlier);
+
+  function applyOverride(key, dataUrl) {
+    setOverrides(prev => ({ ...prev, [key]: dataUrl }));
+    setOverrideOpenKey(null);
+  }
+
+  async function handleSendToScoreBuilder() {
+    setSending(true);
+    try {
+      const sourceId = videoFile ? ('vsrc_' + Date.now() + '_' + Math.random().toString(36).slice(2)) : null;
+      const finalItems = groupsWithMeta.map((g, idx) => {
+        const canvas = g.override ? null : cropGroupCanvas(stitchedCanvas, direction, g);
+        const src = g.override || canvas.toDataURL('image/png');
+        return {
+          id: 'scroll_' + Date.now() + '_' + idx,
+          type: 'image', src,
+          invert: false, override: { ...MERGED_ROW_NEUTRAL_OVERRIDE },
+          lyrics: { tags: [], areaHeightRatio: null },
+          playheadExcluded: [], barLayout: null,
+          stitchMeta: {
+            source: 'scroll', direction, directionNcc, groupIndex: idx,
+            barRange: [g.startIdx, g.endIdx], barCount: g.count, confidence: g.confidence,
+            manuallyReplaced: !!g.override,
+          },
+          timeRange: g.timeRange,
+          videoSourceId: sourceId,
+        };
+      });
+      if (sourceId && videoFile) {
+        await dbPut(VIDEO_SOURCE_KEY_PREFIX + sourceId, { videoBlob: videoFile, onsets: [], savedAt: Date.now() });
+      }
+      await dbPut(VIDEO_IMPORT_KEY, { items: finalItems, importedAt: Date.now() });
+      window.location.href = 'tab-score-builder.html';
+    } catch (err) {
+      alert('전달 중 오류가 발생했습니다: ' + err.message);
+      setSending(false);
+    }
+  }
+
+  return (
+    <div>
+      <div className="block">
+        <div className="block-head"><span>결과 — 이어붙이기 · 마디선 · 그룹 (재조정 가능)</span></div>
+        <p className="hint-text">
+          방향: {direction === 'vertical' ? '세로' : '가로'} 스크롤{directionNcc != null ? ' (첫 이음매 NCC=' + directionNcc.toFixed(3) + ')' : ''} ·
+          이어붙인 프레임 {repFrameTimes.length}장 · {staffFound ? ('6선 감지됨, 마디 ' + measureCount + '개') : '6선을 찾지 못했습니다 — 마디 인식 임계값 조정이 필요할 수 있습니다.'}
+        </p>
+        {outlierBursts.length > 0 && (
+          <p className="hint-text" style={{ color: '#c0392b' }}>
+            ⚠ 다른 구간보다 유독 길거나 짧은 스크롤 구간이 {outlierBursts.length}개 있습니다 (아래 그룹 중 테두리가 강조된 곳을 확인하세요).
+          </p>
+        )}
+        <div className="toolbar">
+          <label>몇 마디씩 묶기(목표): <input type="number" min="1" max="16" value={groupSize}
+            onChange={e => setGroupSize(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
+          <label>그룹당 최대 마디수: <input type="number" min="1" max="20" value={maxBarsPerGroup}
+            onChange={e => setMaxBarsPerGroup(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
+          <span className="save-msg">{measureCount}마디 → {groups.length}개 그룹</span>
+        </div>
+      </div>
+
+      <div className="list" ref={groupResultRef}>
+        {(() => {
+          // 마지막(또는 마디 수가 적은) 그룹이 확대되어 보이지 않도록 — 모든 그룹에 같은
+          // displayScale(px 단위)을 적용한다. 가장 "긴"(스티칭 축 기준) 그룹 기준으로 한 번만
+          // 계산해서 전체에 동일 적용 (prototype의 groupBtn 미리보기 로직과 동일한 방식).
+          function nativeSize(g) {
+            return direction === 'vertical'
+              ? { w: stitchedCanvas.width, h: g.endX - g.startX }
+              : { w: g.endX - g.startX, h: stitchedCanvas.height };
+          }
+          const containerW = (groupResultRef.current && groupResultRef.current.clientWidth) || 900;
+          const widestW = Math.max(1, ...groupsWithMeta.map(g => nativeSize(g).w));
+          const displayScale = Math.min(1, containerW / widestW);
+          return groupsWithMeta.map((g, idx) => {
+            const canvas = g.override ? null : cropGroupCanvas(stitchedCanvas, direction, g);
+            const src = g.override || (canvas && canvas.toDataURL('image/png'));
+            const nsize = nativeSize(g);
+            const imgStyle = g.override
+              ? undefined // 수동 대체 이미지는 원본 크롭과 크기 계약이 다를 수 있어 기본(max-width:100%)로 표시
+              : { width: Math.round(nsize.w * displayScale) + 'px', height: Math.round(nsize.h * displayScale) + 'px', maxWidth: 'none' };
+            return (
+              <div key={g.key} className="block" style={g.lowConfidence ? { borderColor: '#c0392b', borderWidth: '2px' } : undefined}>
+                <div className="block-head">
+                  <span>
+                    그룹 {idx + 1}: {g.count}마디
+                    {g.lowConfidence && <b style={{ color: '#c0392b' }}> · 저신뢰 구간 (NCC {g.confidence.toFixed(2)})</b>}
+                    {g.override && <span className="save-msg"> · 수동으로 다시 만듦</span>}
+                  </span>
+                  <button className="icon-btn" onClick={() => setOverrideOpenKey(overrideOpenKey === g.key ? null : g.key)}>
+                    이 구간 다시 만들기
+                  </button>
+                </div>
+                {src && <img src={src} className="merge-preview-img" style={imgStyle} alt={'그룹 ' + (idx + 1)} />}
+                {overrideOpenKey === g.key && (
+                  <GroupOverridePanel videoRef={videoRef} scrollDefaults={scrollDefaults} roi={roi}
+                    onApply={dataUrl => applyOverride(g.key, dataUrl)}
+                    onCancel={() => setOverrideOpenKey(null)} />
+                )}
+              </div>
+            );
+          });
+        })()}
+      </div>
+
+      <div className="toolbar">
+        <button className="icon-btn" onClick={onBack} disabled={sending}>← 대표 프레임 다시 고르기</button>
+        <button className="icon-btn" onClick={onModeBack} disabled={sending}>모드 다시 선택</button>
+        <button onClick={handleSendToScoreBuilder} disabled={sending || groups.length === 0}>
+          {sending ? '전달 중...' : 'TAB 악보 만들기로 넘기기 (' + groups.length + '개) →'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function App() {
+  // 1단계: 모드 선택. 'page'(페이지 전환형, 기존 로직 그대로) | 'scroll'(스크롤형, 새 모드) | null(선택 전).
+  const [mode, setMode] = useState(null);
+
   const videoRef = useRef(null);
   const [step, setStep] = useState('capture');
   const [frames, setFrames] = useState([]);
@@ -1581,6 +2808,12 @@ function App() {
   const [onsets, setOnsets] = useState([]);
   const [videoFile, setVideoFile] = useState(null);
   const [videoSourceId, setVideoSourceId] = useState(null);
+
+  // 스크롤형 전용 상태 — 페이지 전환형의 videoRef/frames/items 등과 완전히 분리된 별도 트리.
+  const scrollVideoRef = useRef(null);
+  const [scrollPhase, setScrollPhase] = useState('capture'); // 'capture' (2단계 수동 부분) | 'result' (4~5단계)
+  const [scrollDefaults, setScrollDefaults] = useState(SCROLL_DEFAULTS_INIT);
+  const [scrollCapture, setScrollCapture] = useState(null); // ScrollCaptureStep의 onDone 결과
 
   async function goToPreprocess() {
     const selected = frames.filter(f => selectedFrameIds.has(f.id));
@@ -1612,8 +2845,11 @@ function App() {
     <div className="app">
       {/* Always rendered here at the App root (never inside a step wrapper that gets hidden) — a
           <video> nested inside a display:none ancestor can fail to decode frames in Safari even
-          when the video element's own styles only make it visually tiny/transparent. */}
+          when the video element's own styles only make it visually tiny/transparent. Two separate
+          elements (one per mode) so switching modes never confuses one mode's seek state with the
+          other's — harmless to keep both mounted since only one mode is ever actually driven. */}
       <video ref={videoRef} muted className="hidden-video" />
+      <video ref={scrollVideoRef} muted className="hidden-video" />
 
       <div className="titlebar">
         <h1>영상에서 TAB 추출</h1>
@@ -1622,35 +2858,77 @@ function App() {
 
       <div className="notice-banner">
         <div>
-          <b>안내:</b> 이 도구는 화면이 통째로 바뀌는 <b>"페이지 전환형"</b> TAB 영상만 지원합니다 — 스크롤형·투명 오버레이형 영상은
-          아직 감지되지 않으며 지원하지 않습니다. 모든 처리는 이 브라우저 안에서만 이뤄지고, 영상이나 이미지를 서버로 전송하지 않습니다.
+          <b>안내:</b> 화면이 통째로 바뀌는 <b>"페이지 전환형"</b>과 화면이 계속 흐르듯 넘어가는 <b>"스크롤형"</b> TAB 영상을
+          지원합니다 (투명 오버레이형은 아직 지원하지 않습니다). 모든 처리는 이 브라우저 안에서만 이뤄지고, 영상이나 이미지를 서버로
+          전송하지 않습니다.
         </div>
       </div>
 
-      <div className="step-nav">
-        <span className={step === 'capture' ? 'step active' : 'step'}>1. 영역 지정 · 추출</span>
-        <span className="arrow">→</span>
-        <span className={step === 'select' ? 'step active' : 'step'}>2. 프레임 선택</span>
-        <span className="arrow">→</span>
-        <span className={step === 'preprocess' ? 'step active' : 'step'}>3. 전처리 · 전달</span>
-      </div>
+      {mode === null && (
+        <div className="block">
+          <div className="block-head"><span>1단계 — 영상 종류 선택</span></div>
+          <p className="hint-text">
+            영상이 화면 전체가 툭툭 바뀌며 넘어가면 "페이지 전환형", 화면이 스크롤하듯 계속 흐르면(예: 화면이 옆으로 밀려가는
+            TAB) "스크롤형"을 고르세요.
+          </p>
+          <div className="toolbar">
+            <button onClick={() => setMode('page')}>페이지 전환형</button>
+            <button onClick={() => setMode('scroll')}>스크롤형</button>
+          </div>
+        </div>
+      )}
 
-      {/* Each step stays mounted (display:none when inactive, not unmounted) so its state — loaded
-          video, ROI, diff analysis, per-frame overrides — survives moving back and forth. */}
-      <div style={{ display: step === 'capture' ? 'block' : 'none' }}>
-        <CaptureStep videoRef={videoRef} frames={frames} setFrames={setFrames}
-          onsets={onsets} setOnsets={setOnsets} videoFile={videoFile} setVideoFile={setVideoFile}
-          onNext={() => { setSelectedFrameIds(new Set(frames.map(f => f.id))); setStep('select'); }} />
-      </div>
-      <div style={{ display: step === 'select' ? 'block' : 'none' }}>
-        <SelectStep frames={frames} selectedFrameIds={selectedFrameIds} setSelectedFrameIds={setSelectedFrameIds}
-          onBack={() => setStep('capture')} onNext={goToPreprocess} />
-      </div>
-      <div style={{ display: step === 'preprocess' ? 'block' : 'none' }}>
-        <PreprocessStep items={items} setItems={setItems} defaults={defaults} setDefaults={setDefaults}
-          videoFile={videoFile} onsets={onsets} videoSourceId={videoSourceId}
-          onBack={() => setStep('select')} />
-      </div>
+      {mode === 'page' && (
+        <React.Fragment>
+          <div className="step-nav">
+            <button className="icon-btn" onClick={() => setMode(null)} style={{ marginRight: '4px' }}>← 모드</button>
+            <span className={step === 'capture' ? 'step active' : 'step'}>1. 영역 지정 · 추출</span>
+            <span className="arrow">→</span>
+            <span className={step === 'select' ? 'step active' : 'step'}>2. 프레임 선택</span>
+            <span className="arrow">→</span>
+            <span className={step === 'preprocess' ? 'step active' : 'step'}>3. 전처리 · 전달</span>
+          </div>
+
+          {/* Each step stays mounted (display:none when inactive, not unmounted) so its state — loaded
+              video, ROI, diff analysis, per-frame overrides — survives moving back and forth. */}
+          <div style={{ display: step === 'capture' ? 'block' : 'none' }}>
+            <CaptureStep videoRef={videoRef} frames={frames} setFrames={setFrames}
+              onsets={onsets} setOnsets={setOnsets} videoFile={videoFile} setVideoFile={setVideoFile}
+              onNext={() => { setSelectedFrameIds(new Set(frames.map(f => f.id))); setStep('select'); }} />
+          </div>
+          <div style={{ display: step === 'select' ? 'block' : 'none' }}>
+            <SelectStep frames={frames} selectedFrameIds={selectedFrameIds} setSelectedFrameIds={setSelectedFrameIds}
+              onBack={() => setStep('capture')} onNext={goToPreprocess} />
+          </div>
+          <div style={{ display: step === 'preprocess' ? 'block' : 'none' }}>
+            <PreprocessStep items={items} setItems={setItems} defaults={defaults} setDefaults={setDefaults}
+              videoFile={videoFile} onsets={onsets} videoSourceId={videoSourceId}
+              onBack={() => setStep('select')} />
+          </div>
+        </React.Fragment>
+      )}
+
+      {mode === 'scroll' && (
+        <React.Fragment>
+          <div className="step-nav">
+            <button className="icon-btn" onClick={() => setMode(null)} style={{ marginRight: '4px' }}>← 모드</button>
+            <span className={scrollPhase === 'capture' ? 'step active' : 'step'}>2. 영역 지정 · 스크롤 구간 조정</span>
+            <span className="arrow">→</span>
+            <span className={scrollPhase === 'result' ? 'step active' : 'step'}>4~5. 결과 · 재조정 · 전달</span>
+          </div>
+          <div style={{ display: scrollPhase === 'capture' ? 'block' : 'none' }}>
+            <ScrollCaptureStep videoRef={scrollVideoRef} scrollDefaults={scrollDefaults} setScrollDefaults={setScrollDefaults}
+              onDone={result => { setScrollCapture(result); setScrollPhase('result'); }}
+              onModeBack={() => setMode(null)} />
+          </div>
+          {scrollPhase === 'result' && scrollCapture && (
+            <div style={{ display: 'block' }}>
+              <ScrollResultStep videoRef={scrollVideoRef} scrollCapture={scrollCapture} scrollDefaults={scrollDefaults}
+                onBack={() => setScrollPhase('capture')} onModeBack={() => setMode(null)} />
+            </div>
+          )}
+        </React.Fragment>
+      )}
     </div>
   );
 }
