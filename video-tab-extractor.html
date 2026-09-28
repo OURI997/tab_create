@@ -70,6 +70,10 @@
   .mode-card .mode-card-title{font-size:16px;font-weight:700;margin-bottom:6px;}
   .mode-card .mode-card-desc{font-size:12.5px;color:var(--text2);line-height:1.5;}
 
+  .badge{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;}
+  .badge-precise{background:#e6f6ec;color:#1e7d3c;border:1px solid #b6e3c4;}
+  .badge-estimate{background:#fdf3e2;color:#9a6a12;border:1px solid #f0d9a6;}
+
   .step-nav{display:flex;gap:6px;align-items:center;font-size:12.5px;color:var(--text2);}
   .step-nav .step{padding:4px 10px;border-radius:999px;border:1px solid var(--border);}
   .step-nav .step.active{border-color:var(--accent);color:var(--accent);background:var(--accent-bg);font-weight:600;}
@@ -422,6 +426,206 @@ function getRoiPixelsForDiff(video, roi) {
   diffSampleCanvas.width = outW; diffSampleCanvas.height = outH;
   diffSampleCtx.drawImage(video, rx0, ry0, rw, rh, 0, 0, outW, outH);
   return diffSampleCtx.getImageData(0, 0, outW, outH).data;
+}
+
+
+// ==== 재생 위치 표시(플레이헤드) 자동 추적 — 마디별 정밀 시간 동기화 ====
+// 목적: 그룹의 timeRange가 "대표 프레임 캡처 시각 사이의 선형 보간"이라 오차가 있는 문제를,
+// 많은 스크롤형 TAB 영상에 있는 "현재 재생 위치를 보여주는 움직이는 표시"(하이라이트/커서선/진행
+// 바 등, 색은 영상마다 다름 — 하드코딩하지 않는다)를 안정(정지) 구간에서 자동으로 찾아 추적해서
+// 보정한다. 실패하면(표시가 없거나 ROI 밖에 있으면) 4)의 개선된 폴백으로 자동 전환된다.
+
+const MARKER_SAMPLE_MAXDIM = 300;
+const markerSampleCanvasA = document.createElement('canvas');
+const markerSampleCtxA = markerSampleCanvasA.getContext('2d', { willReadFrequently: true });
+const markerSampleCanvasB = document.createElement('canvas');
+const markerSampleCtxB = markerSampleCanvasB.getContext('2d', { willReadFrequently: true });
+const MARKER_FINE_STEP_SEC = 0.12;
+const MARKER_DIFF_LUM_THRESH = 25;
+const MARKER_MAX_AREA_FRACTION = 0.15; // ROI 면적의 이 비율을 넘는 "덩어리"는 전체 화면 변화(페이드
+// 등)로 보고 후보에서 제외 — 1)의 "적당히 작은" 요건
+const MARKER_MIN_GAP_DURATION_SEC = 0.3; // 이보다 짧은 안정 구간은 촘촘 샘플링해도 점이 부족해 스킵
+const MARKER_MIN_POINTS_FOR_CONFIDENCE = 3;
+const MARKER_MAX_SAMPLES_PER_GAP = 60; // 비정상적으로 긴 안정 구간에서 과도한 seek이 걸리지 않도록
+
+function getRoiPixelsForMarker(video, roi, useA) {
+  const { rx0, ry0, rw, rh } = roiRectPx(video, roi);
+  const scale = Math.min(1, MARKER_SAMPLE_MAXDIM / Math.max(rw, rh));
+  const outW = Math.max(1, Math.round(rw * scale)), outH = Math.max(1, Math.round(rh * scale));
+  const canvas = useA ? markerSampleCanvasA : markerSampleCanvasB;
+  const ctx = useA ? markerSampleCtxA : markerSampleCtxB;
+  canvas.width = outW; canvas.height = outH;
+  ctx.drawImage(video, rx0, ry0, rw, rh, 0, 0, outW, outH);
+  return { data: ctx.getImageData(0, 0, outW, outH).data, w: outW, h: outH };
+}
+
+// 1) 두 프레임(같은 크기) 사이에서 "바뀐" 픽셀들의 연결영역(despeckleBinary와 같은 flood-fill
+// 방식) 중, 너무 크지 않은(MARKER_MAX_AREA_FRACTION 이하) 것들 중 가장 큰 덩어리의 중심좌표를
+// 반환한다. 안정 구간에서는 배경이 고정이므로, 바뀐 부분은 "재생 위치 표시" 자체일 가능성이 높다.
+function findChangedBlobCentroid(dataA, dataB, w, h, diffThresh, maxAreaFraction) {
+  const total = w * h;
+  const isChanged = new Uint8Array(total);
+  let changedCount = 0;
+  for (let i = 0, p = 0; i < dataA.length; i += 4, p++) {
+    const dr = dataA[i] - dataB[i], dg = dataA[i + 1] - dataB[i + 1], db = dataA[i + 2] - dataB[i + 2];
+    const lum = 0.299 * Math.abs(dr) + 0.587 * Math.abs(dg) + 0.114 * Math.abs(db);
+    if (lum > diffThresh) { isChanged[p] = 1; changedCount++; }
+  }
+  if (changedCount === 0) return null;
+  const maxArea = Math.max(4, Math.round(total * maxAreaFraction));
+  const visited = new Uint8Array(total);
+  const stack = new Int32Array(total);
+  let best = null, bestArea = 0;
+  for (let start = 0; start < total; start++) {
+    if (visited[start] || !isChanged[start]) continue;
+    let sp = 0; stack[sp++] = start; visited[start] = 1;
+    let head = 0, sumX = 0, sumY = 0, cnt = 0;
+    while (head < sp) {
+      const p = stack[head++];
+      const x = p % w, y = (p - x) / w | 0;
+      sumX += x; sumY += y; cnt++;
+      if (x > 0) { const n = p - 1; if (!visited[n] && isChanged[n]) { visited[n] = 1; stack[sp++] = n; } }
+      if (x < w - 1) { const n = p + 1; if (!visited[n] && isChanged[n]) { visited[n] = 1; stack[sp++] = n; } }
+      if (y > 0) { const n = p - w; if (!visited[n] && isChanged[n]) { visited[n] = 1; stack[sp++] = n; } }
+      if (y < h - 1) { const n = p + w; if (!visited[n] && isChanged[n]) { visited[n] = 1; stack[sp++] = n; } }
+    }
+    if (cnt <= maxArea && cnt > bestArea) { bestArea = cnt; best = { x: sumX / cnt, y: sumY / cnt, area: cnt }; }
+  }
+  return best;
+}
+
+// repIndices(대표 프레임을 뽑은 시각 인덱스들)의 인접한 두 항목 사이가 "안정 구간"(그 사이에
+// 감지된 burst가 없음, 즉 스크롤이 실제로 일어나지 않은 구간)인지 — burst 전/후 프레임 쌍(그
+// burst 자신의 전환 구간)만 아니면 전부 안정 구간이다.
+function isStableIndexGap(idxA, idxB, bursts) {
+  return !bursts.some(b => (b.start - 1) === idxA && (b.end + 1) === idxB);
+}
+
+// 스티칭 단계의 seam 데이터(seam.pos = 그 프레임이 최종 이미지에서 시작하는 위치, seam.shift =
+// 겹치지 않고 새로 그려진 폭)로부터, 각 대표 프레임(0-based, repFrames 배열 인덱스)의
+// "로컬(그 프레임 자신의 원본 해상도 crop) 좌표 → 최종 스티칭 이미지 좌표" 변환에 필요한
+// (boundaries[k], srcXs[k]) 쌍을 계산한다 — boundaries는 결과 화면(ScrollResultStep)이 그룹
+// 경계 계산에 쓰는 것과 정확히 같은 구성([0, ...seams.map(s=>s.pos)])이라 항상 일치한다.
+function computeFrameGlobalOffsets(seams, frameLen) {
+  const boundaries = [0];
+  const srcXs = [0];
+  for (let i = 0; i < seams.length; i++) {
+    boundaries.push(seams[i].pos);
+    const shift = Math.max(1, seams[i].shift);
+    srcXs.push(seams[i].dup ? frameLen : Math.max(0, frameLen - shift));
+  }
+  return { boundaries, srcXs };
+}
+function localToGlobal(localPos, frameIdx, boundaries, srcXs) {
+  return boundaries[frameIdx] + (localPos - srcXs[frameIdx]);
+}
+
+// 2) 안정 구간마다 촘촘히 샘플링해서 "시각 → 최종 스티칭 이미지 내 위치(global)" 후보 목록을
+// 모은다. 이미 캡처해둔 repFrames(대표 프레임)는 재사용하지 않는다 — 안정 구간 "내부"의 세밀한
+// 변화를 보려면 그 사이 시각들을 새로 seek해야 하기 때문. 비용을 통제하기 위해 안정 구간에서만
+// (스크롤 자체가 일어나는 burst 구간은 배경도 같이 움직여 표시만 분리하기 어려우므로 원래도 제외
+// 대상) 동작하고, 구간당 샘플 수 상한(MARKER_MAX_SAMPLES_PER_GAP)을 둔다.
+async function detectPlaybackMarker({ video, roi, direction, repIndices, times, bursts, seams, frameLen, onProgress }) {
+  const { boundaries, srcXs } = computeFrameGlobalOffsets(seams, frameLen);
+  const allPoints = [];
+  for (let k = 0; k < repIndices.length - 1; k++) {
+    const idxA = repIndices[k], idxB = repIndices[k + 1];
+    if (!isStableIndexGap(idxA, idxB, bursts)) continue;
+    const tA = times[idxA], tB = times[idxB];
+    if (tB - tA < MARKER_MIN_GAP_DURATION_SEC) continue;
+    let step = MARKER_FINE_STEP_SEC;
+    const rawCount = Math.ceil((tB - tA) / step) + 1;
+    if (rawCount > MARKER_MAX_SAMPLES_PER_GAP) step = (tB - tA) / MARKER_MAX_SAMPLES_PER_GAP;
+    const fineTimes = [];
+    for (let t = tA; t < tB; t += step) fineTimes.push(t);
+    fineTimes.push(tB);
+
+    let prev = null;
+    for (let i = 0; i < fineTimes.length; i++) {
+      await seekTo(video, fineTimes[i]);
+      const sample = getRoiPixelsForMarker(video, roi, i % 2 === 0);
+      if (prev) {
+        const blob = findChangedBlobCentroid(prev.data, sample.data, sample.w, sample.h, MARKER_DIFF_LUM_THRESH, MARKER_MAX_AREA_FRACTION);
+        if (blob) {
+          // blob.x/y는 다운스케일된 sample 좌표계 — 원본(native) 해상도 축 좌표로 환산한 뒤,
+          // 이 안정 구간이 속한 대표 프레임(k)의 스티칭 오프셋을 적용해 최종 이미지 좌표로 투영.
+          const localSample = direction === 'vertical' ? blob.y : blob.x;
+          const sampleAxisLen = direction === 'vertical' ? sample.h : sample.w;
+          const localNative = (localSample / sampleAxisLen) * frameLen;
+          const globalPos = localToGlobal(localNative, k, boundaries, srcXs);
+          allPoints.push({ time: fineTimes[i], globalPos });
+        }
+      }
+      prev = sample;
+      if (onProgress) onProgress();
+    }
+  }
+  allPoints.sort((a, b) => a.time - b.time);
+  return { allPoints, boundaries };
+}
+
+// 3) 신뢰도 검증 — 최소 개수 이상, 스크롤 진행 방향(=global 좌표가 커지는 방향, 스티칭 관례상
+// 항상 그 방향)과 대체로 일치하는 단조 이동인지.
+function validateMarkerTrack(allPoints) {
+  if (allPoints.length < MARKER_MIN_POINTS_FOR_CONFIDENCE) {
+    return { confident: false, count: allPoints.length, ratio: null };
+  }
+  let forward = 0, backward = 0;
+  for (let i = 1; i < allPoints.length; i++) {
+    const d = allPoints[i].globalPos - allPoints[i - 1].globalPos;
+    if (Math.abs(d) < 0.5) continue;
+    if (d > 0) forward++; else backward++;
+  }
+  const total = forward + backward;
+  if (total === 0) return { confident: false, count: allPoints.length, ratio: null };
+  const ratio = forward / total;
+  return { confident: ratio >= 0.7 && allPoints.length >= MARKER_MIN_POINTS_FOR_CONFIDENCE, count: allPoints.length, ratio };
+}
+
+// 목표 global 위치를 지나는 시각을 추적된 점들 사이에서 선형보간 — 점 목록은 이미 시간순 정렬됨.
+function interpolateTimeFromMarker(allPoints, targetX) {
+  if (!allPoints.length) return null;
+  if (targetX <= allPoints[0].globalPos) return allPoints[0].time;
+  if (targetX >= allPoints[allPoints.length - 1].globalPos) return allPoints[allPoints.length - 1].time;
+  for (let i = 0; i < allPoints.length - 1; i++) {
+    const a = allPoints[i], b = allPoints[i + 1];
+    const lo = Math.min(a.globalPos, b.globalPos), hi = Math.max(a.globalPos, b.globalPos);
+    if (targetX >= lo && targetX <= hi) {
+      const span = b.globalPos - a.globalPos;
+      const frac = Math.abs(span) > 1e-6 ? (targetX - a.globalPos) / span : 0;
+      return a.time + frac * (b.time - a.time);
+    }
+  }
+  return null; // 추적 범위 밖 — 호출부에서 폴백으로 넘어감
+}
+
+// 4) 개선된 폴백 — (repFrameTimes[k], boundaries[k]) 쌍은 이미 burst 구간(기울기=그 구간의 평균
+// 속도)과 안정 구간(기울기=0, 그 구간 전체가 같은 위치)이 번갈아 나오는 자연스러운 piecewise-
+// linear 함수다. 목표 위치를 포함하는 구간을 찾아 그 안에서 선형보간 — 이전 방식(겹치는 대표
+// 프레임들의 시각 min/max만 취하던 것)보다 훨씬 정밀하다.
+function piecewiseTimeForGlobalX(boundaries, repFrameTimes, targetX) {
+  const n = boundaries.length;
+  if (!n) return null;
+  if (targetX <= boundaries[0]) return repFrameTimes[0];
+  if (targetX >= boundaries[n - 1]) return repFrameTimes[n - 1];
+  for (let k = 0; k < n - 1; k++) {
+    if (targetX >= boundaries[k] && targetX <= boundaries[k + 1]) {
+      const span = boundaries[k + 1] - boundaries[k];
+      const frac = span > 1e-6 ? (targetX - boundaries[k]) / span : 0;
+      return repFrameTimes[k] + frac * (repFrameTimes[k + 1] - repFrameTimes[k]);
+    }
+  }
+  return repFrameTimes[n - 1];
+}
+
+// 마디별 정밀 시간 조회의 단일 진입점 — 마커 추적 데이터가 있고 그 추적 범위 안이면 마커 기반,
+// 아니면(추적 실패 전체 또는 이 특정 위치만 추적 범위 밖) 4)의 피스와이즈 폴백.
+function timeForGlobalX(markerData, boundaries, repFrameTimes, targetX) {
+  if (markerData && markerData.confident) {
+    const t = interpolateTimeFromMarker(markerData.allPoints, targetX);
+    if (t != null) return t;
+  }
+  return piecewiseTimeForGlobalX(boundaries, repFrameTimes, targetX);
 }
 
 // ==== onset (sound-start) detection — spectral flux, reused from the verified onset-detect-test.html
@@ -2488,10 +2692,34 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
       log('전처리 · 이어붙이기 진행 중...');
       const stage3 = await runScrollStage3(repFrames, scrollDefaults, direction);
       const flaggedBursts = flagOutlierBursts(bursts, times);
+      const repFrameTimes = repFrames.map(f => f.time);
+
+      // 마디별 정밀 시간 동기화 — 안정 구간마다 촘촘히 재생 위치 표시를 추적해본다. 실패해도
+      // (표시가 없거나 신뢰도 부족) markerData.confident=false로 남을 뿐, 결과 화면은 자동으로
+      // 4)의 개선된 폴백(구간별 선형보간)을 쓰므로 여기서 실패를 막을 필요는 없다.
+      log('재생 위치 표시 추적 중 (있는 경우 마디별 시간을 더 정밀하게 맞춥니다)...');
+      const frameLen = stage3.direction === 'vertical' ? repFrames[0].canvas.height : repFrames[0].canvas.width;
+      let markerData = null;
+      try {
+        let markerProgressCount = 0;
+        const { allPoints, boundaries } = await detectPlaybackMarker({
+          video, roi, direction: stage3.direction, repIndices: repIdx, times, bursts, seams: stage3.seams,
+          frameLen,
+          // 지난번 diff 분석 루프와 같은 이유로 — 매 샘플마다 리렌더시키지 않도록 몇 번에 한 번만 갱신.
+          onProgress: () => { markerProgressCount++; if (markerProgressCount % 5 === 0) log('재생 위치 표시 추적 중... (' + markerProgressCount + '개 샘플)'); },
+        });
+        const validation = validateMarkerTrack(allPoints);
+        markerData = { allPoints, boundaries, ...validation };
+      } catch (err) {
+        // 추적 자체가 실패해도(영상 디코딩 이슈 등) 전체 흐름은 막지 않고 폴백으로 넘어간다.
+        markerData = null;
+      }
+
       onDone({
         videoFile, roi, direction: stage3.direction, directionNcc: stage3.directionNcc,
-        repFrameTimes: repFrames.map(f => f.time),
+        repFrameTimes, repIndices: repIdx,
         stitchedCanvas: stage3.canvas, seams: stage3.seams, bursts: flaggedBursts,
+        markerData,
       });
     } catch (err) {
       log('처리 중 오류: ' + err.message);
@@ -2612,21 +2840,6 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
     </div>
   );
 }
-function frameTimeRangeForSpan(seams, repFrameTimes, spanStart, spanEnd) {
-  const boundaries = [0, ...seams.map(s => s.pos)];
-  let minT = Infinity, maxT = -Infinity;
-  for (let k = 0; k < repFrameTimes.length; k++) {
-    const segStart = boundaries[k] != null ? boundaries[k] : 0;
-    const segEnd = k + 1 < boundaries.length ? boundaries[k + 1] : Infinity;
-    if (segEnd > spanStart && segStart < spanEnd) {
-      minT = Math.min(minT, repFrameTimes[k]);
-      maxT = Math.max(maxT, repFrameTimes[k]);
-    }
-  }
-  if (!isFinite(minT)) return { start: repFrameTimes[0], end: repFrameTimes[repFrameTimes.length - 1] };
-  return { start: minT, end: maxT };
-}
-
 // 그룹(마디 범위)의 신뢰도 = 그 범위와 겹치는 이음매(seam)들 중 최저 NCC. 겹치는 이음매가 없으면
 // (그룹이 이음매 없이 한 대표 프레임 안에만 있으면) 신뢰도 문제 없음(=1)으로 본다.
 function groupConfidence(seams, startX, endX) {
@@ -2828,7 +3041,11 @@ function GroupOverridePanel({ videoRef, scrollDefaults, roi, onApply, onCancel }
 }
 
 function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onModeBack }) {
-  const { videoFile, roi, direction, directionNcc, repFrameTimes, stitchedCanvas, seams, bursts } = scrollCapture;
+  const { videoFile, roi, direction, directionNcc, repFrameTimes, stitchedCanvas, seams, bursts, markerData } = scrollCapture;
+  // frameTimeRangeForSpan(옛 방식: 겹치는 대표 프레임들의 시각 min/max)을 timeForGlobalX로 교체 —
+  // markerData.confident면 안정 구간에서 추적한 재생 위치 표시로 선형보간, 아니면 4)의 개선된
+  // piecewise-linear 폴백(burst별 평균 속도). boundaries는 두 방식이 공유하는 같은 좌표계.
+  const timeBoundaries = [0, ...seams.map(s => s.pos)];
   // "몇 마디씩 묶기(목표)"의 기본값 — 사용자가 아직 직접 입력하지 않았다면(null) 이미 감지된 총
   // 마디 수를 그대로 따라가며 채워둔다(감지 결과가 바뀌면 같이 갱신). 한 번이라도 직접 타이핑하면
   // 그 이후로는 항상 사용자가 입력한 값을 그대로 쓴다 — wholeImageFallback과 동일한 패턴.
@@ -2879,7 +3096,10 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
     const confidence = groupConfidence(seams, g.startX, g.endX);
     const key = g.whole ? 'whole' : (g.startIdx + '-' + g.endIdx);
     const override = overrides[key];
-    const timeRange = frameTimeRangeForSpan(seams, repFrameTimes, g.startX, g.endX);
+    const timeRange = {
+      start: timeForGlobalX(markerData, timeBoundaries, repFrameTimes, g.startX),
+      end: timeForGlobalX(markerData, timeBoundaries, repFrameTimes, g.endX),
+    };
     return { ...g, key, confidence, lowConfidence: confidence < 0.7, override, timeRange };
   });
 
@@ -2929,7 +3149,10 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
         <div className="block-head"><span>결과 — 이어붙이기 · 마디선 · 그룹 (재조정 가능)</span></div>
         <p className="hint-text">
           방향: {direction === 'vertical' ? '세로' : '가로'} 스크롤{directionNcc != null ? ' (첫 이음매 NCC=' + directionNcc.toFixed(3) + ')' : ''} ·
-          이어붙인 프레임 {repFrameTimes.length}장
+          이어붙인 프레임 {repFrameTimes.length}장 ·{' '}
+          {markerData && markerData.confident
+            ? <span className="badge badge-precise">정밀 동기화됨 (재생 표시 감지 · 추적점 {markerData.count}개)</span>
+            : <span className="badge badge-estimate">추정값 (재생 표시 없음 — 구간별 보간){markerData ? ' · 추적점 ' + markerData.count + '개(부족)' : ''}</span>}
         </p>
         {outlierBursts.length > 0 && (
           <p className="hint-text" style={{ color: '#c0392b' }}>
