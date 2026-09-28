@@ -2298,6 +2298,55 @@ async function runScrollStage3(repFrames, scrollDefaults, directionPref) {
   // 직접 호출한다. 여기서는 깨끗한(오버레이 없는) stitched canvas만 돌려준다.
   return { direction, directionNcc, canvas: out, seams };
 }
+
+// ---- 그룹 수동 오버라이드용 "구간 재스캔(미니 스티칭)" — 위 4단계 파이프라인(diff 샘플링 →
+// burst 탐지 → 대표 프레임 추출 → 전처리+스티칭)을 임의의 [startT, endT] 구간에만 그대로 다시
+// 돌린다. 단일 프레임 캡처(예전 방식)와 달리, 그 구간 안에서도 여러 프레임에 걸쳐 있는 내용을
+// 놓치지 않는다. diffThreshold가 null/undefined면 메인 분석 화면과 같은 방식(최대 diff의 35%)으로
+// 자동 추정해 반환한다 — 그래야 패널이 처음 열릴 때 threshold를 몰라도 바로 한 번 실행해볼 수 있다.
+async function runMiniStitchForRange(video, roi, startT, endT, diffThreshold, scrollDefaults, directionPref, stepSec) {
+  const step = stepSec || 0.15;
+  const s = Math.max(0, Math.min(startT, video.duration));
+  const e = Math.max(s + step, Math.min(endT, video.duration));
+  const times = [], diffs = [];
+  let prevSample = null;
+  let t = s;
+  while (t < e) {
+    await seekTo(video, t);
+    const sample = getRoiPixelsForDiff(video, roi);
+    times.push(t);
+    if (prevSample) diffs.push(diffScore(prevSample, sample));
+    prevSample = sample;
+    t += step;
+  }
+  if (times[times.length - 1] < e - 1e-6) {
+    await seekTo(video, e);
+    const sample = getRoiPixelsForDiff(video, roi);
+    times.push(e);
+    if (prevSample) diffs.push(diffScore(prevSample, sample));
+  }
+  const maxObserved = Math.max(...diffs, 0.1);
+  const threshold = diffThreshold != null ? diffThreshold : maxObserved * 0.35;
+  const bursts = groupScrollBursts(diffs, threshold);
+  const repIdx = scrollRepIndices(times, bursts);
+  const repFrames = [];
+  for (const idx of repIdx) {
+    const rt = times[idx];
+    await seekTo(video, rt);
+    const captured = captureRoiNative(video, roi);
+    const img = await loadImage(captured.dataUrl);
+    const c = document.createElement('canvas');
+    c.width = captured.w; c.height = captured.h;
+    c.getContext('2d').drawImage(img, 0, 0);
+    repFrames.push({ time: rt, canvas: c });
+  }
+  const stage3 = await runScrollStage3(repFrames, scrollDefaults, directionPref);
+  return {
+    canvas: stage3.canvas, direction: stage3.direction, directionNcc: stage3.directionNcc, seams: stage3.seams,
+    repFrameTimes: repFrames.map(f => f.time), bursts, times, diffs, maxObserved, threshold,
+  };
+}
+
 // ---- ROI 드래그 선택 UI — CaptureStep과 같은 패턴(별도 컴포넌트로 분리해 스크롤/페이지 두
 // 플로우가 각자의 캔버스 ref를 갖게 함, 상태 공유 없음) ----
 function ScrollRoiPicker({ videoRef, videoLoaded, roi, setRoi }) {
@@ -2936,13 +2985,84 @@ function ImageCropPicker({ src, crop, setCrop }) {
   );
 }
 
+// ---- 5단계: 저신뢰 그룹 보완용 "이 구간 다시 만들기" 내부 공용 서브패널 — "이 구간 다시 스캔"과
+// "영상에서 직접 구간 선택" 두 모드가 시작 구간 값/힌트 문구만 다르고 동작은 완전히 같으므로(둘 다
+// runMiniStitchForRange로 미니 스티칭 실행 → 미리보기 → 적용) 하나의 컴포넌트로 재사용한다. ----
+function RangeRescanPanel({ videoRef, roi, scrollDefaults, direction, initialStart, initialEnd, maxDuration, hint, onApply, onCancel }) {
+  const [startT, setStartT] = useState(initialStart);
+  const [endT, setEndT] = useState(initialEnd);
+  const [diffThreshold, setDiffThreshold] = useState(null); // null = 아직 자동 추정 전
+  const [thresholdRange, setThresholdRange] = useState({ min: 0, max: 1, step: 0.01 });
+  const [result, setResult] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const ranOnceRef = useRef(false);
+
+  async function rescan(explicitThreshold) {
+    const video = videoRef.current;
+    if (!video) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await runMiniStitchForRange(
+        video, roi, startT, endT,
+        explicitThreshold != null ? explicitThreshold : diffThreshold,
+        scrollDefaults, direction
+      );
+      setResult(res);
+      setDiffThreshold(res.threshold);
+      setThresholdRange({ min: 0, max: Math.max(0.001, res.maxObserved * 1.3), step: Math.max(0.001, res.maxObserved / 200) });
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (ranOnceRef.current) return;
+    ranOnceRef.current = true;
+    rescan(null);
+  }, []);
+
+  return (
+    <React.Fragment>
+      {hint && <p className="hint-text">{hint}</p>}
+      <div className="toolbar">
+        <label>시작(s): <input type="number" step="0.1" min="0" max={maxDuration}
+          value={startT} onChange={e => setStartT(parseFloat(e.target.value) || 0)} style={{ width: '5.5em' }} /></label>
+        <label>끝(s): <input type="number" step="0.1" min="0" max={maxDuration}
+          value={endT} onChange={e => setEndT(parseFloat(e.target.value) || 0)} style={{ width: '5.5em' }} /></label>
+      </div>
+      <div className="toolbar">
+        <label style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span className="slider-label" style={{ margin: 0, whiteSpace: 'nowrap' }}>diff 임계값</span>
+          <input type="range" min={thresholdRange.min} max={thresholdRange.max} step={thresholdRange.step}
+            value={diffThreshold != null ? diffThreshold : 0} disabled={busy} style={{ flex: 1 }}
+            onChange={e => setDiffThreshold(parseFloat(e.target.value))} />
+          <span className="slider-label" style={{ margin: 0 }}>{diffThreshold != null ? diffThreshold.toFixed(3) : '-'}</span>
+        </label>
+        <button className="icon-btn" onClick={() => rescan(diffThreshold)} disabled={busy}>{busy ? '스캔 중...' : '다시 스캔'}</button>
+      </div>
+      {error && <p className="hint-text" style={{ color: '#c0392b' }}>재스캔 중 오류: {error}</p>}
+      {result && (
+        <div>
+          <img src={result.canvas.toDataURL('image/png')} className="merge-preview-img" alt="재스캔 미리보기" />
+          <p className="hint-text">대표 프레임 {result.repFrameTimes.length}장 · 스크롤(이동) {result.bursts.length}회 감지됨</p>
+        </div>
+      )}
+      <div className="toolbar">
+        <button onClick={() => onApply(result.canvas.toDataURL('image/png'))} disabled={busy || !result}>이 결과 적용</button>
+        <button className="icon-btn" onClick={onCancel} disabled={busy}>취소</button>
+      </div>
+    </React.Fragment>
+  );
+}
+
 // ---- 5단계: 저신뢰 그룹 보완용 "이 구간 다시 만들기" ----
-function GroupOverridePanel({ videoRef, scrollDefaults, roi, onApply, onCancel }) {
-  const [mode, setMode] = useState('scrub'); // 'scrub' | 'upload'
-  // scrub 방식
-  const [seekT, setSeekT] = useState(0);
+function GroupOverridePanel({ videoRef, scrollDefaults, roi, direction, timeRange, onApply, onCancel }) {
+  const [mode, setMode] = useState('rescan'); // 'rescan' | 'manual-range' | 'upload'
   const [duration, setDuration] = useState(videoRef.current ? videoRef.current.duration || 0 : 0);
-  const [scrubRoi, setScrubRoi] = useState(roi);
   // upload 방식
   const [uploadSrc, setUploadSrc] = useState(null);
   const [uploadCrop, setUploadCrop] = useState(null);
@@ -2952,28 +3072,6 @@ function GroupOverridePanel({ videoRef, scrollDefaults, roi, onApply, onCancel }
     const video = videoRef.current;
     if (video && video.duration) setDuration(video.duration);
   }, []);
-
-  async function onSeek(e) {
-    const t = parseFloat(e.target.value);
-    setSeekT(t);
-    await seekTo(videoRef.current, t);
-  }
-
-  async function applyFromScrub() {
-    if (!scrubRoi) { alert('영역을 드래그로 지정하세요.'); return; }
-    setBusy(true);
-    try {
-      const captured = captureRoiNative(videoRef.current, scrubRoi);
-      const img = await loadImage(captured.dataUrl);
-      const c = document.createElement('canvas');
-      c.width = captured.w; c.height = captured.h;
-      c.getContext('2d').drawImage(img, 0, 0);
-      scrollApplyPreprocInPlace(c, scrollDefaults);
-      onApply(c.toDataURL('image/png'));
-    } finally {
-      setBusy(false);
-    }
-  }
 
   function onUploadFile(e) {
     const file = e.target.files && e.target.files[0];
@@ -3001,28 +3099,42 @@ function GroupOverridePanel({ videoRef, scrollDefaults, roi, onApply, onCancel }
     }
   }
 
+  // "이 구간 다시 스캔"은 이 그룹의 원래 구간(정밀 동기화로 이미 알고 있는 정확한 timeRange)을
+  // 그대로 시작값으로 쓰고, "영상에서 직접 구간 선택"은 앞뒤로 여유를 둔 더 넓은 구간을 기본값으로
+  // 제시해 원래 구간에서 누락됐을 수 있는 앞/뒤 내용까지 포함해 다시 잡기 쉽게 한다.
+  const groupStart = timeRange ? timeRange.start : 0;
+  const groupEnd = timeRange ? timeRange.end : (duration || 1);
+  const pad = Math.max(0.3, (groupEnd - groupStart) * 0.3);
+
   return (
     <div className="block" style={{ borderColor: 'var(--accent)' }}>
       <div className="block-head"><span>이 구간 다시 만들기</span></div>
       <div className="toolbar">
-        <button className={mode === 'scrub' ? 'icon-btn' : 'icon-btn'} style={mode === 'scrub' ? { borderColor: 'var(--accent)', color: 'var(--accent)' } : undefined} onClick={() => setMode('scrub')}>영상에서 다시 크롭</button>
-        <button style={mode === 'upload' ? { borderColor: 'var(--accent)', color: 'var(--accent)' } : undefined} className="icon-btn" onClick={() => setMode('upload')}>로컬 이미지 업로드</button>
+        <button className="icon-btn" style={mode === 'rescan' ? { borderColor: 'var(--accent)', color: 'var(--accent)' } : undefined} onClick={() => setMode('rescan')}>이 구간 다시 스캔</button>
+        <button className="icon-btn" style={mode === 'manual-range' ? { borderColor: 'var(--accent)', color: 'var(--accent)' } : undefined} onClick={() => setMode('manual-range')}>영상에서 직접 구간 선택</button>
+        <button className="icon-btn" style={mode === 'upload' ? { borderColor: 'var(--accent)', color: 'var(--accent)' } : undefined} onClick={() => setMode('upload')}>로컬 이미지 업로드</button>
       </div>
-      {mode === 'scrub' ? (
-        <React.Fragment>
-          <div className="toolbar">
-            <label style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
-              구간 스크럽:
-              <input type="range" min="0" max={duration || 0} step="0.1" value={seekT} style={{ flex: 1 }} onChange={onSeek} />
-              <span className="slider-label" style={{ margin: 0 }}>{seekT.toFixed(1)}s</span>
-            </label>
-          </div>
-          <ScrollRoiPicker videoRef={videoRef} videoLoaded={true} roi={scrubRoi} setRoi={setScrubRoi} />
-          <div className="toolbar">
-            <button onClick={applyFromScrub} disabled={busy}>{busy ? '처리 중...' : '이 프레임으로 대체'}</button>
-          </div>
-        </React.Fragment>
-      ) : (
+      {mode === 'rescan' && (
+        <RangeRescanPanel
+          key={'rescan-' + groupStart + '-' + groupEnd}
+          videoRef={videoRef} roi={roi} scrollDefaults={scrollDefaults} direction={direction}
+          initialStart={Math.max(0, groupStart)} initialEnd={Math.min(duration || groupEnd, groupEnd)}
+          maxDuration={duration}
+          hint="원래 이 그룹이 차지했던 구간을 그대로 다시 스캔합니다 (여러 프레임에 걸친 내용도 놓치지 않습니다)."
+          onApply={onApply} onCancel={onCancel}
+        />
+      )}
+      {mode === 'manual-range' && (
+        <RangeRescanPanel
+          key={'manual-' + groupStart + '-' + groupEnd}
+          videoRef={videoRef} roi={roi} scrollDefaults={scrollDefaults} direction={direction}
+          initialStart={Math.max(0, groupStart - pad)} initialEnd={Math.min(duration || groupEnd, groupEnd + pad)}
+          maxDuration={duration}
+          hint="구간을 자유롭게 넓히거나 옮겨서 앞/뒤 누락분까지 포함해 다시 스캔할 수 있습니다."
+          onApply={onApply} onCancel={onCancel}
+        />
+      )}
+      {mode === 'upload' && (
         <React.Fragment>
           <div className="controls">
             <label>이미지 파일: <input type="file" accept="image/*" onChange={onUploadFile} /></label>
@@ -3030,12 +3142,10 @@ function GroupOverridePanel({ videoRef, scrollDefaults, roi, onApply, onCancel }
           {uploadSrc && <ImageCropPicker src={uploadSrc} crop={uploadCrop} setCrop={setUploadCrop} />}
           <div className="toolbar">
             <button onClick={applyFromUpload} disabled={busy || !uploadSrc}>{busy ? '처리 중...' : '이 이미지로 대체'}</button>
+            <button className="icon-btn" onClick={onCancel} disabled={busy}>취소</button>
           </div>
         </React.Fragment>
       )}
-      <div className="toolbar">
-        <button className="icon-btn" onClick={onCancel} disabled={busy}>취소</button>
-      </div>
     </div>
   );
 }
@@ -3231,6 +3341,7 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
                 {src && <img src={src} className="merge-preview-img" style={imgStyle} alt={'그룹 ' + (idx + 1)} />}
                 {overrideOpenKey === g.key && (
                   <GroupOverridePanel videoRef={videoRef} scrollDefaults={scrollDefaults} roi={roi}
+                    direction={direction} timeRange={g.timeRange}
                     onApply={dataUrl => applyOverride(g.key, dataUrl)}
                     onCancel={() => setOverrideOpenKey(null)} />
                 )}
