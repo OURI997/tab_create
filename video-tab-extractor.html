@@ -526,6 +526,7 @@ function renderFrames(frames, direction) {
       seams.push({
         i: i - 1, pos: cursor, score: f.score, dup: !!f.dup, ok: f.ok,
         shift: f.shift != null ? f.shift : f.len, cut: !!f.cut, weight: f.weight, delta: f.delta,
+        ovl: f.ovl, dupSuspect: !!f.dupSuspect, dupFixed: f.dupFixed || 0,
       });
     }
     if (f.dup) return;
@@ -2145,11 +2146,24 @@ function scrollRemoveAxisMean(g, direction) {
   }
 }
 
+// 재생바/하이라이트 열만 중립화한다. 마디선은 정렬 단서이므로 지우지 않는다 — 가로 스크롤에서는 보표 밴드를
+// 먼저 찾아, 밴드 밖으로 끊김 없이 0.6 staff space 이상 삐져나오는 선만 재생바로 본다. 보표를 못 찾는
+// 경우(저해상도 등)에만 예전 규칙(높이의 85% 이상이 어두운 열)을 쓴다.
 function scrollFullLineMask(gA, gB, direction) {
   const len = direction === 'vertical' ? Math.min(gA.h, gB.h) : Math.min(gA.w, gB.w);
   const mask = new Uint8Array(len);
   for (const g of [gA, gB]) {
+    const sys = direction === 'vertical' ? null : detectStaffSystem(g, 0.3, 140);
     for (let i = 0; i < len; i++) {
+      if (sys) {
+        const lim = Math.max(2, Math.round(sys.space * 2));
+        const prot = Math.max(
+          contiguousInk(g, i, sys.main.top - 1, -1, lim, 128),
+          contiguousInk(g, i, sys.main.bottom + 1, 1, lim, 128)
+        );
+        if (prot >= sys.space * 0.6) mask[i] = 1;
+        continue;
+      }
       let dark = 0;
       if (direction === 'vertical') { for (let x = 0; x < g.w; x++) if (g.gray[i * g.w + x] < 128) dark++; if (dark / g.w >= 0.85) mask[i] = 1; }
       else { for (let y = 0; y < g.h; y++) if (g.gray[y * g.w + i] < 128) dark++; if (dark / g.h >= 0.85) mask[i] = 1; }
@@ -2478,7 +2492,7 @@ function runExtentFrom(g, x, ySeed, darkThresh) {
   return { top, bot };
 }
 
-function detectBarsThroughSystem(g, sys, T, left, darkThresh, frames) {
+function detectBarsThroughSystem(g, sys, T, left, darkThresh, frames, headerSpaces) {
   const space = sys.space, staves = sys.main.staves, K = staves.length;
   const tol = Math.max(3, space * 0.4);
   const bands = staves.map(st => [st[0].y0, st[st.length - 1].y1]);
@@ -2553,8 +2567,9 @@ function detectBarsThroughSystem(g, sys, T, left, darkThresh, frames) {
   }
   // 헤더(첫 타일 악보 왼쪽 오선 간격×20) 제외, 제외 후 0이면 범위를 절반으로 재시도
   const run = hs => passed.filter(b => b.x >= left + space * hs);
-  let kept = run(20);
-  if (!kept.length && passed.length) kept = run(10);
+  const H0 = headerSpaces == null ? 20 : headerSpaces;
+  let kept = run(H0);
+  if (!kept.length && passed.length) kept = run(H0 / 2);
   const afterHeader = kept.length;
   kept = pruneCloseBarObjs(kept);
   return { bars: kept, stats: { cand, allStaff: passed.length, afterHeader, afterPrune: kept.length, T, protruded, endMismatch, notPersistent } };
@@ -2894,7 +2909,7 @@ async function medianRepCanvas(video, roi, times, idx, dir, scrollDefaults) {
 
 // burst별 전환 유형 판별. 컷 = (a) 전환이 샘플 1스텝 안에 끝나 중간 프레임이 없고 (b) 오선 제거 + 재생바 열
 // 제외 후 NCC가 유의미한 shift를 못 찾고 (c) A의 오른쪽 끝(화면 폭 10~50%)과 B의 왼쪽 끝이 어떤 shift에서도
-// 겹치지 않음. 겹침이 확인되면 그 burst는 컷이 아니다. 방향이 auto면 가로·세로 둘 다 실패해야 한다.
+// 큰 겹침으로 이어지는 스크롤이 아님. 방향이 auto면 가로·세로 둘 다 확인한다.
 // kind: 'cut'(컷 burst 비율 > 0.9, 다중 샘플 burst 없음) | 'smooth' | 'ambiguous'(비율 0.5~0.9 또는 다중 샘플 burst가 섞임)
 async function classifyCutBursts(video, roi, times, bursts, scrollDefaults, directionPref) {
   if (!bursts.length || directionPref === 'vertical') return { kind: 'smooth', cutCount: 0, multi: 0, ratio: 0, flags: [] };
@@ -2905,15 +2920,15 @@ async function classifyCutBursts(video, roi, times, bursts, scrollDefaults, dire
     if (b.end !== b.start) { flags.push(false); multi++; continue; }
     const A = await medianRepCanvas(video, roi, times, Math.max(0, b.start - 1), -1, scrollDefaults);
     const B = await medianRepCanvas(video, roi, times, Math.min(times.length - 1, b.end + 1), 1, scrollDefaults);
-    const noShift = dirs.every(d => !scrollFindBestShift(A, B, d, { removeStaff: true, maskPlaybar: true }).ok);
-    let overlap = false;
-    if (noShift) {
-      const W = A.width;
-      overlap = scrollFindBestShift(A, B, 'horizontal', {
-        removeStaff: true, maskPlaybar: true, minShift: Math.round(W * 0.5), maxShift: Math.round(W * 0.9),
-      }).ok;
-    }
-    flags.push(noShift && !overlap);
+    // 1스텝에 끝난 전환에서 NCC가 "큰 겹침(60% 초과)"의 실제 스크롤을 찾았을 때만 컷이 아니다. 겹침이 없거나
+    // 작은 겹침(5~60%, 컷 전환 후 앞 화면 마지막 마디가 다시 나오는 경우)이면 컷으로 두고, 겹침 여부는
+    // 이음매 단위 탐지(findSeamOverlap)가 이어붙이는 단계에서 결정한다.
+    const bigOverlapScroll = dirs.some(d => {
+      const r = scrollFindBestShift(A, B, d, { removeStaff: true, maskPlaybar: true });
+      const L = d === 'vertical' ? A.height : A.width;
+      return r.ok && (1 - r.shift / L) > 0.6;
+    });
+    flags.push(!bigOverlapScroll);
   }
   const cutCount = flags.filter(Boolean).length;
   const ratio = cutCount / bursts.length;
@@ -3045,7 +3060,162 @@ function weightedMedian(items) {
   return arr[arr.length - 1].v;
 }
 
+// ---- 이음매 단위 겹침 탐지 (컷 전환인데 앞 화면 마지막 마디가 다음 화면에 다시 나오는 영상) ----
+// 잉크 이진 배열 + ±1px 팽창본. 모든 비교는 전처리된 원본 해상도 타일에서 한다.
+function tileInkSet(info) {
+  if (info.inkSet) return info.inkSet;
+  const { w, h } = info.g;
+  const ink = tileInk(info.g);
+  const dil = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (!ink[y * w + x]) continue;
+      for (let dy = -1; dy <= 1; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= h) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          if (xx >= 0 && xx < w) dil[yy * w + xx] = 1;
+        }
+      }
+    }
+  }
+  info.inkSet = { ink, dil, w, h };
+  return info.inkSet;
+}
+
+// 정렬 관계: B의 로컬 x좌표 u는 A의 x = u + s. 겹침 영역(오선 밴드 높이, 오선 줄 행 제외)에서 ±1px 팽창을 허용한
+// 잉크 일치율(IoU). 겹침 영역의 잉크가 (오선 간격²×5)개 미만이면 검증 불가(null).
+function verifyOverlap(infoA, infoB, setA, setB, s, mask, band, space) {
+  const w = setA.w;
+  const xs = Math.max(infoA.xL, infoB.xL + s), xe = Math.min(infoA.xR, infoB.xR + s);
+  const ow = xe - xs + 1;
+  if (ow < 4) return null;
+  let nA = 0, nB = 0, mA = 0, mB = 0;
+  for (let y = band.top; y <= band.bottom; y++) {
+    if (mask[y]) continue;
+    const row = y * w;
+    for (let x = xs; x <= xe; x++) {
+      const u = x - s;
+      if (u < 0 || u >= w || x < 0 || x >= w) continue;
+      const a = setA.ink[row + x], b = setB.ink[row + u];
+      if (a) { nA++; if (setB.dil[row + u]) mA++; }
+      if (b) { nB++; if (setA.dil[row + x]) mB++; }
+    }
+  }
+  if (Math.max(nA, nB) < space * space * 5) return null;
+  return { iou: (mA + mB) / Math.max(1, nA + nB), ink: Math.max(nA, nB), overlapW: ow };
+}
+
+// 보조 탐색(b): maxDim 900에서 잉크 이진 이미지 일치율로 겹침 폭 5~60% 범위의 shift 후보 상위 3개
+function coarseOverlapCandidates(canvasA, canvasB, mask, band) {
+  const gA = scrollGetGray(canvasA, 900), gB = scrollGetGray(canvasB, 900);
+  const sc = gA.scale, w2 = Math.min(gA.w, gB.w), h2 = Math.min(gA.h, gB.h);
+  const y0 = Math.max(0, Math.floor(band.top * sc)), y1 = Math.min(h2 - 1, Math.ceil(band.bottom * sc));
+  const inkA = new Uint8Array(w2 * h2), inkB = new Uint8Array(w2 * h2);
+  for (let y = y0; y <= y1; y++) {
+    if (mask[Math.min(mask.length - 1, Math.round(y / sc))]) continue;
+    for (let x = 0; x < w2; x++) {
+      inkA[y * w2 + x] = gA.gray[y * gA.w + x] < 160 ? 1 : 0;
+      inkB[y * w2 + x] = gB.gray[y * gB.w + x] < 160 ? 1 : 0;
+    }
+  }
+  const sMin = Math.round(w2 * 0.4), sMax = Math.round(w2 * 0.95);
+  const scores = [];
+  for (let sp = sMin; sp <= sMax; sp++) {
+    const ow = w2 - sp;
+    let m = 0, na = 0, nb = 0;
+    for (let y = y0; y <= y1; y++) {
+      const row = y * w2;
+      for (let x = 0; x < ow; x++) {
+        const a = inkA[row + sp + x], b = inkB[row + x];
+        na += a; nb += b; m += a & b;
+      }
+    }
+    if (na + nb >= 20) scores.push({ sp, score: m / Math.max(1, na + nb - m) });
+  }
+  scores.sort((p, q) => q.score - p.score);
+  const picked = [];
+  for (const c of scores) {
+    if (c.score < 0.3) break;
+    if (picked.every(p => Math.abs(p.sp - c.sp) > 4)) picked.push(c);
+    if (picked.length >= 3) break;
+  }
+  return picked.map(c => Math.round(c.sp / sc));
+}
+
+// 반환: { status: 'overlap'|'none'|'unverifiable', s, px(겹친 폭), iou, cands:[상위 3개 {s,iou,ink,src}] }
+function findSeamOverlap(infoA, infoB, canvasA, canvasB, mask, space) {
+  const W = infoA.g.w;
+  const sysInfo = infoA.sys || infoB.sys;
+  if (!sysInfo) return { status: 'unverifiable', cands: [] };
+  const band = { top: sysInfo.main.top, bottom: sysInfo.main.bottom };
+  const setA = tileInkSet(infoA), setB = tileInkSet(infoB);
+  const lo = Math.round(W * 0.05), hi = Math.round(W * 0.6);
+  const cands = [];
+  const seen = new Set();
+  const evalS = (sv, src) => {
+    if (seen.has(sv)) return;
+    seen.add(sv);
+    const ow = infoA.xR - (infoB.xL + sv) + 1;
+    if (ow < lo || ow > hi) return;
+    const r = verifyOverlap(infoA, infoB, setA, setB, sv, mask, band, space);
+    if (r) cands.push({ s: sv, iou: r.iou, ink: r.ink, src });
+  };
+  // (a) 마디선 x좌표 쌍의 차 (밴드 정확 일치 규칙을 통과한 마디선만, 재생바 제외 — 마디선은 마스킹하지 않고 단서로 사용)
+  if (infoA.sys && infoB.sys) {
+    const barsA = detectBarsThroughSystem(infoA.g, infoA.sys, 0.8, infoA.xL, 140, null, 0).bars.map(b => b.x);
+    const barsB = detectBarsThroughSystem(infoB.g, infoB.sys, 0.8, infoB.xL, 140, null, 0).bars.map(b => b.x);
+    for (const xa of barsA) for (const xb of barsB) evalS(xa - xb, 'bar');
+  }
+  const bestOf = () => cands.reduce((m, c) => (!m || c.iou > m.iou ? c : m), null);
+  let best = bestOf();
+  // (b) 마디선이 없거나 후보 검증에 모두 실패하면 maxDim 900 잉크 이진 이미지 탐색
+  if (!best || best.iou < 0.8) {
+    for (const sv of coarseOverlapCandidates(canvasA, canvasB, mask, band)) {
+      for (let d = -3; d <= 3; d++) evalS(sv + d, 'ncc');
+    }
+    best = bestOf();
+  }
+  if (best) {
+    for (let d = -2; d <= 2; d++) evalS(best.s + d, best.src); // 정밀 보정
+    best = bestOf();
+  }
+  const top = cands.slice().sort((p, q) => q.iou - p.iou).slice(0, 3);
+  if (best && best.iou >= 0.8) {
+    return { status: 'overlap', s: best.s, px: infoA.xR - (infoB.xL + best.s) + 1, iou: best.iou, ink: best.ink, cands: top };
+  }
+  return { status: cands.length ? 'none' : 'unverifiable', cands: top };
+}
+
+// 사후 중복 검사: 이음매 왼쪽 끝 d열(A의 마지막 그려진 열까지)과 오른쪽 처음 d열(B의 첫 그려진 열부터)이
+// 같은 마디(잉크 일치)인지, d = 폭 5~40%. 중복이면 {d, iou}.
+function detectSeamDuplicate(setA, setB, aEnd, bStart, bEnd, mask, band, space, W) {
+  const w = setA.w;
+  let best = null;
+  for (let d = Math.round(W * 0.05); d <= Math.round(W * 0.4); d += 2) {
+    if (aEnd - d + 1 < 0 || bStart + d - 1 > bEnd) continue;
+    let nA = 0, nB = 0, mA = 0, mB = 0;
+    for (let y = band.top; y <= band.bottom; y++) {
+      if (mask[y]) continue;
+      const row = y * w;
+      for (let k = 0; k < d; k++) {
+        const xa = aEnd - d + 1 + k, xb = bStart + k;
+        const a = setA.ink[row + xa], b = setB.ink[row + xb];
+        if (a) { nA++; if (setB.dil[row + xb]) mA++; }
+        if (b) { nB++; if (setA.dil[row + xa]) mB++; }
+      }
+    }
+    if (Math.max(nA, nB) < space * space * 5) continue;
+    const iou = (mA + mB) / Math.max(1, nA + nB);
+    if (iou >= 0.8 && (!best || iou > best.iou)) best = { d, iou };
+  }
+  return best;
+}
+
 // tiles: [{canvas, t, t0, t1}] → 조각 목록(타일 하나당 조각 하나, 중복 타일은 dup) 또는 null(오선을 못 찾음)
+// 이음 방식은 이음매마다 독립 결정: 겹침 확정이면 겹친 폭만큼 B 왼쪽을 잘라 이어 붙이고, 겹침 없음이면
+// butt-join(연속성 점수로 고른 공통 δ). 타일 경계 양쪽 2px는 트림해 연한 회색 세로선을 없앤다.
 async function buildCutFrames(tiles, scrollDefaults) {
   for (const tl of tiles) scrollApplyPreprocInPlace(tl.canvas, scrollDefaults);
   const infos = tiles.map(tl => analyzeTileStaff(tl.canvas));
@@ -3055,6 +3225,8 @@ async function buildCutFrames(tiles, scrollDefaults) {
   const space = medianOf(withSys.map(i => i.sys.space));
   const mask = new Uint8Array(h);
   for (const i of withSys) for (let y = 0; y < h; y++) if (i.sys.mask[y]) mask[y] = 1;
+  const bandSys = withSys[0].sys;
+  const band = { top: bandSys.main.top, bottom: bandSys.main.bottom };
 
   // 중복 타일(같은 화면이 반복) — 오선 제거 후 NCC로 판정해 오선만 같은 서로 다른 화면을 중복으로 오인하지 않게
   const dupFlags = tiles.map(() => false);
@@ -3066,18 +3238,21 @@ async function buildCutFrames(tiles, scrollDefaults) {
 
   const inkCache = {};
   const inkOf = idx => (inkCache[idx] || (inkCache[idx] = tileInk(infos[idx].g)));
-  const seamRes = {};
+  const pairRes = {};
   const wm = [];
   for (let j = 1; j < keep.length; j++) {
     const a = keep[j - 1], b = keep[j];
+    const ov = findSeamOverlap(infos[a], infos[b], tiles[a].canvas, tiles[b].canvas, mask, space);
     const r = findCutSeamOffset(inkOf(a), w, h, infos[a].xR, inkOf(b), w, infos[b].xL, mask, space);
-    seamRes[b] = r;
-    if (r) wm.push({ v: r.d, w: r.match >= 4 ? r.match : 0 });
+    pairRes[b] = { ov, r };
+    if (ov.status !== 'overlap' && r) wm.push({ v: r.d, w: r.match >= 4 ? r.match : 0 });
   }
   const common = Math.round(weightedMedian(wm));
 
+  const lastKept = keep[keep.length - 1];
+  const TRIM = 2;
   const frames = [];
-  let lastReal = null;
+  let lastReal = null, prevKeptIdx = null;
   for (let k = 0; k < tiles.length; k++) {
     const tl = tiles[k], inf = infos[k];
     if (dupFlags[k]) {
@@ -3085,16 +3260,52 @@ async function buildCutFrames(tiles, scrollDefaults) {
       frames.push(newScrollFrame({ canvas: tl.canvas, t: tl.t, srcX: 0, len: 0, dup: true, cut: true, t0: tl.t0, t1: tl.t1, score: 1, ok: true }));
       continue;
     }
-    const r = seamRes[k];
     const first = k === keep[0];
-    const srcX = first ? inf.xL : Math.max(0, Math.min(inf.xR, inf.xL + common));
+    const e = inf.xR - (k === lastKept ? 0 : TRIM);
+    const pr = pairRes[k];
+    let srcX, score = null, weight = 0, delta = 0, ovl = null;
+    if (first) {
+      srcX = inf.xL;
+    } else if (pr && pr.ov.status === 'overlap') {
+      const aEnd = infos[prevKeptIdx].xR - TRIM;
+      srcX = Math.max(inf.xL, aEnd - pr.ov.s + 1);
+      score = pr.ov.iou; weight = pr.ov.ink;
+      ovl = { kind: 'overlap', px: pr.ov.px, iou: pr.ov.iou, cands: pr.ov.cands };
+    } else {
+      srcX = Math.max(0, Math.min(e, inf.xL + common + TRIM));
+      delta = common;
+      score = pr && pr.r ? pr.r.match / Math.max(1, pr.r.match + pr.r.mism) : null;
+      weight = pr && pr.r ? pr.r.match : 0;
+      ovl = { kind: pr ? pr.ov.status : 'none', px: 0, cands: pr ? pr.ov.cands : [] };
+    }
+    srcX = Math.min(srcX, Math.max(0, e));
     const f = newScrollFrame({
-      canvas: tl.canvas, t: tl.t, srcX, len: Math.max(1, inf.xR - srcX + 1), cut: true, t0: tl.t0, t1: tl.t1,
-      score: first || !r ? null : r.match / Math.max(1, r.match + r.mism), ok: true,
-      weight: r ? r.match : 0, delta: first ? 0 : common,
+      canvas: tl.canvas, t: tl.t, srcX, len: Math.max(1, e - srcX + 1), cut: true, t0: tl.t0, t1: tl.t1,
+      score, ok: true, weight, delta, ovl,
     });
     frames.push(f);
     lastReal = f;
+    prevKeptIdx = k;
+  }
+
+  // 사후 중복 검사 — 이음매 양쪽 5~40% 구간이 같은 마디면 중복 의심: 겹침 탐지(1번)가 놓친 것이므로 중복 폭만큼
+  // B 왼쪽을 잘라 자동 수정하고, 그래도 남으면 dupSuspect로 표시(주황 깃발 대상)
+  const realFrames = frames.filter(f => !f.dup);
+  for (let j = 1; j < keep.length; j++) {
+    const fp = frames.filter(f => !f.dup)[j - 1], fc = realFrames[j];
+    const ia = keep[j - 1], ib = keep[j];
+    const setA = tileInkSet(infos[ia]), setB = tileInkSet(infos[ib]);
+    for (let pass = 0; pass < 2; pass++) {
+      const dd = detectSeamDuplicate(setA, setB, fp.srcX + fp.len - 1, fc.srcX, fc.srcX + fc.len - 1, mask, band, space, w);
+      if (!dd) break;
+      if (pass === 0 && fc.len - dd.d >= 1) {
+        fc.srcX += dd.d; fc.len -= dd.d;
+        fc.dupFixed = (fc.dupFixed || 0) + dd.d;
+      } else {
+        fc.dupSuspect = true;
+        break;
+      }
+    }
   }
   const both = withSys.filter(i => i.touchL && i.touchR).length;
   return { frames, notes: { roiNarrow: both / withSys.length >= 0.5, commonDelta: common, space } };
@@ -4328,10 +4539,13 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
 
   // 컷 이음새 자동 검증 — 이음새를 낀 마디 폭, 양쪽 내용 중복 흔적. 통과 못 한 이음새만 저신뢰.
   const seamChecks = useMemo(() => validateCutSeams(layout.seams, bars, detection, quality.low), [layout.seams, bars, detection, quality.low]);
-  const seamsV = layout.seams.map((s, i) => ({ ...s, flagged: !!(seamChecks[i] && seamChecks[i].flagged), reason: seamChecks[i] && seamChecks[i].reason }));
+  const seamsV = layout.seams.map((s, i) => ({
+    ...s, flagged: !!(seamChecks[i] && seamChecks[i].flagged),
+    reason: (seamChecks[i] && seamChecks[i].reason) || (s.dupSuspect ? '이음매 양쪽에 같은 마디가 반복됨 (자동 수정 실패)' : null),
+  }));
   const seamsInfo = seamsV.map((s, i) => ({
     ...s, widthRatio: seamChecks[i] ? seamChecks[i].widthRatio : null,
-    needsFix: s.flagged || (!s.cut && !s.dup && s.score != null && s.score < 0.7),
+    needsFix: s.flagged || s.dupSuspect || (!s.cut && !s.dup && s.score != null && s.score < 0.7),
   }));
   const fixSeams = seamsInfo.filter(s => s.needsFix); // 수정 후 검증을 다시 통과하면 자동으로 목록·깃발에서 빠진다
   const curSeam = fixSeams.length ? (fixSeams.find(s => s.i === seamSel) || fixSeams[0]) : null;
@@ -4613,6 +4827,15 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
                 scoreText = (s.score == null || !(s.weight >= 4)) ? ('연속도 판단 보류 (가중 ' + (s.weight || 0) + ')') : ('연속도 ' + s.score.toFixed(2) + ' (가중 ' + s.weight + ')');
                 criterion = (quality.low ? '실패 기준: 연속도 < 0.40 (가중 ≥ 4) 또는 내용 중복' : '실패 기준: 낀 마디 폭이 중앙값의 0.4~2.5배 밖 또는 내용 중복')
                   + (s.widthRatio != null ? ' · 마디 폭 비 ' + s.widthRatio.toFixed(2) : '');
+                const o = s.ovl;
+                const ovText = s.dupSuspect ? '중복 의심 (자동 수정 실패)'
+                  : (s.dupFixed ? ('중복 의심 → 자동 수정 (' + s.dupFixed + 'px 제거)')
+                    : (o && o.kind === 'overlap' ? ('겹침 ' + o.px + 'px 제거 (IoU ' + o.iou.toFixed(2) + ')')
+                      : (o && o.kind === 'unverifiable' ? '겹침 판단 불가(잉크 부족) → 겹침 없음으로 처리' : '겹침 없음')));
+                scoreText = ovText + ' · ' + scoreText;
+                if (o && o.cands && o.cands.length) {
+                  criterion += ' · 후보: ' + o.cands.map(c => 'shift ' + c.s + ' / IoU ' + c.iou.toFixed(2) + ' / 잉크 ' + c.ink + ' (' + (c.src === 'bar' ? '마디선' : 'NCC') + ')').join(' ; ');
+                }
               } else { scoreText = 'NCC ' + (s.score != null ? s.score.toFixed(2) : '-'); criterion = '실패 기준: NCC < 0.70'; }
               return (
                 <div key={s.i} onClick={() => !s.dup && selectSeam(s.i)}
