@@ -494,45 +494,159 @@ function findChangedBlobCentroid(dataA, dataB, w, h, diffThresh, maxAreaFraction
   return best;
 }
 
-// repIndices(대표 프레임을 뽑은 시각 인덱스들)의 인접한 두 항목 사이가 "안정 구간"(그 사이에
-// 감지된 burst가 없음, 즉 스크롤이 실제로 일어나지 않은 구간)인지 — burst 전/후 프레임 쌍(그
-// burst 자신의 전환 구간)만 아니면 전부 안정 구간이다.
-function isStableIndexGap(idxA, idxB, bursts) {
-  return !bursts.some(b => (b.start - 1) === idxA && (b.end + 1) === idxB);
+// ==== 프레임 모델 — 스티칭 결과를 "그려진 조각(frame)들의 목록"으로 표현한다 ====
+// frame = { id, canvas, t, srcX, len, dup, score, ok, shift?, cut?, t0?, t1?, weight?, delta? }
+//  - canvas: 전처리가 끝난 원본 해상도 캡처(ROI 크롭), srcX/len: 그 canvas에서 실제로 그려지는 축 방향 구간
+//  - t: 대표 시각, cut 타일은 t0~t1이 그 타일이 화면에 떠 있던 정확한 시간 구간(컷 시각으로 고정)
+//  - score/ok: 이전 조각과의 이음새 품질(첫 조각은 null)
+// 이렇게 "조각 목록"을 단일 진실로 두면 이음새 미세 조정, 구간 재스캔 패치, 마커 좌표 이동이
+// 모두 목록 편집 + renderFrames 재실행만으로 일관되게 처리된다.
+let scrollFrameIdSeq = 1;
+function newScrollFrame(props) {
+  return { id: scrollFrameIdSeq++, dup: false, score: null, ok: true, ...props };
 }
 
-// 스티칭 단계의 seam 데이터(seam.pos = 그 프레임이 최종 이미지에서 시작하는 위치, seam.shift =
-// 겹치지 않고 새로 그려진 폭)로부터, 각 대표 프레임(0-based, repFrames 배열 인덱스)의
-// "로컬(그 프레임 자신의 원본 해상도 crop) 좌표 → 최종 스티칭 이미지 좌표" 변환에 필요한
-// (boundaries[k], srcXs[k]) 쌍을 계산한다 — boundaries는 결과 화면(ScrollResultStep)이 그룹
-// 경계 계산에 쓰는 것과 정확히 같은 구성([0, ...seams.map(s=>s.pos)])이라 항상 일치한다.
-function computeFrameGlobalOffsets(seams, frameLen) {
-  const boundaries = [0];
-  const srcXs = [0];
-  for (let i = 0; i < seams.length; i++) {
-    boundaries.push(seams[i].pos);
-    const shift = Math.max(1, seams[i].shift);
-    srcXs.push(seams[i].dup ? frameLen : Math.max(0, frameLen - shift));
+function renderFrames(frames, direction) {
+  const vertical = direction === 'vertical';
+  const first = frames[0].canvas;
+  const crossLen = vertical ? first.width : first.height;
+  let total = 0;
+  for (const f of frames) if (!f.dup) total += f.len;
+  total = Math.max(1, Math.round(total));
+  const out = document.createElement('canvas');
+  if (vertical) { out.width = crossLen; out.height = total; } else { out.width = total; out.height = crossLen; }
+  const octx = out.getContext('2d');
+  octx.fillStyle = '#ffffff';
+  octx.fillRect(0, 0, out.width, out.height);
+  const placed = [], seams = [];
+  let cursor = 0;
+  frames.forEach((f, i) => {
+    placed.push({ ...f, start: cursor });
+    if (i > 0) {
+      seams.push({
+        i: i - 1, pos: cursor, score: f.score, dup: !!f.dup, ok: f.ok,
+        shift: f.shift != null ? f.shift : f.len, cut: !!f.cut, weight: f.weight, delta: f.delta,
+      });
+    }
+    if (f.dup) return;
+    if (vertical) octx.drawImage(f.canvas, 0, f.srcX, f.canvas.width, f.len, 0, cursor, f.canvas.width, f.len);
+    else octx.drawImage(f.canvas, f.srcX, 0, f.len, f.canvas.height, cursor, 0, f.len, f.canvas.height);
+    cursor += f.len;
+  });
+  return { canvas: out, placed, seams, total };
+}
+
+// 구간 재스캔 결과를 전역 조각 목록의 [xA, xB) 구간에 패치한다. 걸쳐 있는 조각은 경계에서 잘라
+// 남기고(시간 구간도 비례해서 줄임), 그 뒤 조각들은 renderFrames가 새 폭만큼 자동으로 밀어준다.
+// 마커 점은 (조각 id, 로컬 좌표)로 저장돼 있어 남은 조각의 점은 따로 옮길 필요 없이 같이 이동한다.
+function patchFrames(placed, xA, xB, miniFrames) {
+  const lead = [], trail = [];
+  for (const f of placed) {
+    const fs = f.start, fe = f.dup ? f.start : f.start + f.len;
+    const { start: _s, ...base } = f;
+    if (f.dup) {
+      if (fs < xA) lead.push(base); else if (fs >= xB) trail.push({ ...base, score: 1, ok: true });
+      continue;
+    }
+    if (fe <= xA) { lead.push(base); continue; }
+    if (fs >= xB) { trail.push(base); continue; }
+    const hasLead = fs < xA, hasTrail = fe > xB;
+    if (hasLead) {
+      const keep = xA - fs;
+      const piece = { ...base, len: keep };
+      if (f.t0 != null) piece.t1 = f.t0 + (keep / f.len) * (f.t1 - f.t0);
+      lead.push(piece);
+    }
+    if (hasTrail) {
+      const skip = xB - fs;
+      const piece = { ...base, srcX: f.srcX + skip, len: f.len - skip, score: 1, ok: true };
+      if (f.t0 != null) piece.t0 = f.t0 + (skip / f.len) * (f.t1 - f.t0);
+      if (hasLead) piece.id = scrollFrameIdSeq++;
+      trail.push(piece);
+    }
   }
-  return { boundaries, srcXs };
-}
-function localToGlobal(localPos, frameIdx, boundaries, srcXs) {
-  return boundaries[frameIdx] + (localPos - srcXs[frameIdx]);
+  const mini = miniFrames.map((f, i) => ({ ...f, id: scrollFrameIdSeq++, score: i === 0 ? 1 : f.score, ok: i === 0 ? true : f.ok }));
+  const merged = [...lead, ...mini, ...trail];
+  merged[0] = { ...merged[0], dup: false };
+  return merged;
 }
 
-// 2) 안정 구간마다 촘촘히 샘플링해서 "시각 → 최종 스티칭 이미지 내 위치(global)" 후보 목록을
-// 모은다. 이미 캡처해둔 repFrames(대표 프레임)는 재사용하지 않는다 — 안정 구간 "내부"의 세밀한
-// 변화를 보려면 그 사이 시각들을 새로 seek해야 하기 때문. 비용을 통제하기 위해 안정 구간에서만
-// (스크롤 자체가 일어나는 burst 구간은 배경도 같이 움직여 표시만 분리하기 어려우므로 원래도 제외
-// 대상) 동작하고, 구간당 샘플 수 상한(MARKER_MAX_SAMPLES_PER_GAP)을 둔다.
-async function detectPlaybackMarker({ video, roi, direction, repIndices, times, bursts, seams, frameLen, onProgress }) {
-  const { boundaries, srcXs } = computeFrameGlobalOffsets(seams, frameLen);
-  const allPoints = [];
-  for (let k = 0; k < repIndices.length - 1; k++) {
-    const idxA = repIndices[k], idxB = repIndices[k + 1];
-    if (!isStableIndexGap(idxA, idxB, bursts)) continue;
-    const tA = times[idxA], tB = times[idxB];
+// 컷 이음새 미세 조정 — 이음새 i는 조각 i+1의 시작 경계. d>0이면 오른쪽 타일 내용이 왼쪽으로(d px)
+// 이동(타일 앞부분 d열을 잘라냄), d<0이면 오른쪽으로 이동(앞쪽 여백 열을 포함). all이면 모든 컷 이음새.
+function adjustCutSeam(frames, seamIdx, d, all) {
+  return frames.map((f, idx) => {
+    const target = all ? (idx > 0 && f.cut && !f.dup) : (idx === seamIdx + 1 && !f.dup);
+    if (!target) return f;
+    const end = f.srcX + f.len;
+    const ns = Math.max(0, Math.min(end - 1, f.srcX + d));
+    return { ...f, srcX: ns, len: end - ns, delta: (f.delta || 0) + (ns - f.srcX) };
+  });
+}
+
+// ---- 시간 ↔ 좌표 매핑 (조각 기반 폴백) ----
+// 각 조각의 시간 구간: cut 타일은 [t0,t1](컷 시각으로 고정), 부드러운 스크롤 조각은 [t, 다음 조각 t]
+// (burst 구간은 그 구간의 평균 속도, 정지 구간은 이어지는 두 조각의 t가 같아 기울기 0).
+function frameTimeSpan(placed, i) {
+  const f = placed[i];
+  const tS = f.t0 != null ? f.t0 : f.t;
+  let tE;
+  if (f.t1 != null) tE = f.t1;
+  else if (i + 1 < placed.length) tE = placed[i + 1].t0 != null ? placed[i + 1].t0 : placed[i + 1].t;
+  else tE = f.t;
+  return [tS, tE];
+}
+function timeForXByFrames(placed, x) {
+  let lastTE = null;
+  for (let i = 0; i < placed.length; i++) {
+    const f = placed[i];
+    if (f.dup) continue;
+    const [tS, tE] = frameTimeSpan(placed, i);
+    if (lastTE == null && x < f.start) return tS;
+    if (x >= f.start && x < f.start + f.len) {
+      const frac = f.len > 0 ? (x - f.start) / f.len : 0;
+      return tS + frac * (tE - tS);
+    }
+    lastTE = tE;
+  }
+  return lastTE;
+}
+function xForTimeByFrames(placed, totalLen, t) {
+  let first = true;
+  for (let i = 0; i < placed.length; i++) {
+    const f = placed[i];
+    if (f.dup) continue;
+    const [tS, tE] = frameTimeSpan(placed, i);
+    if (first && t < tS) return 0;
+    first = false;
+    if (t >= tS && t <= tE) return tE > tS ? f.start + ((t - tS) / (tE - tS)) * f.len : f.start;
+  }
+  return totalLen;
+}
+
+// repIndices(대표 프레임을 뽑은 시각 인덱스들)의 인접한 두 항목 사이가 "안정 구간"(그 사이에
+// 감지된 burst가 없음)이면 재생 표시 추적용 세그먼트로 만든다. frameIdx는 그 구간이 속한(시작
+// 쪽) 대표 프레임의 인덱스.
+function smoothMarkerSegments(repIdx, times, bursts) {
+  const segs = [];
+  for (let k = 0; k < repIdx.length - 1; k++) {
+    const a = repIdx[k], b = repIdx[k + 1];
+    if (bursts.some(bu => (bu.start - 1) === a && (bu.end + 1) === b)) continue;
+    segs.push({ tA: times[a], tB: times[b], frameIdx: k });
+  }
+  return segs;
+}
+
+// 2) 안정 구간(세그먼트)마다 촘촘히 샘플링해서 "시각 → (조각 id, 조각 내 로컬 좌표)" 후보 목록을
+// 모은다. 구간당 샘플 수 상한(MARKER_MAX_SAMPLES_PER_GAP)을 둔다. 중복(dup) 조각에 속한 구간은
+// 내용이 같은 직전의 실제 그려진 조각으로 앵커링한다(로컬 좌표가 동일하므로 그대로 유효).
+async function detectPlaybackMarker({ video, roi, direction, segments, frames, frameLen, onProgress }) {
+  const rawPoints = [];
+  for (const seg of segments) {
+    const { tA, tB } = seg;
     if (tB - tA < MARKER_MIN_GAP_DURATION_SEC) continue;
+    let anchor = seg.frameIdx;
+    while (anchor > 0 && frames[anchor].dup) anchor--;
+    const f = frames[anchor];
     let step = MARKER_FINE_STEP_SEC;
     const rawCount = Math.ceil((tB - tA) / step) + 1;
     if (rawCount > MARKER_MAX_SAMPLES_PER_GAP) step = (tB - tA) / MARKER_MAX_SAMPLES_PER_GAP;
@@ -547,21 +661,33 @@ async function detectPlaybackMarker({ video, roi, direction, repIndices, times, 
       if (prev) {
         const blob = findChangedBlobCentroid(prev.data, sample.data, sample.w, sample.h, MARKER_DIFF_LUM_THRESH, MARKER_MAX_AREA_FRACTION);
         if (blob) {
-          // blob.x/y는 다운스케일된 sample 좌표계 — 원본(native) 해상도 축 좌표로 환산한 뒤,
-          // 이 안정 구간이 속한 대표 프레임(k)의 스티칭 오프셋을 적용해 최종 이미지 좌표로 투영.
           const localSample = direction === 'vertical' ? blob.y : blob.x;
           const sampleAxisLen = direction === 'vertical' ? sample.h : sample.w;
-          const localNative = (localSample / sampleAxisLen) * frameLen;
-          const globalPos = localToGlobal(localNative, k, boundaries, srcXs);
-          allPoints.push({ time: fineTimes[i], globalPos });
+          rawPoints.push({ time: fineTimes[i], fid: f.id, local: (localSample / sampleAxisLen) * frameLen });
         }
       }
       prev = sample;
       if (onProgress) onProgress();
     }
   }
-  allPoints.sort((a, b) => a.time - b.time);
-  return { allPoints, boundaries };
+  rawPoints.sort((a, b) => a.time - b.time);
+  return { rawPoints };
+}
+
+// 저장된 (조각 id, 로컬 좌표) 점들을 "현재" 레이아웃 기준 전역 좌표로 변환 — 이음새 조정/패치로
+// 레이아웃이 바뀌어도 항상 최신 좌표를 쓴다. 사라진 조각이거나 잘려나간 로컬 구간의 점은 버린다.
+function markerPointsToGlobal(rawPoints, placed) {
+  const byId = new Map();
+  for (const f of placed) byId.set(f.id, f);
+  const out = [];
+  for (const p of rawPoints) {
+    const f = byId.get(p.fid);
+    if (!f || f.dup) continue;
+    if (p.local < f.srcX || p.local >= f.srcX + f.len) continue;
+    out.push({ time: p.time, globalPos: f.start + (p.local - f.srcX) });
+  }
+  out.sort((a, b) => a.time - b.time);
+  return out;
 }
 
 // 3) 신뢰도 검증 — 최소 개수 이상, 스크롤 진행 방향(=global 좌표가 커지는 방향, 스티칭 관례상
@@ -596,36 +722,33 @@ function interpolateTimeFromMarker(allPoints, targetX) {
       return a.time + frac * (b.time - a.time);
     }
   }
-  return null; // 추적 범위 밖 — 호출부에서 폴백으로 넘어감
+  return null;
 }
 
-// 4) 개선된 폴백 — (repFrameTimes[k], boundaries[k]) 쌍은 이미 burst 구간(기울기=그 구간의 평균
-// 속도)과 안정 구간(기울기=0, 그 구간 전체가 같은 위치)이 번갈아 나오는 자연스러운 piecewise-
-// linear 함수다. 목표 위치를 포함하는 구간을 찾아 그 안에서 선형보간 — 이전 방식(겹치는 대표
-// 프레임들의 시각 min/max만 취하던 것)보다 훨씬 정밀하다.
-function piecewiseTimeForGlobalX(boundaries, repFrameTimes, targetX) {
-  const n = boundaries.length;
-  if (!n) return null;
-  if (targetX <= boundaries[0]) return repFrameTimes[0];
-  if (targetX >= boundaries[n - 1]) return repFrameTimes[n - 1];
-  for (let k = 0; k < n - 1; k++) {
-    if (targetX >= boundaries[k] && targetX <= boundaries[k + 1]) {
-      const span = boundaries[k + 1] - boundaries[k];
-      const frac = span > 1e-6 ? (targetX - boundaries[k]) / span : 0;
-      return repFrameTimes[k] + frac * (repFrameTimes[k + 1] - repFrameTimes[k]);
-    }
-  }
-  return repFrameTimes[n - 1];
-}
-
-// 마디별 정밀 시간 조회의 단일 진입점 — 마커 추적 데이터가 있고 그 추적 범위 안이면 마커 기반,
-// 아니면(추적 실패 전체 또는 이 특정 위치만 추적 범위 밖) 4)의 피스와이즈 폴백.
-function timeForGlobalX(markerData, boundaries, repFrameTimes, targetX) {
-  if (markerData && markerData.confident) {
+// x → 시간. 재생 표시가 신뢰할 만하면 그 궤적(타일 경계는 위 조각 모델이 컷 시각으로 고정), 아니면
+// 조각 모델(cut: 타일 내 선형, smooth: burst별 평균 속도 piecewise).
+function timeForGlobalX(markerData, placed, targetX) {
+  if (markerData && markerData.confident && markerData.allPoints.length) {
     const t = interpolateTimeFromMarker(markerData.allPoints, targetX);
     if (t != null) return t;
   }
-  return piecewiseTimeForGlobalX(boundaries, repFrameTimes, targetX);
+  return timeForXByFrames(placed, targetX);
+}
+// 시간 → x (구간 재스캔 패치 범위 계산용). 마커 궤적의 추적 구간 안이면 그 궤적의 역변환.
+function globalXForTime(markerData, placed, totalLen, t) {
+  if (markerData && markerData.confident && markerData.allPoints.length >= 2) {
+    const pts = markerData.allPoints;
+    if (t >= pts[0].time && t <= pts[pts.length - 1].time) {
+      for (let i = 0; i < pts.length - 1; i++) {
+        const a = pts[i], b = pts[i + 1];
+        if (t >= a.time && t <= b.time) {
+          const dt = b.time - a.time;
+          return dt > 1e-9 ? a.globalPos + ((t - a.time) / dt) * (b.globalPos - a.globalPos) : a.globalPos;
+        }
+      }
+    }
+  }
+  return xForTimeByFrames(placed, totalLen, t);
 }
 
 // ==== onset (sound-start) detection — spectral flux, reused from the verified onset-detect-test.html
@@ -1999,15 +2122,44 @@ function scrollScoreShift(gA, gB, direction, s, W, H) {
 // 최소-겹침 편향 버그 방지: 최고 NCC 대비 tolerance(0.03) 이내인 shift들 중 "가장 작은 shift"
 // (=가장 많이 겹치는 지점)를 채택 — 단순 최대NCC 채택 금지 (탐색범위 s는 오름차순이므로 첫 번째
 // 통과 항목이 곧 가장 작은 shift다).
-function scrollFindBestShift(canvasA, canvasB, direction) {
-  const SEARCH_MAXDIM = 220;
+// 스크롤 축 방향 평균 제거 — 오선은 스크롤 방향으로 계속 이어지는 선이라 어느 shift에서나 겹쳐 보여
+// NCC 바닥값을 깔아버린다. 선(행/열)마다 그 선 위의 평균을 빼면 오선(및 균일한 줄)이 사라지고 음표
+// 등 실제 내용만 남는다. direction이 horizontal이면 행별(x방향) 평균, vertical이면 열별(y방향) 평균.
+function scrollRemoveAxisMean(g, direction) {
+  const { gray, w, h } = g;
+  if (direction === 'vertical') {
+    for (let x = 0; x < w; x++) {
+      let m = 0;
+      for (let y = 0; y < h; y++) m += gray[y * w + x];
+      m /= h;
+      for (let y = 0; y < h; y++) gray[y * w + x] -= m;
+    }
+  } else {
+    for (let y = 0; y < h; y++) {
+      let m = 0;
+      const base = y * w;
+      for (let x = 0; x < w; x++) m += gray[base + x];
+      m /= w;
+      for (let x = 0; x < w; x++) gray[base + x] -= m;
+    }
+  }
+}
+
+// opts: { removeStaff, minShift, maxShift, maxDim } — minShift/maxShift는 원본 해상도 px 단위(생략하면
+// 기존처럼 전체 길이의 15%~85%). 기존 호출(opts 없음)은 동작이 완전히 동일하다.
+function scrollFindBestShift(canvasA, canvasB, direction, opts) {
+  opts = opts || {};
+  const SEARCH_MAXDIM = opts.maxDim || 220;
   const gA = scrollGetGray(canvasA, SEARCH_MAXDIM);
   const gB = scrollGetGray(canvasB, SEARCH_MAXDIM);
+  if (opts.removeStaff) { scrollRemoveAxisMean(gA, direction); scrollRemoveAxisMean(gB, direction); }
   const W = Math.min(gA.w, gB.w), H = Math.min(gA.h, gB.h);
 
   const totalLen = direction === 'vertical' ? H : W;
-  const minLen = Math.max(2, Math.round(totalLen * 0.15));
-  const maxLen = Math.round(totalLen * 0.85);
+  let minLen = Math.max(2, Math.round(totalLen * 0.15));
+  let maxLen = Math.round(totalLen * 0.85);
+  if (opts.minShift != null) minLen = Math.max(1, Math.round(opts.minShift * gA.scale));
+  if (opts.maxShift != null) maxLen = Math.min(totalLen - 1, Math.max(minLen, Math.round(opts.maxShift * gA.scale)));
 
   const scores = [];
   for (let s = minLen; s <= maxLen; s++) {
@@ -2039,10 +2191,11 @@ function scrollFindBestShiftAuto(canvasA, canvasB) {
 // 중복 프레임 스킵: shift=0 상태(오프셋 탐색 없이 전체 프레임)에서 NCC ≥ 0.9면 "실제 스크롤
 // 없었음"으로 보고 해당 쌍을 스티칭에서 완전히 제외한다.
 const SCROLL_DUP_SIMILARITY_THRESHOLD = 0.9;
-function scrollIsDuplicateFrame(canvasA, canvasB) {
+function scrollIsDuplicateFrame(canvasA, canvasB, removeStaff) {
   const SEARCH_MAXDIM = 220;
   const gA = scrollGetGray(canvasA, SEARCH_MAXDIM);
   const gB = scrollGetGray(canvasB, SEARCH_MAXDIM);
+  if (removeStaff) { scrollRemoveAxisMean(gA, 'horizontal'); scrollRemoveAxisMean(gB, 'horizontal'); }
   const W = Math.min(gA.w, gB.w), H = Math.min(gA.h, gB.h);
   const bufA = [], bufB = [];
   for (let y = 0; y < H; y++) {
@@ -2055,9 +2208,11 @@ function scrollIsDuplicateFrame(canvasA, canvasB) {
   return { isDup: sim >= SCROLL_DUP_SIMILARITY_THRESHOLD, sim };
 }
 
-// ---- 마디선(bar-line) 기하 검출 — scroll-stitch-test.html에서 그대로 이식 (OCR/ML 없음) ----
-// detectStaffBand라는 이름은 이 파일의 기존 배치-합치기(mergeImagesIntoRow) 기능에 이미 쓰이고
-//있어(다른 알고리즘) detectStaffYBand로만 이름을 바꿨다 — 로직 자체는 프로토타입과 동일하다.
+// ---- 보표 구조 + 마디선(bar-line) 기하 검출 ----
+// 줄 간격(staff space) 기준으로 5선/6선 보표를 묶고, 인접 보표(간격 1.5~6 staff space)는 하나의
+// 시스템(큰 보표)으로 병합한다. 마디선은 시스템 밴드 높이를 거의 끊김 없이 덮는 가늘고 고립된 세로
+// 획만 인정한다(화음 덩어리·줄기 제외). OCR/ML 없음. (예전 detectStaffYBand/detectBarLines는 이
+// 구조 인식으로 대체되어 제거됨.)
 
 function scrollGetFullGrayData(canvas) {
   const ctx = canvas.getContext('2d');
@@ -2070,94 +2225,302 @@ function scrollGetFullGrayData(canvas) {
   return { gray, w: W, h: H };
 }
 
-function detectStaffYBand(g, darkThresh, staffLineFrac) {
+function medianOf(arr) {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)];
+}
+
+// lineFrac: 한 행에서 어두운 픽셀 비율이 이 이상이면 오선 후보 행(완화된 값 권장). 일부 줄이 연해서
+// 빠져도 등간격(약 2배 간격이면 빠진 줄 1개로 간주)으로 보충한다.
+function detectStaffSystem(g, lineFrac, darkThresh) {
+  darkThresh = darkThresh || 140;
   const rowDark = new Float32Array(g.h);
   for (let y = 0; y < g.h; y++) {
     let cnt = 0;
     const base = y * g.w;
-    for (let x = 0; x < g.w; x++) {
-      if (g.gray[base + x] < darkThresh) cnt++;
-    }
+    for (let x = 0; x < g.w; x++) if (g.gray[base + x] < darkThresh) cnt++;
     rowDark[y] = cnt / g.w;
   }
-  const candidates = [];
-  for (let y = 0; y < g.h; y++) if (rowDark[y] >= staffLineFrac) candidates.push(y);
   const lines = [];
-  let cluster = [];
-  for (let i = 0; i < candidates.length; i++) {
-    if (cluster.length === 0 || candidates[i] - cluster[cluster.length - 1] <= 2) {
-      cluster.push(candidates[i]);
-    } else {
-      lines.push(Math.round(cluster.reduce((a, b) => a + b, 0) / cluster.length));
-      cluster = [candidates[i]];
+  let cur = null;
+  for (let y = 0; y < g.h; y++) {
+    if (rowDark[y] >= lineFrac) {
+      if (cur && y - cur.y1 <= 2) cur.y1 = y;
+      else { if (cur) lines.push(cur); cur = { y0: y, y1: y }; }
     }
   }
-  if (cluster.length) lines.push(Math.round(cluster.reduce((a, b) => a + b, 0) / cluster.length));
-  return lines;
+  if (cur) lines.push(cur);
+  for (const l of lines) l.y = (l.y0 + l.y1) / 2;
+  if (lines.length < 4) return null;
+
+  const gaps = [];
+  for (let i = 1; i < lines.length; i++) gaps.push(lines[i].y - lines[i - 1].y);
+  const sortedGaps = [...gaps].sort((a, b) => a - b);
+  const minGap = sortedGaps.find(v => v >= 3) || sortedGaps[0];
+  const space = medianOf(gaps.filter(v => v >= minGap * 0.75 && v <= minGap * 1.3)) || minGap;
+  if (!(space >= 2)) return null;
+
+  const staves = [];
+  let chain = [lines[0]];
+  for (let i = 1; i < lines.length; i++) {
+    const gap = lines[i].y - lines[i - 1].y;
+    if (gap <= space * 1.45) {
+      chain.push(lines[i]);
+    } else if (gap >= space * 1.7 && gap <= space * 2.3 && chain.length <= 5) {
+      const my = Math.round((lines[i - 1].y + lines[i].y) / 2);
+      chain.push({ y: my, y0: my, y1: my, synth: true });
+      chain.push(lines[i]);
+    } else {
+      staves.push(chain);
+      chain = [lines[i]];
+    }
+  }
+  staves.push(chain);
+  const valid = staves.filter(s => s.length >= 5 && s.length <= 6);
+  if (!valid.length) return null;
+
+  const systems = [];
+  let sys = null;
+  for (const st of valid) {
+    const firstY = st[0].y, lastY = st[st.length - 1].y;
+    if (sys) {
+      const gapToPrev = firstY - sys.lastLineY;
+      if (gapToPrev >= space * 1.5 && gapToPrev <= space * 6) {
+        sys.staves.push(st); sys.bottom = st[st.length - 1].y1; sys.lastLineY = lastY;
+        continue;
+      }
+    }
+    sys = { staves: [st], top: st[0].y0, bottom: st[st.length - 1].y1, lastLineY: lastY };
+    systems.push(sys);
+  }
+  for (const s of systems) {
+    s.lines = [];
+    for (const st of s.staves) for (const l of st) s.lines.push(l);
+    s.lineCount = s.lines.filter(l => !l.synth).length;
+  }
+  let main = systems[0];
+  for (const s of systems) {
+    if (s.lineCount > main.lineCount || (s.lineCount === main.lineCount && (s.bottom - s.top) > (main.bottom - main.top))) main = s;
+  }
+  const pad = Math.max(1, Math.round(space * 0.15));
+  const mask = new Uint8Array(g.h);
+  for (const l of main.lines) {
+    for (let y = Math.max(0, l.y0 - pad); y <= Math.min(g.h - 1, l.y1 + pad); y++) mask[y] = 1;
+  }
+  return { systems, main, space, mask };
 }
 
-function detectBarLines(g, top, bottom, darkThresh, barFrac) {
-  const pad = Math.max(1, Math.round((bottom - top) * 0.03));
-  const y0 = Math.max(0, top - pad), y1 = Math.min(g.h - 1, bottom + pad);
-  const span = y1 - y0 + 1;
-  const colFrac = new Float32Array(g.w);
+// 열별 "밴드 높이 대비 가장 긴 수직 연속 획 비율" (1~2px 끊김 허용)
+function computeBarCoverage(g, top, bottom, darkThresh) {
+  const band = Math.max(1, bottom - top + 1);
+  const cover = new Float32Array(g.w);
   for (let x = 0; x < g.w; x++) {
-    let cnt = 0;
-    for (let y = y0; y <= y1; y++) {
-      if (g.gray[y * g.w + x] < darkThresh) cnt++;
+    let best = 0, runStart = -1, lastDark = -1;
+    for (let y = top; y <= bottom; y++) {
+      if (g.gray[y * g.w + x] < darkThresh) {
+        if (runStart < 0 || y - lastDark > 3) runStart = y;
+        lastDark = y;
+        const len = lastDark - runStart + 1;
+        if (len > best) best = len;
+      }
     }
-    colFrac[x] = cnt / span;
+    cover[x] = best / band;
   }
-  const candidates = [];
-  for (let x = 0; x < g.w; x++) if (colFrac[x] >= barFrac) candidates.push(x);
-
-  const merged = [];
-  let cluster = [];
-  for (let i = 0; i < candidates.length; i++) {
-    if (cluster.length === 0 || candidates[i] - cluster[cluster.length - 1] <= 3) {
-      cluster.push(candidates[i]);
-    } else {
-      merged.push(Math.round(cluster.reduce((a, b) => a + b, 0) / cluster.length));
-      cluster = [candidates[i]];
-    }
-  }
-  if (cluster.length) merged.push(Math.round(cluster.reduce((a, b) => a + b, 0) / cluster.length));
-
-  if (merged.length >= 3) {
-    const gaps = [];
-    for (let i = 1; i < merged.length; i++) gaps.push(merged[i] - merged[i - 1]);
-    const sortedGaps = [...gaps].sort((a, b) => a - b);
-    const medianGap = sortedGaps[Math.floor(sortedGaps.length / 2)] || 1;
-    const minGap = medianGap * 0.3;
-    const filtered = [merged[0]];
-    for (let i = 1; i < merged.length; i++) {
-      if (merged[i] - filtered[filtered.length - 1] < minGap) continue;
-      filtered.push(merged[i]);
-    }
-    return filtered;
-  }
-  return merged;
+  return cover;
 }
 
-// staffThresh/barThresh를 결과 화면 슬라이더로 실시간 조정할 수 있어야 해서(재클릭 없이 즉시
-// 재검출), 마디선 검출을 한 번만 도는 runScrollStage3에서 분리해 이 함수로 뽑아뒀다 — 항상 이
-// 함수 하나만 거치므로 "이름을 바꾸는 과정에서 실제 호출부 연결이 끊기는" 종류의 문제가 다시
-// 생길 여지가 없다(호출부가 하나뿐). 입력은 반드시 seam 표시선 등 오버레이가 없는 깨끗한
-// stitched canvas여야 한다 — runScrollStage3의 out은 애초에 그런 오버레이를 그리지 않는 clean
-// canvas라서 (프로토타입과 달리 별도 cleanOut이 필요 없음) 그대로 넘기면 된다.
-function detectStaffAndBars(canvas, staffThresh, barThresh) {
+// 마디선 후보 조건: (a) 연속도 >= thr, (b) 폭 <= staff space*0.6, (c) 좌우 staff space*0.5~1.5 거리에
+// 굵은 연속 획(화음 덩어리 등)이 없음. 겹마디선·종지선은 staff space*2 이내 후보를 한 경계로 병합.
+function barsFromCoverage(cover, space, thr) {
+  const clusters = [];
+  let cur = null;
+  for (let x = 0; x < cover.length; x++) {
+    if (cover[x] >= thr) {
+      if (cur && x - cur.x1 <= 1) cur.x1 = x;
+      else { if (cur) clusters.push(cur); cur = { x0: x, x1: x }; }
+    }
+  }
+  if (cur) clusters.push(cur);
+  const maxThin = Math.max(2, space * 0.6);
+  const thin = [], wide = [];
+  for (const c of clusters) ((c.x1 - c.x0 + 1) <= maxThin ? thin : wide).push(c);
+  const iso = thin.filter(c => !wide.some(wc => {
+    const gap = wc.x0 > c.x1 ? wc.x0 - c.x1 : c.x0 - wc.x1;
+    return gap >= space * 0.5 && gap <= space * 1.5;
+  }));
+  const groups = [];
+  for (const c of iso) {
+    const last = groups[groups.length - 1];
+    if (last && c.x0 - last.x1 <= space * 2) last.x1 = c.x1;
+    else groups.push({ x0: c.x0, x1: c.x1 });
+  }
+  return groups.map(gp => Math.round((gp.x0 + gp.x1) / 2));
+}
+
+// 연속도 임계 0.80~1.00을 훑어 검출 개수가 가장 오래 유지되는 구간(plateau)의 중앙값을 채택
+function autoBarThreshold(cover, space) {
+  const thrAt = i => Math.min(1, Math.round((0.80 + i * 0.01) * 100) / 100);
+  const counts = [];
+  for (let i = 0; i <= 20; i++) counts.push(barsFromCoverage(cover, space, thrAt(i)).length);
+  let best = null, i = 0;
+  while (i < counts.length) {
+    let j = i;
+    while (j + 1 < counts.length && counts[j + 1] === counts[i]) j++;
+    const len = j - i + 1;
+    if (counts[i] > 0 && (!best || len > best.len || (len === best.len && counts[i] > best.count))) best = { i, j, len, count: counts[i] };
+    i = j + 1;
+  }
+  if (!best) return 0.9;
+  return thrAt(Math.round((best.i + best.j) / 2));
+}
+
+// 품질 점수 — 마디 폭이 중앙값의 0.4~2.5배 안인 비율, "ROI 폭당 마디 수"(1~8 밖이면 의심)
+function assessBarQuality(bars, totalLen, viewLen) {
+  const measureCount = Math.max(0, bars.length - 1);
+  if (measureCount < 1) return { low: true, widthOk: 0, perView: 0, measureCount, medianWidth: null };
+  const widths = [];
+  for (let i = 0; i < measureCount; i++) widths.push(bars[i + 1] - bars[i]);
+  const med = medianOf(widths);
+  const widthOk = widths.filter(w => w >= med * 0.4 && w <= med * 2.5).length / widths.length;
+  const perView = viewLen ? measureCount / (totalLen / viewLen) : null;
+  const low = widthOk < 0.7 || (perView != null && (perView < 1 || perView > 8));
+  return { low, widthOk, perView, measureCount, medianWidth: med };
+}
+
+// staffThresh(슬라이더, 기본 0.6)는 줄 검출 비율의 1/2로 환산해 완화해서 쓴다. barThresh가 null이면
+// 임계 자동 보정. 입력은 오버레이 없는 깨끗한 stitched canvas여야 한다.
+function detectStaffAndBars(canvas, staffThresh, barThresh, viewLen) {
   const g = scrollGetFullGrayData(canvas);
   const darkThresh = 140;
-  const staffLines = detectStaffYBand(g, darkThresh, staffThresh);
-  let bars = [];
-  if (staffLines.length >= 2) {
-    const top = staffLines[0], bottom = staffLines[staffLines.length - 1];
-    bars = detectBarLines(g, top, bottom, darkThresh, barThresh);
-    if (bars.length && (canvas.width - bars[bars.length - 1]) > canvas.width * 0.02) {
-      bars = [...bars, canvas.width - 1];
+  const sys = detectStaffSystem(g, Math.max(0.05, staffThresh * 0.5), darkThresh);
+  if (!sys) {
+    return {
+      staffLines: [], bars: [], staffFound: false, system: null, gray: g,
+      threshUsed: barThresh == null ? 0.9 : barThresh, auto: barThresh == null,
+      quality: { low: true, widthOk: 0, perView: 0, measureCount: 0, medianWidth: null },
+    };
+  }
+  const cover = computeBarCoverage(g, sys.main.top, sys.main.bottom, darkThresh);
+  const auto = barThresh == null;
+  const thr = auto ? autoBarThreshold(cover, sys.space) : barThresh;
+  let bars = barsFromCoverage(cover, sys.space, thr);
+  if (bars.length && (canvas.width - bars[bars.length - 1]) > canvas.width * 0.02) {
+    bars = [...bars, canvas.width - 1];
+  }
+  return {
+    staffLines: sys.main.lines.map(l => l.y), bars, staffFound: true, system: sys, gray: g,
+    threshUsed: thr, auto, quality: assessBarQuality(bars, canvas.width, viewLen),
+  };
+}
+
+// ---- 폭 기준 분할(마디 인식 신뢰도가 낮을 때의 자동 폴백) ----
+function robustMeasureWidth(bars) {
+  if (bars.length < 4) return null;
+  const widths = [];
+  for (let i = 0; i < bars.length - 1; i++) widths.push(bars[i + 1] - bars[i]);
+  const med = medianOf(widths);
+  const good = widths.filter(w => w >= med * 0.6 && w <= med * 1.6);
+  return good.length >= 3 ? medianOf(good) : med;
+}
+
+// '세로 공백 열' — 시스템 밴드(위아래 여유 포함)에서 오선 행을 제외하고 잉크가 하나도 없는 열
+function computeBlankColumns(g, sys, darkThresh) {
+  const y0 = Math.max(0, Math.round(sys.main.top - sys.space * 3));
+  const y1 = Math.min(g.h - 1, Math.round(sys.main.bottom + sys.space * 3));
+  const blank = new Uint8Array(g.w);
+  for (let x = 0; x < g.w; x++) {
+    let ink = false;
+    for (let y = y0; y <= y1; y++) {
+      if (!sys.mask[y] && g.gray[y * g.w + x] < darkThresh) { ink = true; break; }
+    }
+    blank[x] = ink ? 0 : 1;
+  }
+  return blank;
+}
+
+function snapGroupBoundary(target, minX, radius, bars, blank) {
+  let best = null, bestD = Infinity;
+  for (const b of bars) {
+    const d = Math.abs(b - target);
+    if (b > minX && d <= radius && d < bestD) { best = b; bestD = d; }
+  }
+  if (best != null) return best;
+  const lo = Math.max(Math.ceil(minX), Math.floor(target - radius));
+  const hi = Math.min(blank.length - 1, Math.ceil(target + radius));
+  let bestC = null, bestCD = Infinity;
+  let x = lo;
+  while (x <= hi) {
+    if (blank[x]) {
+      let e = x;
+      while (e + 1 <= hi && blank[e + 1]) e++;
+      const c = (x + e) / 2;
+      if (Math.abs(c - target) < bestCD) { bestCD = Math.abs(c - target); bestC = c; }
+      x = e + 1;
+    } else x++;
+  }
+  return bestC != null ? Math.round(bestC) : Math.round(target);
+}
+
+// 목표 폭 = N × 견고하게 추정한 마디 폭(추정 불가 시 ROI 폭). 경계는 목표 폭 근처에서 마디선 우선,
+// 없으면 가장 가까운 세로 공백 열.
+function groupByWidth(totalLen, targetN, maxBars, measureW, viewLen, bars, blank) {
+  const n = Math.max(1, targetN);
+  let targetW = measureW ? measureW * n : (viewLen || totalLen);
+  if (measureW && maxBars) targetW = Math.min(targetW, measureW * Math.max(1, maxBars));
+  targetW = Math.max(8, targetW);
+  const out = [];
+  let x = 0;
+  while (x < totalLen - 1) {
+    const target = x + targetW;
+    let end;
+    if (target >= totalLen - targetW * 0.35) end = totalLen;
+    else end = snapGroupBoundary(target, x + targetW * 0.3, targetW * 0.5, bars, blank);
+    end = Math.min(totalLen, Math.max(Math.round(end), Math.round(x) + 1));
+    out.push({ startIdx: out.length, endIdx: out.length + 1, startX: Math.round(x), endX: end, count: null, byWidth: true });
+    x = end;
+  }
+  return out;
+}
+
+// ---- 컷 이음새 검증 (마디 검출 후) ----
+function hasDuplicateTrace(g, sys, pos) {
+  const W = Math.max(12, Math.round(sys.space * 3));
+  if (pos - W < 0 || pos + W > g.w) return false;
+  let a = 0, both = 0, either = 0;
+  for (let y = sys.main.top; y <= sys.main.bottom; y++) {
+    if (sys.mask[y]) continue;
+    for (let j = 0; j < W; j++) {
+      const l = g.gray[y * g.w + pos - W + j] < 128, r = g.gray[y * g.w + pos + j] < 128;
+      if (l || r) either++;
+      if (l && r) both++;
+      if (l) a++;
     }
   }
-  return { staffLines, bars, staffFound: staffLines.length >= 2 };
+  return a >= 8 && either > 0 && both / either >= 0.85;
+}
+
+// 이음새를 낀 마디 폭이 전체 중앙값의 0.4~2.5배인지, 이음새 양쪽에 같은 내용이 반복되는 흔적이
+// 없는지. 통과 못 한 컷 이음새만 flagged.
+function validateCutSeams(seams, bars, det) {
+  const widths = [];
+  for (let i = 0; i < bars.length - 1; i++) widths.push(bars[i + 1] - bars[i]);
+  const med = medianOf(widths);
+  return seams.map(s => {
+    if (!s.cut || s.dup) return { flagged: false };
+    let reason = null;
+    if (med > 0 && bars.length >= 3) {
+      for (let j = 0; j < bars.length - 1; j++) {
+        if (s.pos > bars[j] + 2 && s.pos < bars[j + 1] - 2) {
+          const w = bars[j + 1] - bars[j];
+          if (w < med * 0.4 || w > med * 2.5) reason = '이음새를 낀 마디 폭이 비정상';
+          break;
+        }
+      }
+    }
+    if (!reason && det.system && det.gray && hasDuplicateTrace(det.gray, det.system, s.pos)) reason = '이음새 양쪽에 같은 내용이 반복됨';
+    return { flagged: !!reason, reason };
+  });
 }
 
 // ---- N마디씩 그룹핑 — 프로토타입의 단순 고정-N 슬라이싱을 이번 스펙대로 교체 ----
@@ -2225,10 +2588,12 @@ function flagOutlierBursts(bursts, times) {
   }));
 }
 
-// ---- 대표 프레임 확정 즉시: 전처리 → 스티칭 → 마디선 검출 (4단계 자동 실행, 재클릭 없음) ----
-async function runScrollStage3(repFrames, scrollDefaults, directionPref) {
-  // 1) 전처리 — 반드시 원본 해상도에서 먼저 (despeckle 대상 canvas는 이미 captureRoiNative로
-  // 원본 해상도로 캡처됨. 다운스케일은 스티칭 탐색(scrollGetGray)에서만, 별도의 축소 사본으로.)
+// ---- 부드러운 스크롤용: 전처리 → 방향 감지 → NCC 이음 (조각 목록 반환) ----
+// refineHook(seamIdx, medianShift, direction): 저신뢰(NCC<0.7) 이음새를 촘촘한 연속 프레임 정합으로
+// 다시 계산해 {shift,score,ok}를 돌려주거나 null(교체 안 함). 신뢰 높은 이웃 이음새의 중앙값을 기준으로
+// 탐색 범위를 제한하기 위해 첫 패스가 끝난 뒤에 호출한다.
+async function runScrollStage3(repFrames, scrollDefaults, directionPref, refineHook) {
+  // 1) 전처리 — 반드시 원본 해상도에서 먼저 (다운스케일은 스티칭 탐색(scrollGetGray)에서만)
   for (const f of repFrames) scrollApplyPreprocInPlace(f.canvas, scrollDefaults);
 
   // 2) 방향 자동 감지 (첫 프레임 쌍 기준, 이후 동일 방향 유지) + 스티칭
@@ -2244,66 +2609,299 @@ async function runScrollStage3(repFrames, scrollDefaults, directionPref) {
     }
   }
 
-  const first = repFrames[0].canvas;
-  const crossLen = direction === 'vertical' ? first.width : first.height;
-  // First pass: decide shift/score/dup for every seam WITHOUT drawing anything yet, so totalLen
-  // (needed to size the output canvas) is known before allocating it.
   const seamDecisions = [];
-  let totalLen = direction === 'vertical' ? first.height : first.width;
   for (let i = 0; i < repFrames.length - 1; i++) {
     const a = repFrames[i].canvas, b = repFrames[i + 1].canvas;
     const dup = scrollIsDuplicateFrame(a, b);
     if (dup.isDup) { seamDecisions.push({ i, shift: 0, score: dup.sim, dup: true, ok: true }); continue; }
     const { shift, score, ok } = scrollFindBestShift(a, b, direction);
     seamDecisions.push({ i, shift, score, dup: false, ok });
-    totalLen += Math.max(1, shift);
   }
 
-  const out = document.createElement('canvas');
-  if (direction === 'vertical') { out.width = crossLen; out.height = totalLen; }
-  else { out.width = totalLen; out.height = crossLen; }
-  const octx = out.getContext('2d');
-  octx.fillStyle = '#ffffff';
-  octx.fillRect(0, 0, out.width, out.height);
-
-  // Second pass: actually draw, recording each seam's `pos` — the pixel coordinate (along the
-  // stitch axis) IN THE FINAL CANVAS where that seam's boundary sits — so the result screen can
-  // later tell which N-bar GROUP (a range of x-coordinates) a given seam's low NCC score falls
-  // into, to highlight that specific group as low-confidence.
-  let cursor = 0;
-  if (direction === 'vertical') { octx.drawImage(first, 0, cursor); cursor += first.height; }
-  else { octx.drawImage(first, cursor, 0); cursor += first.width; }
-  const seams = [];
-  for (let i = 0; i < seamDecisions.length; i++) {
-    const d = seamDecisions[i];
-    seams.push({ ...d, pos: cursor });
-    if (d.dup) continue;
-    const bCanvas = repFrames[i + 1].canvas;
-    const shift = Math.max(1, d.shift);
-    if (direction === 'vertical') {
-      const srcY = Math.max(0, bCanvas.height - shift);
-      const h = bCanvas.height - srcY;
-      octx.drawImage(bCanvas, 0, srcY, bCanvas.width, h, 0, cursor, bCanvas.width, h);
-      cursor += h;
-    } else {
-      const srcX = Math.max(0, bCanvas.width - shift);
-      const w = bCanvas.width - srcX;
-      octx.drawImage(bCanvas, srcX, 0, w, bCanvas.height, cursor, 0, w, bCanvas.height);
-      cursor += w;
+  if (refineHook) {
+    const goodShifts = seamDecisions.filter(d => !d.dup && d.score >= 0.7).map(d => d.shift);
+    if (goodShifts.length) {
+      const med = medianOf(goodShifts);
+      for (let k = 0; k < seamDecisions.length; k++) {
+        const d = seamDecisions[k];
+        if (d.dup || d.score >= 0.7) continue;
+        let r = null;
+        try { r = await refineHook(d.i, med, direction); } catch (err) { r = null; }
+        if (r) seamDecisions[k] = { ...d, shift: r.shift, score: r.score, ok: r.ok, refined: true };
+      }
     }
   }
 
-  // 3) 마디(bar-line) 검출은 여기서 한 번만 하지 않는다 — staffThresh/barThresh를 결과 화면에서
-  // 슬라이더로 바꿀 때마다 재검출해야 하므로, 그 하나의 공용 함수(detectStaffAndBars)를 결과 화면이
-  // 직접 호출한다. 여기서는 깨끗한(오버레이 없는) stitched canvas만 돌려준다.
-  return { direction, directionNcc, canvas: out, seams };
+  const first = repFrames[0].canvas;
+  const fullLen = direction === 'vertical' ? first.height : first.width;
+  const frames = [newScrollFrame({ canvas: first, t: repFrames[0].time, srcX: 0, len: fullLen, score: null, ok: true })];
+  for (let i = 0; i < seamDecisions.length; i++) {
+    const d = seamDecisions[i];
+    const bCanvas = repFrames[i + 1].canvas;
+    const bLen = direction === 'vertical' ? bCanvas.height : bCanvas.width;
+    const len = Math.min(bLen, Math.max(1, d.shift));
+    frames.push(newScrollFrame({
+      canvas: bCanvas, t: repFrames[i + 1].time,
+      srcX: d.dup ? 0 : bLen - len, len: d.dup ? 0 : len,
+      dup: d.dup, score: d.score, ok: d.ok, shift: d.shift,
+    }));
+  }
+  return { direction, directionNcc, frames };
 }
 
-// ---- 그룹 수동 오버라이드용 "구간 재스캔(미니 스티칭)" — 위 4단계 파이프라인(diff 샘플링 →
-// burst 탐지 → 대표 프레임 추출 → 전처리+스티칭)을 임의의 [startT, endT] 구간에만 그대로 다시
-// 돌린다. 단일 프레임 캡처(예전 방식)와 달리, 그 구간 안에서도 여러 프레임에 걸쳐 있는 내용을
-// 놓치지 않는다. diffThreshold가 null/undefined면 메인 분석 화면과 같은 방식(최대 diff의 35%)으로
-// 자동 추정해 반환한다 — 그래야 패널이 처음 열릴 때 threshold를 몰라도 바로 한 번 실행해볼 수 있다.
+// ==== 컷 전환(타일링) 이음 ====
+// 화면이 부드럽게 밀리지 않고 "컷"으로 통째로 넘어가며 이전 화면과 겹침이 없는 영상용. NCC 겹침 탐색
+// 대신: 정지 구간(타일)마다 1장 → 오선이 실제로 그려진 구간만 트리밍 → 이동량 0으로 맞대어 붙이되
+// 이음새를 가로지르는 잉크(줄기·빔·음표머리)의 연속성으로 미세 오프셋 δ를 고른다. (가로 방향 전용)
+
+async function captureRepCanvas(video, roi, t) {
+  await seekTo(video, t);
+  const captured = captureRoiNative(video, roi);
+  const img = await loadImage(captured.dataUrl);
+  const c = document.createElement('canvas');
+  c.width = captured.w; c.height = captured.h;
+  c.getContext('2d').drawImage(img, 0, 0);
+  return c;
+}
+
+// burst별 전환 유형 판별. (a) 전환이 샘플 1스텝 안에 끝나 중간 프레임이 없고 (b) 오선 제거 후 NCC가
+// 유의미한 shift를 못 찾으면 "컷". 방향이 auto면 가로·세로 둘 다 실패해야 컷으로 본다. 전체 burst의
+// 절반 이상이 컷이면 컷 모드.
+async function classifyCutBursts(video, roi, times, bursts, scrollDefaults, directionPref) {
+  if (!bursts.length || directionPref === 'vertical') return { isCut: false, flags: [] };
+  const dirs = directionPref === 'horizontal' ? ['horizontal'] : ['horizontal', 'vertical'];
+  const flags = [];
+  for (const b of bursts) {
+    if (b.end !== b.start) { flags.push(false); continue; }
+    const A = await captureRepCanvas(video, roi, times[Math.max(0, b.start - 1)]);
+    const B = await captureRepCanvas(video, roi, times[Math.min(times.length - 1, b.end + 1)]);
+    scrollApplyPreprocInPlace(A, scrollDefaults);
+    scrollApplyPreprocInPlace(B, scrollDefaults);
+    flags.push(dirs.every(d => !scrollFindBestShift(A, B, d, { removeStaff: true }).ok));
+  }
+  const cutCount = flags.filter(Boolean).length;
+  return { isCut: cutCount > 0 && cutCount * 2 >= bursts.length, flags };
+}
+
+// 정지 구간(타일) 정의: 각 타일의 대표 시각은 구간 중앙, 시간 구간 [t0,t1]은 컷 시각으로 고정
+// (컷은 time[b.start-1]과 time[b.start] 사이에서 일어남), tA~tB는 완전히 정지한 샘플 구간.
+function buildCutTileDefs(times, bursts) {
+  const defs = [];
+  const n = times.length;
+  let startIdx = 0, prevT1 = times[0];
+  for (let k = 0; k <= bursts.length; k++) {
+    const b = bursts[k];
+    const endIdx = b ? Math.max(0, b.start - 1) : n - 1;
+    const t1 = b ? (times[endIdx] + times[Math.min(n - 1, endIdx + 1)]) / 2 : times[n - 1];
+    if (endIdx >= startIdx) {
+      const centerIdx = Math.round((startIdx + endIdx) / 2);
+      defs.push({ startIdx, endIdx, tA: times[startIdx], tB: times[endIdx], time: times[centerIdx], t0: prevT1, t1 });
+    }
+    prevT1 = t1;
+    if (b) startIdx = b.end + (b.end === b.start ? 0 : 1);
+  }
+  return defs;
+}
+
+// 타일 한 장의 오선 구조 + 오선이 실제로 그려진 x 구간(트리밍 범위)
+function analyzeTileStaff(canvas) {
+  const g = scrollGetFullGrayData(canvas);
+  const sys = detectStaffSystem(g, 0.3, 140);
+  let xL = 0, xR = g.w - 1;
+  if (sys) {
+    const lns = sys.main.lines.filter(l => !l.synth);
+    let l0 = -1, r0 = -1;
+    for (let x = 0; x < g.w; x++) {
+      let c = 0;
+      for (const l of lns) {
+        for (let y = Math.max(0, l.y0 - 1); y <= Math.min(g.h - 1, l.y1 + 1); y++) {
+          if (g.gray[y * g.w + x] < 140) { c++; break; }
+        }
+      }
+      if (c >= lns.length * 0.5) { if (l0 < 0) l0 = x; r0 = x; }
+    }
+    if (l0 >= 0) { xL = l0; xR = r0; }
+  }
+  return { g, sys, xL, xR, touchL: xL <= 1, touchR: xR >= g.w - 2 };
+}
+
+function tileInk(g) {
+  const ink = new Uint8Array(g.w * g.h);
+  for (let i = 0; i < ink.length; i++) ink[i] = g.gray[i] < 128 ? 1 : 0;
+  return ink;
+}
+
+// 프레임 k의 오른쪽 끝(aEnd)과 프레임 k+1의 왼쪽 끝(xLB+d)을 맞댔을 때, 오선 행을 제외한 잉크가 이음새를
+// 가로질러 이어지는 정도(둘 다 잉크=일치, 한쪽만=불일치). δ ∈ ±(오선 간격×3).
+function findCutSeamOffset(inkA, wA, hA, aEnd, inkB, wB, xLB, mask, space) {
+  const D = Math.max(3, Math.round(space * 3));
+  const m = 3;
+  let best = null;
+  for (let d = -D; d <= D; d++) {
+    const bStart = xLB + d;
+    if (bStart < 0 || bStart >= wB) continue;
+    let match = 0, mism = 0;
+    for (let y = 0; y < hA; y++) {
+      if (mask[y]) continue;
+      let a = 0, b = 0;
+      for (let j = 0; j < m; j++) {
+        const xa = aEnd - j;
+        if (xa >= 0 && xa < wA && inkA[y * wA + xa]) a = 1;
+        const xb = bStart + j;
+        if (xb >= 0 && xb < wB && inkB[y * wB + xb]) b = 1;
+      }
+      if (a && b) match++; else if (a !== b) mism++;
+    }
+    const score = match - 0.5 * mism;
+    if (!best || score > best.score + 1e-9 || (Math.abs(score - best.score) < 1e-9 && Math.abs(d) < Math.abs(best.d))) {
+      best = { d, score, match, mism };
+    }
+  }
+  return best;
+}
+
+function weightedMedian(items) {
+  const arr = items.filter(i => i.w > 0).sort((a, b) => a.v - b.v);
+  if (!arr.length) return 0;
+  const tot = arr.reduce((s, i) => s + i.w, 0);
+  let acc = 0;
+  for (const it of arr) { acc += it.w; if (acc >= tot / 2) return it.v; }
+  return arr[arr.length - 1].v;
+}
+
+// tiles: [{canvas, t, t0, t1}] → 조각 목록(타일 하나당 조각 하나, 중복 타일은 dup) 또는 null(오선을 못 찾음)
+async function buildCutFrames(tiles, scrollDefaults) {
+  for (const tl of tiles) scrollApplyPreprocInPlace(tl.canvas, scrollDefaults);
+  const infos = tiles.map(tl => analyzeTileStaff(tl.canvas));
+  const withSys = infos.filter(i => i.sys);
+  if (!withSys.length) return null;
+  const w = tiles[0].canvas.width, h = tiles[0].canvas.height;
+  const space = medianOf(withSys.map(i => i.sys.space));
+  const mask = new Uint8Array(h);
+  for (const i of withSys) for (let y = 0; y < h; y++) if (i.sys.mask[y]) mask[y] = 1;
+
+  // 중복 타일(같은 화면이 반복) — 오선 제거 후 NCC로 판정해 오선만 같은 서로 다른 화면을 중복으로 오인하지 않게
+  const dupFlags = tiles.map(() => false);
+  const keep = [0];
+  for (let k = 1; k < tiles.length; k++) {
+    const d = scrollIsDuplicateFrame(tiles[keep[keep.length - 1]].canvas, tiles[k].canvas, true);
+    if (d.isDup) dupFlags[k] = true; else keep.push(k);
+  }
+
+  const inkCache = {};
+  const inkOf = idx => (inkCache[idx] || (inkCache[idx] = tileInk(infos[idx].g)));
+  const seamRes = {};
+  const wm = [];
+  for (let j = 1; j < keep.length; j++) {
+    const a = keep[j - 1], b = keep[j];
+    const r = findCutSeamOffset(inkOf(a), w, h, infos[a].xR, inkOf(b), w, infos[b].xL, mask, space);
+    seamRes[b] = r;
+    if (r) wm.push({ v: r.d, w: r.match >= 4 ? r.match : 0 });
+  }
+  const common = Math.round(weightedMedian(wm));
+
+  const frames = [];
+  let lastReal = null;
+  for (let k = 0; k < tiles.length; k++) {
+    const tl = tiles[k], inf = infos[k];
+    if (dupFlags[k]) {
+      if (lastReal) lastReal.t1 = tl.t1;
+      frames.push(newScrollFrame({ canvas: tl.canvas, t: tl.t, srcX: 0, len: 0, dup: true, cut: true, t0: tl.t0, t1: tl.t1, score: 1, ok: true }));
+      continue;
+    }
+    const r = seamRes[k];
+    const first = k === keep[0];
+    const srcX = first ? inf.xL : Math.max(0, Math.min(inf.xR, inf.xL + common));
+    const f = newScrollFrame({
+      canvas: tl.canvas, t: tl.t, srcX, len: Math.max(1, inf.xR - srcX + 1), cut: true, t0: tl.t0, t1: tl.t1,
+      score: first || !r ? null : r.match / Math.max(1, r.match + r.mism), ok: true,
+      weight: r ? r.match : 0, delta: first ? 0 : common,
+    });
+    frames.push(f);
+    lastReal = f;
+  }
+  const both = withSys.filter(i => i.touchL && i.touchR).length;
+  return { frames, notes: { roiNarrow: both / withSys.length >= 0.5, commonDelta: common, space } };
+}
+
+// ---- 대표 프레임 추출 + 이어붙이기 (메인 파이프라인과 구간 재스캔이 공유) ----
+// 반환: { mode:'cut'|'smooth', direction, directionNcc, rawFrames, frameLen, segments, notes }
+async function extractAndStitch({ video, roi, times, bursts, scrollDefaults, direction, log }) {
+  log = log || (() => {});
+  const cls = await classifyCutBursts(video, roi, times, bursts, scrollDefaults, direction);
+  if (cls.isCut) {
+    log('컷 전환(타일링) 영상으로 판별 — 정지 구간별로 대표 프레임을 추출합니다...');
+    const defs = buildCutTileDefs(times, bursts);
+    const tiles = [];
+    for (let k = 0; k < defs.length; k++) {
+      const c = await captureRepCanvas(video, roi, defs[k].time);
+      tiles.push({ canvas: c, t: defs[k].time, t0: defs[k].t0, t1: defs[k].t1 });
+      log('타일 추출 중... ' + (k + 1) + '/' + defs.length);
+    }
+    const built = await buildCutFrames(tiles, scrollDefaults);
+    if (built && built.frames.length) {
+      return {
+        mode: 'cut', direction: 'horizontal', directionNcc: null, rawFrames: built.frames,
+        frameLen: tiles[0].canvas.width,
+        segments: defs.map((d, i) => ({ tA: d.tA, tB: d.tB, frameIdx: i })),
+        notes: built.notes,
+      };
+    }
+    log('컷 전환 처리에 필요한 오선을 찾지 못해 일반(NCC) 이어붙이기로 대체합니다.');
+  }
+
+  const repIdx = scrollRepIndices(times, bursts);
+  log('대표 프레임 ' + repIdx.length + '장 추출 중...');
+  const repFrames = [];
+  for (let k = 0; k < repIdx.length; k++) {
+    const t = times[repIdx[k]];
+    repFrames.push({ time: t, canvas: await captureRepCanvas(video, roi, t) });
+    log('대표 프레임 추출 중... ' + (k + 1) + '/' + repIdx.length);
+  }
+
+  // 저신뢰 seam 재정합(부드러운 스크롤 한정): 해당 burst를 1/20초 간격으로 촘촘히 샘플링해 연속 프레임끼리
+  // NCC 정합 후 오프셋을 누적. 탐색 범위는 신뢰 높은 이웃 seam 중앙값 ±30%.
+  const refineHook = async (seamIdx, medianShift, dir) => {
+    const a = repIdx[seamIdx], b = repIdx[seamIdx + 1];
+    const burst = bursts.find(bu => (bu.start - 1) === a && (bu.end + 1) === b);
+    if (!burst || !(medianShift > 0)) return null;
+    const tA = times[a], tB = times[b];
+    const step = Math.max(1 / 20, (tB - tA) / 40);
+    const fine = [];
+    for (let t = tA; t < tB; t += step) fine.push(t);
+    fine.push(tB);
+    if (fine.length < 3) return null;
+    log('저신뢰 이음새 재정합 중... (' + tA.toFixed(1) + 's~' + tB.toFixed(1) + 's)');
+    const cs = [];
+    for (const t of fine) {
+      const c = await captureRepCanvas(video, roi, t);
+      scrollApplyPreprocInPlace(c, scrollDefaults);
+      cs.push(c);
+    }
+    let total = 0, minScore = 1;
+    for (let j = 0; j < cs.length - 1; j++) {
+      const z = scrollIsDuplicateFrame(cs[j], cs[j + 1]);
+      const r = scrollFindBestShift(cs[j], cs[j + 1], dir, { minShift: 1, maxShift: Math.ceil(medianShift * 1.3), maxDim: 400 });
+      if (z.sim >= r.score) continue;
+      total += r.shift;
+      if (r.score < minScore) minScore = r.score;
+    }
+    if (total < medianShift * 0.7 || total > medianShift * 1.3) return null;
+    return { shift: total, score: minScore, ok: minScore > 0.5 };
+  };
+
+  log('전처리 · 이어붙이기 진행 중...');
+  const stage3 = await runScrollStage3(repFrames, scrollDefaults, direction, refineHook);
+  const frameLen = stage3.direction === 'vertical' ? repFrames[0].canvas.height : repFrames[0].canvas.width;
+  return {
+    mode: 'smooth', direction: stage3.direction, directionNcc: stage3.directionNcc, rawFrames: stage3.frames,
+    frameLen, segments: smoothMarkerSegments(repIdx, times, bursts), notes: {},
+  };
+}
+
+// ---- 그룹 수동 오버라이드용 "구간 재스캔(미니 스티칭)" — 위 파이프라인(diff 샘플링 → burst 탐지 →
+// 컷/부드러운 판별 → 대표 프레임 → 이어붙이기)을 임의의 [startT, endT] 구간에만 그대로 다시 돌린다.
+// diffThreshold가 null/undefined면 메인 분석 화면과 같은 방식(최대 diff의 35%)으로 자동 추정해 반환한다.
 async function runMiniStitchForRange(video, roi, startT, endT, diffThreshold, scrollDefaults, directionPref, stepSec) {
   const step = stepSec || 0.15;
   const s = Math.max(0, Math.min(startT, video.duration));
@@ -2328,22 +2926,11 @@ async function runMiniStitchForRange(video, roi, startT, endT, diffThreshold, sc
   const maxObserved = Math.max(...diffs, 0.1);
   const threshold = diffThreshold != null ? diffThreshold : maxObserved * 0.35;
   const bursts = groupScrollBursts(diffs, threshold);
-  const repIdx = scrollRepIndices(times, bursts);
-  const repFrames = [];
-  for (const idx of repIdx) {
-    const rt = times[idx];
-    await seekTo(video, rt);
-    const captured = captureRoiNative(video, roi);
-    const img = await loadImage(captured.dataUrl);
-    const c = document.createElement('canvas');
-    c.width = captured.w; c.height = captured.h;
-    c.getContext('2d').drawImage(img, 0, 0);
-    repFrames.push({ time: rt, canvas: c });
-  }
-  const stage3 = await runScrollStage3(repFrames, scrollDefaults, directionPref);
+  const ex = await extractAndStitch({ video, roi, times, bursts, scrollDefaults, direction: directionPref });
+  const lay = renderFrames(ex.rawFrames, ex.direction);
   return {
-    canvas: stage3.canvas, direction: stage3.direction, directionNcc: stage3.directionNcc, seams: stage3.seams,
-    repFrameTimes: repFrames.map(f => f.time), bursts, times, diffs, maxObserved, threshold,
+    rawFrames: ex.rawFrames, direction: ex.direction, mode: ex.mode, canvas: lay.canvas,
+    repCount: ex.rawFrames.length, bursts, times, diffs, maxObserved, threshold, startT: s, endT: e,
   };
 }
 
@@ -2723,52 +3310,30 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
     setConfirming(true);
     try {
       const { times } = analysis;
-      const repIdx = scrollRepIndices(times, bursts);
-      log('대표 프레임 ' + repIdx.length + '장 추출 중...');
       const video = videoRef.current;
-      const repFrames = [];
-      for (let k = 0; k < repIdx.length; k++) {
-        const t = times[repIdx[k]];
-        await seekTo(video, t);
-        const captured = captureRoiNative(video, roi);
-        const img = await loadImage(captured.dataUrl);
-        const c = document.createElement('canvas');
-        c.width = captured.w; c.height = captured.h;
-        c.getContext('2d').drawImage(img, 0, 0);
-        repFrames.push({ time: t, canvas: c });
-        log('대표 프레임 추출 중... ' + (k + 1) + '/' + repIdx.length);
-      }
-      log('전처리 · 이어붙이기 진행 중...');
-      const stage3 = await runScrollStage3(repFrames, scrollDefaults, direction);
+      const ex = await extractAndStitch({ video, roi, times, bursts, scrollDefaults, direction, log });
       const flaggedBursts = flagOutlierBursts(bursts, times);
-      const repFrameTimes = repFrames.map(f => f.time);
+      const lay = renderFrames(ex.rawFrames, ex.direction);
 
       // 마디별 정밀 시간 동기화 — 안정 구간마다 촘촘히 재생 위치 표시를 추적해본다. 실패해도
-      // (표시가 없거나 신뢰도 부족) markerData.confident=false로 남을 뿐, 결과 화면은 자동으로
-      // 4)의 개선된 폴백(구간별 선형보간)을 쓰므로 여기서 실패를 막을 필요는 없다.
+      // (표시가 없거나 신뢰도 부족) markerData.confident=false로 남을 뿐, 결과 화면은 자동으로 조각
+      // 모델 기반 폴백(컷: 타일 내 선형, 부드러운 스크롤: burst별 평균 속도)을 쓴다.
       log('재생 위치 표시 추적 중 (있는 경우 마디별 시간을 더 정밀하게 맞춥니다)...');
-      const frameLen = stage3.direction === 'vertical' ? repFrames[0].canvas.height : repFrames[0].canvas.width;
       let markerData = null;
       try {
         let markerProgressCount = 0;
-        const { allPoints, boundaries } = await detectPlaybackMarker({
-          video, roi, direction: stage3.direction, repIndices: repIdx, times, bursts, seams: stage3.seams,
-          frameLen,
-          // 지난번 diff 분석 루프와 같은 이유로 — 매 샘플마다 리렌더시키지 않도록 몇 번에 한 번만 갱신.
+        const { rawPoints } = await detectPlaybackMarker({
+          video, roi, direction: ex.direction, segments: ex.segments, frames: lay.placed, frameLen: ex.frameLen,
           onProgress: () => { markerProgressCount++; if (markerProgressCount % 5 === 0) log('재생 위치 표시 추적 중... (' + markerProgressCount + '개 샘플)'); },
         });
-        const validation = validateMarkerTrack(allPoints);
-        markerData = { allPoints, boundaries, ...validation };
+        markerData = { rawPoints, ...validateMarkerTrack(markerPointsToGlobal(rawPoints, lay.placed)) };
       } catch (err) {
-        // 추적 자체가 실패해도(영상 디코딩 이슈 등) 전체 흐름은 막지 않고 폴백으로 넘어간다.
         markerData = null;
       }
 
       onDone({
-        videoFile, roi, direction: stage3.direction, directionNcc: stage3.directionNcc,
-        repFrameTimes, repIndices: repIdx,
-        stitchedCanvas: stage3.canvas, seams: stage3.seams, bursts: flaggedBursts,
-        markerData,
+        videoFile, roi, direction: ex.direction, directionNcc: ex.directionNcc, mode: ex.mode,
+        rawFrames: ex.rawFrames, frameLen: ex.frameLen, bursts: flaggedBursts, markerData, notes: ex.notes,
       });
     } catch (err) {
       log('처리 중 오류: ' + err.message);
@@ -2895,7 +3460,12 @@ function groupConfidence(seams, startX, endX) {
   let minScore = 1;
   let any = false;
   for (const s of seams) {
-    if (s.pos > startX - 1 && s.pos < endX + 1) { any = true; if (s.score < minScore) minScore = s.score; }
+    if (s.pos > startX - 1 && s.pos < endX + 1) {
+      // 컷 이음새는 NCC가 없으므로 마디 검증(flagged) 결과로 판단. dup 이음새는 신뢰 문제 없음.
+      const sc = s.cut ? (s.flagged ? 0.5 : 1) : s.score;
+      any = true;
+      if (sc != null && sc < minScore) minScore = sc;
+    }
   }
   return any ? minScore : 1;
 }
@@ -2985,10 +3555,65 @@ function ImageCropPicker({ src, crop, setCrop }) {
   );
 }
 
-// ---- 5단계: 저신뢰 그룹 보완용 "이 구간 다시 만들기" 내부 공용 서브패널 — "이 구간 다시 스캔"과
-// "영상에서 직접 구간 선택" 두 모드가 시작 구간 값/힌트 문구만 다르고 동작은 완전히 같으므로(둘 다
-// runMiniStitchForRange로 미니 스티칭 실행 → 미리보기 → 적용) 하나의 컴포넌트로 재사용한다. ----
-function RangeRescanPanel({ videoRef, roi, scrollDefaults, direction, initialStart, initialEnd, maxDuration, hint, onApply, onCancel }) {
+// ---- 5단계: 저신뢰/누락 의심 그룹 보완용 "이 구간 다시 만들기" ----
+
+// 영상 한 프레임을 작게 그리고 ROI 박스를 겹쳐 표시 (영상 컨텍스트용 썸네일)
+function drawVideoFrameWithRoi(canvasEl, video, roi) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return;
+  const w = 260, h = Math.max(1, Math.round(w * vh / vw));
+  canvasEl.width = w; canvasEl.height = h;
+  const ctx = canvasEl.getContext('2d');
+  ctx.drawImage(video, 0, 0, w, h);
+  if (roi) {
+    ctx.strokeStyle = '#e03030'; ctx.lineWidth = 2;
+    ctx.strokeRect(roi.x0 * w, roi.y0 * h, (roi.x1 - roi.x0) * w, (roi.y1 - roi.y0) * h);
+  }
+}
+// seeked가 안 오는 극단적인 경우에도 큐가 멈추지 않도록 시간 제한을 둔 seek
+function seekSafe(video, t) {
+  return Promise.race([seekTo(video, t), new Promise(r => setTimeout(r, 2500))]);
+}
+
+// 전체 영상 미니 타임라인 — CaptureStep 트림 UI(.range-slider-*)와 같은 구조·같은 포인터 드래그 패턴.
+// 최신 값은 ref로 읽어 드래그 중 stale closure가 생기지 않게 한다.
+function MiniRangeTimeline({ duration, start, end, onChange }) {
+  const trackRef = useRef(null);
+  const dragRef = useRef(null);
+  const latestRef = useRef({ start, end, duration, onChange });
+  latestRef.current = { start, end, duration, onChange };
+  useEffect(() => {
+    function onMove(e) {
+      const which = dragRef.current;
+      if (!which || !trackRef.current) return;
+      const rect = trackRef.current.getBoundingClientRect();
+      const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const L = latestRef.current;
+      const t = frac * L.duration;
+      if (which === 'start') L.onChange(Math.min(t, L.end - 0.1), L.end);
+      else L.onChange(L.start, Math.max(t, L.start + 0.1));
+    }
+    function onUp() { dragRef.current = null; }
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    return () => { window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp); };
+  }, []);
+  const d = duration || 1;
+  return (
+    <div className="range-slider-track" ref={trackRef}>
+      <div className="range-slider-fill" style={{ left: (start / d * 100) + '%', width: ((end - start) / d * 100) + '%' }} />
+      <div className="range-slider-handle" style={{ left: (start / d * 100) + '%' }}
+        onPointerDown={e => { e.preventDefault(); dragRef.current = 'start'; }} title={'시작: ' + start.toFixed(2) + 's'} />
+      <div className="range-slider-handle" style={{ left: (end / d * 100) + '%' }}
+        onPointerDown={e => { e.preventDefault(); dragRef.current = 'end'; }} title={'끝: ' + end.toFixed(2) + 's'} />
+    </div>
+  );
+}
+
+// ---- 구간 재스캔 서브패널 — "이 구간 다시 스캔"과 "영상에서 직접 구간 선택"이 시작 구간 값/힌트 문구만 다르고
+// 동작은 같으므로 하나의 컴포넌트를 재사용한다. 결과는 그룹 이미지 한 장을 대체하는 대신 전역 스티치의 해당
+// 구간만 패치한다(onApplyStitch) — 마디 검출·그룹핑·timeRange는 결과 화면이 전부 자동 재계산. ----
+function RangeRescanPanel({ videoRef, roi, scrollDefaults, direction, initialStart, initialEnd, maxDuration, hint, groupImgSrc, timeAtFrac, onApplyStitch, onCancel }) {
   const [startT, setStartT] = useState(initialStart);
   const [endT, setEndT] = useState(initialEnd);
   const [diffThreshold, setDiffThreshold] = useState(null); // null = 아직 자동 추정 전
@@ -2996,7 +3621,43 @@ function RangeRescanPanel({ videoRef, roi, scrollDefaults, direction, initialSta
   const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  const [scrubT, setScrubT] = useState(initialStart);
+  const [hoverT, setHoverT] = useState(null);
+  const [pinnedT, setPinnedT] = useState(null);
   const ranOnceRef = useRef(false);
+  const queueRef = useRef(Promise.resolve());
+  const startThumbRef = useRef(null), endThumbRef = useRef(null), scrubCanvasRef = useRef(null), hoverCanvasRef = useRef(null);
+  const scrubTargetRef = useRef(initialStart), scrubPendingRef = useRef(false);
+  const hoverTargetRef = useRef(0), hoverPendingRef = useRef(false);
+
+  // 같은 <video> 하나를 썸네일·스크럽·재스캔이 함께 쓰므로 모든 seek를 한 줄로 직렬화한다.
+  function enqueue(fn) {
+    const p = queueRef.current.then(fn);
+    queueRef.current = p.catch(() => {});
+    return p;
+  }
+  function drawAt(canvasRef, t) {
+    enqueue(async () => {
+      const video = videoRef.current;
+      if (!video || !canvasRef.current) return;
+      await seekSafe(video, t);
+      if (canvasRef.current) drawVideoFrameWithRoi(canvasRef.current, video, roi);
+    });
+  }
+  function requestLatestDraw(canvasRef, targetRef, pendingRef) {
+    if (pendingRef.current) return;
+    pendingRef.current = true;
+    enqueue(async () => {
+      const tt = targetRef.current;
+      const video = videoRef.current;
+      if (video && canvasRef.current) {
+        await seekSafe(video, tt);
+        if (canvasRef.current) drawVideoFrameWithRoi(canvasRef.current, video, roi);
+      }
+      pendingRef.current = false;
+      if (targetRef.current !== tt) requestLatestDraw(canvasRef, targetRef, pendingRef);
+    });
+  }
 
   async function rescan(explicitThreshold) {
     const video = videoRef.current;
@@ -3004,11 +3665,9 @@ function RangeRescanPanel({ videoRef, roi, scrollDefaults, direction, initialSta
     setBusy(true);
     setError(null);
     try {
-      const res = await runMiniStitchForRange(
-        video, roi, startT, endT,
-        explicitThreshold != null ? explicitThreshold : diffThreshold,
-        scrollDefaults, direction
-      );
+      const res = await enqueue(() => runMiniStitchForRange(
+        video, roi, startT, endT, explicitThreshold != null ? explicitThreshold : diffThreshold, scrollDefaults, direction
+      ));
       setResult(res);
       setDiffThreshold(res.threshold);
       setThresholdRange({ min: 0, max: Math.max(0.001, res.maxObserved * 1.3), step: Math.max(0.001, res.maxObserved / 200) });
@@ -3024,16 +3683,84 @@ function RangeRescanPanel({ videoRef, roi, scrollDefaults, direction, initialSta
     ranOnceRef.current = true;
     rescan(null);
   }, []);
+  useEffect(() => { const id = setTimeout(() => drawAt(startThumbRef, startT), 350); return () => clearTimeout(id); }, [startT]);
+  useEffect(() => { const id = setTimeout(() => drawAt(endThumbRef, endT), 350); return () => clearTimeout(id); }, [endT]);
+
+  const previewUrl = useMemo(() => (result ? result.canvas.toDataURL('image/png') : null), [result]);
+
+  function fracFromEvent(e) {
+    const r = e.currentTarget.getBoundingClientRect();
+    return Math.max(0, Math.min(1, (e.clientX - r.left) / Math.max(1, r.width)));
+  }
+  function onGroupHover(e) {
+    if (!timeAtFrac) return;
+    const t = timeAtFrac(fracFromEvent(e));
+    setHoverT(t);
+    hoverTargetRef.current = t;
+    requestLatestDraw(hoverCanvasRef, hoverTargetRef, hoverPendingRef);
+  }
+  function onGroupClick(e) {
+    if (!timeAtFrac) return;
+    setPinnedT(timeAtFrac(fracFromEvent(e)));
+  }
+  function onScrub(e) {
+    const t = parseFloat(e.target.value);
+    setScrubT(t);
+    scrubTargetRef.current = t;
+    requestLatestDraw(scrubCanvasRef, scrubTargetRef, scrubPendingRef);
+  }
+  const clampT = t => Math.max(0, Math.min(maxDuration || t, t));
 
   return (
     <React.Fragment>
       {hint && <p className="hint-text">{hint}</p>}
-      <div className="toolbar">
-        <label>시작(s): <input type="number" step="0.1" min="0" max={maxDuration}
-          value={startT} onChange={e => setStartT(parseFloat(e.target.value) || 0)} style={{ width: '5.5em' }} /></label>
-        <label>끝(s): <input type="number" step="0.1" min="0" max={maxDuration}
-          value={endT} onChange={e => setEndT(parseFloat(e.target.value) || 0)} style={{ width: '5.5em' }} /></label>
+
+      <div className="slider-label">전체 영상에서의 재스캔 구간 — {startT.toFixed(2)}s ~ {endT.toFixed(2)}s (핸들을 드래그해 넓히거나 옮기세요)</div>
+      <MiniRangeTimeline duration={maxDuration} start={startT} end={endT} onChange={(a, b) => { setStartT(a); setEndT(b); }} />
+      <div className="row" style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+        <div><div className="slider-label">시작 프레임 ({startT.toFixed(2)}s)</div><canvas ref={startThumbRef} style={{ maxWidth: '260px', border: '1px solid var(--border-strong)' }} /></div>
+        <div><div className="slider-label">끝 프레임 ({endT.toFixed(2)}s)</div><canvas ref={endThumbRef} style={{ maxWidth: '260px', border: '1px solid var(--border-strong)' }} /></div>
       </div>
+
+      <div className="toolbar">
+        <label style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span className="slider-label" style={{ margin: 0, whiteSpace: 'nowrap' }}>영상 상태 확인</span>
+          <input type="range" min="0" max={maxDuration || 0} step="0.05" value={scrubT} style={{ flex: 1 }} onChange={onScrub} />
+          <span className="slider-label" style={{ margin: 0 }}>{scrubT.toFixed(2)}s</span>
+        </label>
+        <button className="icon-btn" onClick={() => setStartT(clampT(Math.min(scrubT, endT - 0.1)))}>현재 위치를 시작으로</button>
+        <button className="icon-btn" onClick={() => setEndT(clampT(Math.max(scrubT, startT + 0.1)))}>현재 위치를 끝으로</button>
+      </div>
+      <canvas ref={scrubCanvasRef} style={{ maxWidth: '260px', border: '1px solid var(--border-strong)' }} />
+
+      {groupImgSrc && timeAtFrac && (
+        <div>
+          <div className="slider-label">이 그룹의 현재 스티치 — 마우스를 올리면 그 위치의 원본 프레임이 옆에 표시되고, 클릭하면 그 시각이 고정됩니다.</div>
+          <div className="row" style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'flex-start' }}>
+            <img src={groupImgSrc} className="merge-preview-img" style={{ cursor: 'crosshair', maxWidth: '100%' }}
+              onMouseMove={onGroupHover} onClick={onGroupClick} alt="현재 그룹 스티치" />
+            <div>
+              <canvas ref={hoverCanvasRef} style={{ maxWidth: '260px', border: '1px solid var(--border-strong)' }} />
+              <div className="slider-label">{hoverT != null ? ('마우스 위치 시각 ' + hoverT.toFixed(2) + 's') : ''}{pinnedT != null ? (' · 고정 ' + pinnedT.toFixed(2) + 's') : ''}</div>
+            </div>
+          </div>
+          <div className="toolbar">
+            <button className="icon-btn" disabled={pinnedT == null} onClick={() => { setStartT(clampT(pinnedT)); setEndT(clampT(Math.max(endT, pinnedT + 1))); }}>여기부터 다시 만들기</button>
+            <button className="icon-btn" disabled={pinnedT == null} onClick={() => setEndT(clampT(Math.max(pinnedT, startT + 0.1)))}>여기까지로 끝 지정</button>
+          </div>
+        </div>
+      )}
+
+      <details>
+        <summary className="slider-label" style={{ cursor: 'pointer' }}>고급: 시작/끝 시각 직접 입력</summary>
+        <div className="toolbar">
+          <label>시작(s): <input type="number" step="0.1" min="0" max={maxDuration}
+            value={startT} onChange={e => setStartT(clampT(parseFloat(e.target.value) || 0))} style={{ width: '5.5em' }} /></label>
+          <label>끝(s): <input type="number" step="0.1" min="0" max={maxDuration}
+            value={endT} onChange={e => setEndT(clampT(parseFloat(e.target.value) || 0))} style={{ width: '5.5em' }} /></label>
+        </div>
+      </details>
+
       <div className="toolbar">
         <label style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
           <span className="slider-label" style={{ margin: 0, whiteSpace: 'nowrap' }}>diff 임계값</span>
@@ -3047,20 +3774,22 @@ function RangeRescanPanel({ videoRef, roi, scrollDefaults, direction, initialSta
       {error && <p className="hint-text" style={{ color: '#c0392b' }}>재스캔 중 오류: {error}</p>}
       {result && (
         <div>
-          <img src={result.canvas.toDataURL('image/png')} className="merge-preview-img" alt="재스캔 미리보기" />
-          <p className="hint-text">대표 프레임 {result.repFrameTimes.length}장 · 스크롤(이동) {result.bursts.length}회 감지됨</p>
+          <img src={previewUrl} className="merge-preview-img" alt="재스캔 미리보기" />
+          <p className="hint-text">
+            {result.mode === 'cut' ? '컷 전환(타일링)' : '부드러운 스크롤'} · 조각 {result.repCount}개 · 스크롤(이동) {result.bursts.length}회 감지됨 ·
+            적용하면 전역 스티치의 해당 구간만 교체되고 마디 검출·그룹·시간이 자동으로 다시 계산됩니다.
+          </p>
         </div>
       )}
       <div className="toolbar">
-        <button onClick={() => onApply(result.canvas.toDataURL('image/png'))} disabled={busy || !result}>이 결과 적용</button>
+        <button onClick={() => onApplyStitch(result, result.startT, result.endT)} disabled={busy || !result}>이 결과 적용</button>
         <button className="icon-btn" onClick={onCancel} disabled={busy}>취소</button>
       </div>
     </React.Fragment>
   );
 }
 
-// ---- 5단계: 저신뢰 그룹 보완용 "이 구간 다시 만들기" ----
-function GroupOverridePanel({ videoRef, scrollDefaults, roi, direction, timeRange, onApply, onCancel }) {
+function GroupOverridePanel({ videoRef, scrollDefaults, roi, direction, timeRange, groupImgSrc, timeAtFrac, onApply, onApplyStitch, onCancel }) {
   const [mode, setMode] = useState('rescan'); // 'rescan' | 'manual-range' | 'upload'
   const [duration, setDuration] = useState(videoRef.current ? videoRef.current.duration || 0 : 0);
   // upload 방식
@@ -3099,12 +3828,12 @@ function GroupOverridePanel({ videoRef, scrollDefaults, roi, direction, timeRang
     }
   }
 
-  // "이 구간 다시 스캔"은 이 그룹의 원래 구간(정밀 동기화로 이미 알고 있는 정확한 timeRange)을
-  // 그대로 시작값으로 쓰고, "영상에서 직접 구간 선택"은 앞뒤로 여유를 둔 더 넓은 구간을 기본값으로
-  // 제시해 원래 구간에서 누락됐을 수 있는 앞/뒤 내용까지 포함해 다시 잡기 쉽게 한다.
+  // "이 구간 다시 스캔"은 이 그룹의 원래 구간(정밀 동기화로 이미 알고 있는 timeRange)을 시작값으로,
+  // "영상에서 직접 구간 선택"은 앞뒤로 여유를 둔 더 넓은 구간을 기본값으로 제시한다.
   const groupStart = timeRange ? timeRange.start : 0;
   const groupEnd = timeRange ? timeRange.end : (duration || 1);
   const pad = Math.max(0.3, (groupEnd - groupStart) * 0.3);
+  const common = { videoRef, roi, scrollDefaults, direction, maxDuration: duration, groupImgSrc, timeAtFrac, onApplyStitch, onCancel };
 
   return (
     <div className="block" style={{ borderColor: 'var(--accent)' }}>
@@ -3115,24 +3844,14 @@ function GroupOverridePanel({ videoRef, scrollDefaults, roi, direction, timeRang
         <button className="icon-btn" style={mode === 'upload' ? { borderColor: 'var(--accent)', color: 'var(--accent)' } : undefined} onClick={() => setMode('upload')}>로컬 이미지 업로드</button>
       </div>
       {mode === 'rescan' && (
-        <RangeRescanPanel
-          key={'rescan-' + groupStart + '-' + groupEnd}
-          videoRef={videoRef} roi={roi} scrollDefaults={scrollDefaults} direction={direction}
+        <RangeRescanPanel key={'rescan-' + groupStart + '-' + groupEnd} {...common}
           initialStart={Math.max(0, groupStart)} initialEnd={Math.min(duration || groupEnd, groupEnd)}
-          maxDuration={duration}
-          hint="원래 이 그룹이 차지했던 구간을 그대로 다시 스캔합니다 (여러 프레임에 걸친 내용도 놓치지 않습니다)."
-          onApply={onApply} onCancel={onCancel}
-        />
+          hint="원래 이 그룹이 차지했던 구간을 그대로 다시 스캔합니다 (여러 프레임에 걸친 내용도 놓치지 않습니다)." />
       )}
       {mode === 'manual-range' && (
-        <RangeRescanPanel
-          key={'manual-' + groupStart + '-' + groupEnd}
-          videoRef={videoRef} roi={roi} scrollDefaults={scrollDefaults} direction={direction}
+        <RangeRescanPanel key={'manual-' + groupStart + '-' + groupEnd} {...common}
           initialStart={Math.max(0, groupStart - pad)} initialEnd={Math.min(duration || groupEnd, groupEnd + pad)}
-          maxDuration={duration}
-          hint="구간을 자유롭게 넓히거나 옮겨서 앞/뒤 누락분까지 포함해 다시 스캔할 수 있습니다."
-          onApply={onApply} onCancel={onCancel}
-        />
+          hint="구간을 자유롭게 넓히거나 옮겨서 앞/뒤 누락분까지 포함해 다시 스캔할 수 있습니다." />
       )}
       {mode === 'upload' && (
         <React.Fragment>
@@ -3150,74 +3869,174 @@ function GroupOverridePanel({ videoRef, scrollDefaults, roi, direction, timeRang
   );
 }
 
+// 이음새 주변 2배 확대 미리보기 (초록선 = 현재 이음새 위치, 내보내는 이미지에는 포함되지 않음)
+function SeamZoom({ canvas, pos, space }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    const cv = ref.current;
+    if (!cv) return;
+    const half = Math.max(48, Math.round((space || 12) * 5));
+    const x0 = Math.max(0, Math.round(pos) - half), x1 = Math.min(canvas.width, Math.round(pos) + half);
+    const w = Math.max(1, x1 - x0);
+    cv.width = w * 2; cv.height = canvas.height * 2;
+    const ctx = cv.getContext('2d');
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(canvas, x0, 0, w, canvas.height, 0, 0, w * 2, canvas.height * 2);
+    ctx.strokeStyle = 'rgba(0,160,0,0.85)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo((pos - x0) * 2, 0); ctx.lineTo((pos - x0) * 2, cv.height); ctx.stroke();
+  }, [canvas, pos, space]);
+  return <canvas ref={ref} style={{ maxWidth: '100%', border: '1px solid var(--border-strong)' }} />;
+}
+
 function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onModeBack }) {
-  const { videoFile, roi, direction, directionNcc, repFrameTimes, stitchedCanvas, seams, bursts, markerData } = scrollCapture;
-  // frameTimeRangeForSpan(옛 방식: 겹치는 대표 프레임들의 시각 min/max)을 timeForGlobalX로 교체 —
-  // markerData.confident면 안정 구간에서 추적한 재생 위치 표시로 선형보간, 아니면 4)의 개선된
-  // piecewise-linear 폴백(burst별 평균 속도). boundaries는 두 방식이 공유하는 같은 좌표계.
-  const timeBoundaries = [0, ...seams.map(s => s.pos)];
+  const { videoFile, roi, direction, directionNcc, mode, frameLen, bursts, notes } = scrollCapture;
+  // 단일 진실 = 조각(frame) 목록. 이음새 미세 조정·구간 재스캔 패치는 이 목록만 편집하고, 스티치 이미지·
+  // 이음새 위치·마커 좌표·시간 매핑은 모두 여기서 다시 파생된다.
+  const [rawFrames, setRawFrames] = useState(scrollCapture.rawFrames);
+  const markerRaw = scrollCapture.markerData;
+  const layout = useMemo(() => renderFrames(rawFrames, direction), [rawFrames, direction]);
+  const stitchedCanvas = layout.canvas;
+  const placed = layout.placed;
+  const stitchAxisLen = direction === 'vertical' ? stitchedCanvas.height : stitchedCanvas.width;
+  const markerData = useMemo(() => {
+    if (!markerRaw) return null;
+    const allPoints = markerPointsToGlobal(markerRaw.rawPoints, placed);
+    return { ...validateMarkerTrack(allPoints), allPoints };
+  }, [markerRaw, placed]);
+
   // "몇 마디씩 묶기(목표)"의 기본값 — 사용자가 아직 직접 입력하지 않았다면(null) 이미 감지된 총
-  // 마디 수를 그대로 따라가며 채워둔다(감지 결과가 바뀌면 같이 갱신). 한 번이라도 직접 타이핑하면
-  // 그 이후로는 항상 사용자가 입력한 값을 그대로 쓴다 — wholeImageFallback과 동일한 패턴.
+  // 마디 수를 그대로 따라가며 채워둔다. 한 번이라도 직접 타이핑하면 그 값을 그대로 쓴다.
   const [groupSizeUser, setGroupSizeUser] = useState(null);
   const [maxBarsPerGroup, setMaxBarsPerGroup] = useState(8);
-  const [overrides, setOverrides] = useState({}); // key `${startIdx}-${endIdx}` -> dataUrl
+  const [overrides, setOverrides] = useState({}); // key -> dataUrl (로컬 이미지 업로드로 대체한 그룹)
   const [overrideOpenKey, setOverrideOpenKey] = useState(null);
   const [sending, setSending] = useState(false);
+  const [showAllFix, setShowAllFix] = useState(false);
+  const [groupBasis, setGroupBasis] = useState('auto'); // 'auto' | 'bar' | 'width'
+  const [showOverlay, setShowOverlay] = useState(true);
+  const [seamSel, setSeamSel] = useState(null);
+  const [seamAdjAll, setSeamAdjAll] = useState(true);
   const groupResultRef = useRef(null);
+  const overlayRef = useRef(null);
 
-  // 마디선 감지 임계값 — 재클릭 없이 슬라이더로 바로 조정 가능해야 하므로 여기서 상태로 갖고
-  // 있다가, detectStaffAndBars 하나만(재이름 과정에서 다른 호출부가 남아있을 여지 자체가 없음)
-  // 항상 거쳐서 재검출한다. 슬라이더를 드래그하는 동안 매 틱마다 O(전체 픽셀) 재계산이 도는 걸
-  // 막기 위해 표시값(Input)과 실제 계산에 쓰는 값(Thresh)을 분리해 살짝 debounce한다.
+  // 마디선 감지 임계값 — 슬라이더를 드래그하는 동안 매 틱마다 O(전체 픽셀) 재계산이 도는 걸 막기 위해
+  // 표시값(Input)과 실제 계산에 쓰는 값(Thresh)을 분리해 살짝 debounce한다. 연속도 임계는 기본 자동 보정
+  // (plateau)이고, 슬라이더를 건드리면 수동 override(자동 해제).
   const [staffThreshInput, setStaffThreshInput] = useState(0.6);
-  const [barThreshInput, setBarThreshInput] = useState(0.85);
+  const [barThreshInput, setBarThreshInput] = useState(0.95);
   const [staffThresh, setStaffThresh] = useState(0.6);
-  const [barThresh, setBarThresh] = useState(0.85);
+  const [barThresh, setBarThresh] = useState(0.95);
+  const [barAuto, setBarAuto] = useState(true);
   useEffect(() => {
     const t = setTimeout(() => { setStaffThresh(staffThreshInput); setBarThresh(barThreshInput); }, 200);
     return () => clearTimeout(t);
   }, [staffThreshInput, barThreshInput]);
 
   const detection = useMemo(
-    () => detectStaffAndBars(stitchedCanvas, staffThresh, barThresh),
-    [stitchedCanvas, staffThresh, barThresh]
+    () => detectStaffAndBars(stitchedCanvas, staffThresh, barAuto ? null : barThresh, frameLen),
+    [stitchedCanvas, staffThresh, barThresh, barAuto, frameLen]
   );
   const bars = detection.bars;
   const staffFound = detection.staffFound;
+  const quality = detection.quality;
   const measureCount = Math.max(0, bars.length - 1);
   const groupSize = groupSizeUser != null ? groupSizeUser : Math.max(1, measureCount || 4);
+  const measureW = useMemo(() => robustMeasureWidth(bars), [bars]);
+  const blank = useMemo(
+    () => (detection.system ? computeBlankColumns(detection.gray, detection.system, 140) : new Uint8Array(stitchedCanvas.width)),
+    [detection, stitchedCanvas]
+  );
 
-  // 마디선이 0개(또는 부족)여도 다음 단계를 막지 않는다 — "마디선 없이 스티칭 결과 전체를 그대로
-  // 하나의 이미지로 사용" 폴백. 사용자가 아직 이 체크박스를 직접 만지지 않았다면 마디가 1개 미만일
-  // 때 자동으로 제안(선택)해두고, 한 번이라도 직접 바꾸면 그 이후로는 마디 수와 무관하게 사용자
-  // 선택을 그대로 따른다.
+  // 오선 자체를 못 찾았을 때만 "전체를 하나의 이미지로" 자동 제안 — 오선은 찾았는데 마디선이 부족/불안정하면
+  // 폭 기준 분할로 계속 진행한다. 사용자가 체크박스를 직접 만지면 그 선택을 따른다.
   const [wholeImageFallback, setWholeImageFallback] = useState(null);
-  const effectiveFallback = wholeImageFallback !== null ? wholeImageFallback : measureCount < 1;
-  const stitchAxisLen = direction === 'vertical' ? stitchedCanvas.height : stitchedCanvas.width;
+  const effectiveFallback = wholeImageFallback !== null ? wholeImageFallback : !staffFound;
 
-  // 파라미터(N, 최대 마디수, 임계값, 폴백)를 바꾸면 버튼 재클릭 없이 여기서 즉시 재계산(리플로우) —
-  // 스티칭은 다시 하지 않고 캐시된 stitchedCanvas를 그대로 재사용한다.
-  const groups = effectiveFallback
-    ? [{ startIdx: 0, endIdx: measureCount, startX: 0, endX: stitchAxisLen, count: measureCount || null, whole: true }]
-    : groupBarsByTargetWidth(bars, groupSize, maxBarsPerGroup);
+  const useBarGroups = !effectiveFallback && bars.length >= 2 && (groupBasis === 'bar' || (groupBasis === 'auto' && !quality.low));
 
-  const groupsWithMeta = groups.map((g, idx) => {
-    const confidence = groupConfidence(seams, g.startX, g.endX);
-    const key = g.whole ? 'whole' : (g.startIdx + '-' + g.endIdx);
-    const override = overrides[key];
+  let groups;
+  if (effectiveFallback) groups = [{ startIdx: 0, endIdx: measureCount, startX: 0, endX: stitchAxisLen, count: measureCount || null, whole: true }];
+  else if (useBarGroups) groups = groupBarsByTargetWidth(bars, groupSize, maxBarsPerGroup);
+  else groups = groupByWidth(stitchAxisLen, groupSize, maxBarsPerGroup, measureW, frameLen, bars, blank);
+
+  // 컷 이음새 자동 검증 — 이음새를 낀 마디 폭, 양쪽 내용 중복 흔적. 통과 못 한 이음새만 저신뢰.
+  const seamChecks = useMemo(() => validateCutSeams(layout.seams, bars, detection), [layout.seams, bars, detection]);
+  const seamsV = layout.seams.map((s, i) => ({ ...s, flagged: !!(seamChecks[i] && seamChecks[i].flagged), reason: seamChecks[i] && seamChecks[i].reason }));
+  const flaggedSeams = seamsV.filter(s => s.flagged);
+  const curSeam = flaggedSeams.length ? (flaggedSeams.find(s => s.i === seamSel) || flaggedSeams[0]) : null;
+
+  const groupsBase = groups.map(g => {
+    const confidence = groupConfidence(seamsV, g.startX, g.endX);
+    const key = g.whole ? 'whole' : ((g.byWidth ? 'w' : '') + g.startIdx + '-' + g.endIdx);
     const timeRange = {
-      start: timeForGlobalX(markerData, timeBoundaries, repFrameTimes, g.startX),
-      end: timeForGlobalX(markerData, timeBoundaries, repFrameTimes, g.endX),
+      start: timeForGlobalX(markerData, placed, g.startX),
+      end: timeForGlobalX(markerData, placed, g.endX),
     };
-    return { ...g, key, confidence, lowConfidence: confidence < 0.7, override, timeRange };
+    return { ...g, key, confidence, lowConfidence: confidence < 0.7, override: overrides[key], timeRange };
   });
+  // 누락 의심: (timeRange 길이 ÷ 픽셀 폭)이 전체 중앙값 대비 ±40%를 넘는 그룹
+  const timePerPx = groupsBase.map(g => (g.timeRange.end - g.timeRange.start) / Math.max(1, g.endX - g.startX));
+  const medTpp = medianOf(timePerPx);
+  const groupsWithMeta = groupsBase.map((g, i) => ({
+    ...g,
+    suspect: groupsBase.length >= 3 && medTpp > 0 && Math.abs(timePerPx[i] / medTpp - 1) > 0.4,
+  }));
 
   const outlierBursts = bursts.filter(b => b.isOutlier);
+
+  // 디버그 오버레이 — 사용된 밴드(파랑 사각형)·마디선(빨강)·이음새(초록 가는 선). 화면용 canvas에만 그리며
+  // 내보내는 이미지(stitchedCanvas에서 직접 crop)에는 포함되지 않는다.
+  useEffect(() => {
+    const cv = overlayRef.current;
+    if (!cv || !showOverlay) return;
+    const h0 = stitchedCanvas.height, w0 = stitchedCanvas.width;
+    const scale = Math.min(1, 150 / h0, 12000 / w0);
+    cv.width = Math.max(1, Math.round(w0 * scale)); cv.height = Math.max(1, Math.round(h0 * scale));
+    const ctx = cv.getContext('2d');
+    ctx.drawImage(stitchedCanvas, 0, 0, cv.width, cv.height);
+    if (detection.system) {
+      ctx.strokeStyle = 'rgba(0,90,255,0.9)'; ctx.lineWidth = 1;
+      ctx.strokeRect(0.5, detection.system.main.top * scale, cv.width - 1, Math.max(1, (detection.system.main.bottom - detection.system.main.top) * scale));
+    }
+    ctx.strokeStyle = 'rgba(230,30,30,0.9)';
+    for (const b of bars) { ctx.beginPath(); ctx.moveTo(b * scale + 0.5, 0); ctx.lineTo(b * scale + 0.5, cv.height); ctx.stroke(); }
+    ctx.strokeStyle = 'rgba(0,160,0,0.9)';
+    for (const s of layout.seams) {
+      if (s.dup) continue;
+      ctx.beginPath(); ctx.moveTo(s.pos * scale + 0.5, 0); ctx.lineTo(s.pos * scale + 0.5, cv.height); ctx.stroke();
+    }
+  }, [stitchedCanvas, detection, bars, layout.seams, showOverlay]);
 
   function applyOverride(key, dataUrl) {
     setOverrides(prev => ({ ...prev, [key]: dataUrl }));
     setOverrideOpenKey(null);
+  }
+
+  // 재스캔 결과 패치: 재스캔 시간 구간 [startT,endT]에 해당하는 전역 좌표 구간만 교체. 뒤쪽 조각(= 이음새
+  // 위치)은 폭 차이만큼 자동으로 밀리고, 마커 점은 (조각 id, 로컬 좌표)로 저장돼 있어 같이 이동한다.
+  function applyStitchPatch(mini, startT, endT) {
+    if (!mini) return;
+    if (mini.direction !== direction) { alert('스크롤 방향이 달라 적용할 수 없습니다.'); return; }
+    const lo = Math.min(startT, endT), hi = Math.max(startT, endT);
+    let xA = Math.round(globalXForTime(markerData, placed, stitchAxisLen, lo));
+    let xB = Math.round(globalXForTime(markerData, placed, stitchAxisLen, hi));
+    xA = Math.max(0, Math.min(stitchAxisLen - 1, xA));
+    xB = Math.max(xA + 1, Math.min(stitchAxisLen, xB));
+    setRawFrames(patchFrames(placed, xA, xB, mini.rawFrames));
+    setOverrides({}); // 그룹 경계가 바뀌므로 로컬 업로드로 대체한 그룹 이미지는 초기화
+    setOverrideOpenKey(null);
+    setSeamSel(null);
+  }
+
+  function nudgeSeam(d) {
+    if (!curSeam) return;
+    setRawFrames(prev => adjustCutSeam(prev, curSeam.i, d, seamAdjAll));
+  }
+  function onSeamKey(e) {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    const step = e.shiftKey ? 10 : 1;
+    nudgeSeam(e.key === 'ArrowLeft' ? step : -step);
   }
 
   async function handleSendToScoreBuilder() {
@@ -3234,8 +4053,8 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
           lyrics: { tags: [], areaHeightRatio: null },
           playheadExcluded: [], barLayout: null,
           stitchMeta: {
-            source: 'scroll', direction, directionNcc, groupIndex: idx,
-            barRange: [g.startIdx, g.endIdx], barCount: g.count, confidence: g.confidence,
+            source: 'scroll', direction, directionNcc, groupIndex: idx, transition: mode,
+            barRange: [g.startIdx, g.endIdx], barCount: g.count, byWidth: !!g.byWidth, confidence: g.confidence,
             manuallyReplaced: !!g.override,
           },
           timeRange: g.timeRange,
@@ -3253,17 +4072,25 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
     }
   }
 
+  const barSliderValue = barAuto ? detection.threshUsed : barThreshInput;
+
   return (
     <div>
       <div className="block">
         <div className="block-head"><span>결과 — 이어붙이기 · 마디선 · 그룹 (재조정 가능)</span></div>
         <p className="hint-text">
           방향: {direction === 'vertical' ? '세로' : '가로'} 스크롤{directionNcc != null ? ' (첫 이음매 NCC=' + directionNcc.toFixed(3) + ')' : ''} ·
-          이어붙인 프레임 {repFrameTimes.length}장 ·{' '}
+          전환 방식: {mode === 'cut' ? '컷 전환(타일링, 맞대어 붙이기)' : '부드러운 스크롤(NCC 겹침)'} ·
+          이어붙인 조각 {rawFrames.length}개 ·{' '}
           {markerData && markerData.confident
             ? <span className="badge badge-precise">정밀 동기화됨 (재생 표시 감지 · 추적점 {markerData.count}개)</span>
-            : <span className="badge badge-estimate">추정값 (재생 표시 없음 — 구간별 보간){markerData ? ' · 추적점 ' + markerData.count + '개(부족)' : ''}</span>}
+            : <span className="badge badge-estimate">추정값 (재생 표시 없음 — {mode === 'cut' ? '타일 내 선형 보간' : '구간별 보간'}){markerData ? ' · 추적점 ' + markerData.count + '개(부족)' : ''}</span>}
         </p>
+        {notes && notes.roiNarrow && (
+          <p className="hint-text" style={{ color: '#c0392b' }}>
+            ⚠ 오선이 영역(ROI) 양쪽 끝까지 닿아 있습니다. 지정한 영역이 뷰어의 악보 영역보다 좁아 이음새에서 내용이 빠질 수 있으니, 영역을 더 넓게 지정해서 다시 시도하세요.
+          </p>
+        )}
         {outlierBursts.length > 0 && (
           <p className="hint-text" style={{ color: '#c0392b' }}>
             ⚠ 다른 구간보다 유독 길거나 짧은 스크롤 구간이 {outlierBursts.length}개 있습니다 (아래 그룹 중 테두리가 강조된 곳을 확인하세요).
@@ -3281,20 +4108,33 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
         </div>
         <div className="toolbar">
           <label style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <span className="slider-label" style={{ margin: 0, whiteSpace: 'nowrap' }}>마디선 감지 임계값</span>
-            <input type="range" min="0.1" max="0.98" step="0.01" value={barThreshInput} style={{ flex: 1 }}
-              onChange={e => setBarThreshInput(parseFloat(e.target.value))} />
-            <span className="slider-label" style={{ margin: 0 }}>{barThreshInput.toFixed(2)}</span>
+            <span className="slider-label" style={{ margin: 0, whiteSpace: 'nowrap' }}>마디선 연속도 임계값</span>
+            <input type="range" min="0.5" max="1" step="0.01" value={barSliderValue} style={{ flex: 1 }}
+              onChange={e => { setBarAuto(false); setBarThreshInput(parseFloat(e.target.value)); }} />
+            <span className="slider-label" style={{ margin: 0 }}>{barSliderValue.toFixed(2)}{barAuto ? ' (자동)' : ''}</span>
           </label>
+          <label><input type="checkbox" checked={barAuto} onChange={e => setBarAuto(e.target.checked)} /> 자동 보정</label>
         </div>
         <p className="hint-text" style={{ margin: '4px 0' }}>
-          {staffFound ? ('6선 감지됨 · 마디선 ' + bars.length + '개 (마디 ' + measureCount + '개) 검출됨') : '6선을 찾지 못했습니다.'}
-          {measureCount < 1 && ' — 마디선이 부족합니다. 임계값을 낮춰보거나, 아래 "마디선 없이 전체 사용"을 켜세요.'}
+          {staffFound ? ('보표 구조 인식됨 · 마디선 ' + bars.length + '개 (마디 ' + measureCount + '개) 검출됨') : '보표(오선)를 찾지 못했습니다.'}
+          {staffFound && quality.low && (
+            <b style={{ color: '#c0392b' }}> · 마디 인식 신뢰도 낮음
+              ({quality.measureCount < 1 ? '마디선 없음' : ('폭 정상 비율 ' + Math.round(quality.widthOk * 100) + '%' + (quality.perView != null ? ', ROI 폭당 ' + quality.perView.toFixed(1) + '마디' : ''))})
+              {!effectiveFallback && !useBarGroups && ' — 폭 기준 분할로 자동 전환됨'}
+            </b>
+          )}
         </p>
         <div className="toolbar">
           <label><input type="checkbox" checked={effectiveFallback} onChange={e => setWholeImageFallback(e.target.checked)} />
             마디선 없이 스티칭 결과 전체를 그대로 하나의 이미지로 사용</label>
+          <label><input type="checkbox" checked={showOverlay} onChange={e => setShowOverlay(e.target.checked)} /> 디버그 오버레이 표시</label>
         </div>
+        {showOverlay && (
+          <div style={{ overflowX: 'auto', border: '1px solid var(--border-strong)', background: '#fff' }}>
+            <canvas ref={overlayRef} />
+          </div>
+        )}
+        {showOverlay && <p className="hint-text" style={{ margin: '4px 0' }}>파랑 = 사용된 보표 밴드 · 빨강 = 검출된 마디선 · 초록 = 이음새 위치 (화면 표시용, 내보내는 이미지에는 포함되지 않음)</p>}
 
         <div className="hr" />
         <div className="toolbar">
@@ -3302,15 +4142,50 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
             onChange={e => setGroupSizeUser(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
           <label>그룹당 최대 마디수: <input type="number" min="1" max="20" value={maxBarsPerGroup} disabled={effectiveFallback}
             onChange={e => setMaxBarsPerGroup(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
-          <span className="save-msg">{measureCount}마디 → {groups.length}개 그룹</span>
+          <label>그룹 기준:
+            <select value={groupBasis} onChange={e => setGroupBasis(e.target.value)} disabled={effectiveFallback} style={{ width: 'auto', marginLeft: '6px' }}>
+              <option value="auto">자동 (신뢰도 낮으면 폭 기준)</option>
+              <option value="bar">마디선 기준</option>
+              <option value="width">폭 기준</option>
+            </select>
+          </label>
+          <span className="save-msg">{effectiveFallback ? '전체 1개 그룹' : (useBarGroups ? (measureCount + '마디 → ' + groups.length + '개 그룹') : ('폭 기준 분할 → ' + groups.length + '개 그룹'))}</span>
         </div>
+      </div>
+
+      {flaggedSeams.length > 0 && curSeam && (
+        <div className="block" style={{ borderColor: '#c0392b' }}>
+          <div className="block-head"><span>이음새 미세 조정 — 자동 검증에 실패한 이음새 {flaggedSeams.length}개</span></div>
+          <p className="hint-text">
+            선택한 이음새: {curSeam.reason}. 아래 확대 미리보기를 클릭한 뒤 ←/→ 키(1px, Shift+키는 10px) 또는 버튼으로 오른쪽 타일의 위치를 맞추세요. 초록선이 현재 이음새입니다.
+          </p>
+          <div className="toolbar">
+            {flaggedSeams.map(s => (
+              <button key={s.i} className="icon-btn" style={s.i === curSeam.i ? { borderColor: 'var(--accent)', color: 'var(--accent)' } : undefined}
+                onClick={() => setSeamSel(s.i)}>이음새 {s.i + 1}</button>
+            ))}
+          </div>
+          <div tabIndex={0} onKeyDown={onSeamKey} style={{ outline: 'none' }}>
+            <SeamZoom canvas={stitchedCanvas} pos={curSeam.pos} space={detection.system ? detection.system.space : 12} />
+          </div>
+          <div className="toolbar">
+            <button className="icon-btn" onClick={() => nudgeSeam(10)}>⇤ 10px</button>
+            <button className="icon-btn" onClick={() => nudgeSeam(1)}>← 1px</button>
+            <button className="icon-btn" onClick={() => nudgeSeam(-1)}>→ 1px</button>
+            <button className="icon-btn" onClick={() => nudgeSeam(-10)}>10px ⇥</button>
+            <label><input type="radio" checked={seamAdjAll} onChange={() => setSeamAdjAll(true)} /> 전체 이음새에 적용</label>
+            <label><input type="radio" checked={!seamAdjAll} onChange={() => setSeamAdjAll(false)} /> 이 이음새만</label>
+          </div>
+        </div>
+      )}
+
+      <div className="toolbar">
+        <label><input type="checkbox" checked={showAllFix} onChange={e => setShowAllFix(e.target.checked)} /> 모든 그룹에 수동 보정 버튼 표시 (기본: 자동 처리로 해결 안 된 그룹에만 표시)</label>
       </div>
 
       <div className="list" ref={groupResultRef}>
         {(() => {
-          // 마지막(또는 마디 수가 적은) 그룹이 확대되어 보이지 않도록 — 모든 그룹에 같은
-          // displayScale(px 단위)을 적용한다. 가장 "긴"(스티칭 축 기준) 그룹 기준으로 한 번만
-          // 계산해서 전체에 동일 적용 (prototype의 groupBtn 미리보기 로직과 동일한 방식).
+          // 마지막(또는 마디 수가 적은) 그룹이 확대되어 보이지 않도록 — 모든 그룹에 같은 displayScale(px 단위)을 적용.
           function nativeSize(g) {
             return direction === 'vertical'
               ? { w: stitchedCanvas.width, h: g.endX - g.startX }
@@ -3324,25 +4199,32 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
             const src = g.override || (canvas && canvas.toDataURL('image/png'));
             const nsize = nativeSize(g);
             const imgStyle = g.override
-              ? undefined // 수동 대체 이미지는 원본 크롭과 크기 계약이 다를 수 있어 기본(max-width:100%)로 표시
+              ? undefined
               : { width: Math.round(nsize.w * displayScale) + 'px', height: Math.round(nsize.h * displayScale) + 'px', maxWidth: 'none' };
+            const flagged = g.lowConfidence || g.suspect;
             return (
-              <div key={g.key} className="block" style={g.lowConfidence ? { borderColor: '#c0392b', borderWidth: '2px' } : undefined}>
+              <div key={g.key} className="block" style={flagged ? { borderColor: '#c0392b', borderWidth: '2px' } : undefined}>
                 <div className="block-head">
                   <span>
-                    그룹 {idx + 1}: {g.whole ? '전체 (마디선 미사용)' : (g.count + '마디')}
-                    {g.lowConfidence && <b style={{ color: '#c0392b' }}> · 저신뢰 구간 (NCC {g.confidence.toFixed(2)})</b>}
+                    그룹 {idx + 1}: {g.whole ? '전체 (마디선 미사용)' : (g.byWidth ? '폭 기준 분할' : (g.count + '마디'))}
+                    <span className="save-msg"> · {g.timeRange.start.toFixed(2)}s ~ {g.timeRange.end.toFixed(2)}s</span>
+                    {g.lowConfidence && <b style={{ color: '#c0392b' }}> · 저신뢰 구간 ({seamsV.some(s => s.cut && s.flagged && s.pos > g.startX - 1 && s.pos < g.endX + 1) ? '이음새 검증 실패' : 'NCC ' + g.confidence.toFixed(2)})</b>}
+                    {g.suspect && <b style={{ color: '#c0392b' }}> · 누락 의심 (시간 대비 내용량 불일치)</b>}
                     {g.override && <span className="save-msg"> · 수동으로 다시 만듦</span>}
                   </span>
-                  <button className="icon-btn" onClick={() => setOverrideOpenKey(overrideOpenKey === g.key ? null : g.key)}>
-                    이 구간 다시 만들기
-                  </button>
+                  {(flagged || showAllFix) && (
+                    <button className="icon-btn" onClick={() => setOverrideOpenKey(overrideOpenKey === g.key ? null : g.key)}>
+                      이 구간 다시 만들기
+                    </button>
+                  )}
                 </div>
                 {src && <img src={src} className="merge-preview-img" style={imgStyle} alt={'그룹 ' + (idx + 1)} />}
                 {overrideOpenKey === g.key && (
                   <GroupOverridePanel videoRef={videoRef} scrollDefaults={scrollDefaults} roi={roi}
-                    direction={direction} timeRange={g.timeRange}
+                    direction={direction} timeRange={g.timeRange} groupImgSrc={src}
+                    timeAtFrac={frac => timeForGlobalX(markerData, placed, g.startX + frac * (g.endX - g.startX))}
                     onApply={dataUrl => applyOverride(g.key, dataUrl)}
+                    onApplyStitch={applyStitchPatch}
                     onCancel={() => setOverrideOpenKey(null)} />
                 )}
               </div>
