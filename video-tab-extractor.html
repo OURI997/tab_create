@@ -2145,14 +2145,39 @@ function scrollRemoveAxisMean(g, direction) {
   }
 }
 
-// opts: { removeStaff, minShift, maxShift, maxDim } — minShift/maxShift는 원본 해상도 px 단위(생략하면
+function scrollFullLineMask(gA, gB, direction) {
+  const len = direction === 'vertical' ? Math.min(gA.h, gB.h) : Math.min(gA.w, gB.w);
+  const mask = new Uint8Array(len);
+  for (const g of [gA, gB]) {
+    for (let i = 0; i < len; i++) {
+      let dark = 0;
+      if (direction === 'vertical') { for (let x = 0; x < g.w; x++) if (g.gray[i * g.w + x] < 128) dark++; if (dark / g.w >= 0.85) mask[i] = 1; }
+      else { for (let y = 0; y < g.h; y++) if (g.gray[y * g.w + i] < 128) dark++; if (dark / g.h >= 0.85) mask[i] = 1; }
+    }
+  }
+  return mask;
+}
+function scrollApplyLineMask(gA, gB, mask, direction) {
+  for (const g of [gA, gB]) {
+    for (let i = 0; i < mask.length; i++) {
+      if (!mask[i]) continue;
+      if (direction === 'vertical') { for (let x = 0; x < g.w; x++) g.gray[i * g.w + x] = 0; }
+      else { for (let y = 0; y < g.h; y++) g.gray[y * g.w + i] = 0; }
+    }
+  }
+}
+
+// opts: { removeStaff, maskPlaybar, minShift, maxShift, maxDim } — minShift/maxShift는 원본 해상도 px 단위(생략하면
 // 기존처럼 전체 길이의 15%~85%). 기존 호출(opts 없음)은 동작이 완전히 동일하다.
 function scrollFindBestShift(canvasA, canvasB, direction, opts) {
   opts = opts || {};
   const SEARCH_MAXDIM = opts.maxDim || 220;
   const gA = scrollGetGray(canvasA, SEARCH_MAXDIM);
   const gB = scrollGetGray(canvasB, SEARCH_MAXDIM);
+  // 재생바 열 제외: 높이(폭)의 85% 이상이 어두운 선은 오선·내용이 아니라 재생바/마디선이므로 양쪽 모두에서 중립화
+  const lineMask = opts.maskPlaybar ? scrollFullLineMask(gA, gB, direction) : null;
   if (opts.removeStaff) { scrollRemoveAxisMean(gA, direction); scrollRemoveAxisMean(gB, direction); }
+  if (lineMask) scrollApplyLineMask(gA, gB, lineMask, direction);
   const W = Math.min(gA.w, gB.w), H = Math.min(gA.h, gB.h);
 
   const totalLen = direction === 'vertical' ? H : W;
@@ -2407,7 +2432,53 @@ function pruneCloseBarObjs(list) {
   return cur;
 }
 
-function detectBarsThroughSystem(g, sys, T, left, darkThresh) {
+// 같은 내용(전역 x)을 본 프레임들 중 그 위치에 밴드 높이의 선이 보이는 비율 — 재생바는 한 프레임에서만 보인다
+const scrollFrameGrayCache = new WeakMap();
+function scrollFrameGray(canvas) {
+  let v = scrollFrameGrayCache.get(canvas);
+  if (!v) { v = scrollGetFullGrayData(canvas); scrollFrameGrayCache.set(canvas, v); }
+  return v;
+}
+function barPersistence(frames, x, bandTop, bandBottom, darkThresh) {
+  let obs = 0, seen = 0;
+  for (const f of frames) {
+    if (f.dup) continue;
+    const u = Math.round(x - f.start + f.srcX);
+    if (u < 3 || u >= f.canvas.width - 3) continue;
+    const gf = scrollFrameGray(f.canvas);
+    let hit = false;
+    for (let du = -2; du <= 2 && !hit; du++) if (columnRunFraction(gf, u + du, bandTop, bandBottom, darkThresh) >= 0.7) hit = true;
+    obs++;
+    if (hit) seen++;
+  }
+  return { obs, seen };
+}
+// 밴드 가장자리(edgeY)에서 바깥쪽으로 끊김 없이(1px 허용) 이어지는 잉크 길이 (limit까지)
+function contiguousInk(g, x, edgeY, dirSign, limit, darkThresh) {
+  let len = 0, gap = 0;
+  for (let k = 0; k < limit; k++) {
+    const y = edgeY + dirSign * k;
+    if (y < 0 || y >= g.h) break;
+    if (g.gray[y * g.w + x] < darkThresh) { len = k + 1; gap = 0; }
+    else if (++gap > 1) break;
+  }
+  return len;
+}
+// 씨앗 y에서 위/아래로 (2px 끊김 허용) 이어지는 어두운 구간의 끝
+function runExtentFrom(g, x, ySeed, darkThresh) {
+  let y0 = Math.round(ySeed), found = false;
+  for (let d = 0; d < 6 && !found; d++) {
+    for (const yy of [y0 + d, y0 - d]) if (yy >= 0 && yy < g.h && g.gray[yy * g.w + x] < darkThresh) { y0 = yy; found = true; break; }
+  }
+  if (!found) return null;
+  let top = y0, bot = y0, gap = 0;
+  for (let y = y0 - 1; y >= 0; y--) { if (g.gray[y * g.w + x] < darkThresh) { top = y; gap = 0; } else if (++gap > 2) break; }
+  gap = 0;
+  for (let y = y0 + 1; y < g.h; y++) { if (g.gray[y * g.w + x] < darkThresh) { bot = y; gap = 0; } else if (++gap > 2) break; }
+  return { top, bot };
+}
+
+function detectBarsThroughSystem(g, sys, T, left, darkThresh, frames) {
   const space = sys.space, staves = sys.main.staves, K = staves.length;
   const tol = Math.max(3, space * 0.4);
   const bands = staves.map(st => [st[0].y0, st[st.length - 1].y1]);
@@ -2437,6 +2508,7 @@ function detectBarsThroughSystem(g, sys, T, left, darkThresh) {
   }
   const cand = groups.length;
   const passed = [];
+  let protruded = 0, endMismatch = 0, notPersistent = 0;
   for (const gr of groups) {
     if (new Set(gr.items.map(m => m.k)).size < K) continue;
     const x = gr.items.reduce((s, m) => s + m.x, 0) / gr.items.length;
@@ -2454,7 +2526,30 @@ function detectBarsThroughSystem(g, sys, T, left, darkThresh) {
         if (best < 0.7) gapConn = false;
       }
     }
-    passed.push({ x: Math.round(x), score: cov + (gapConn ? 0.05 : 0), gapConn });
+    // 재생바 제거 — 마디선은 시스템 밴드(맨 위 줄 ~ 맨 아래 줄)에서 시작해 끝나며 밴드 밖으로 나가지 않는다
+    const px = Math.round(x);
+    const bandTop = sys.main.top, bandBottom = sys.main.bottom;
+    const tolEnd = Math.max(2, space * 0.3);
+    const protrude = Math.max(
+      contiguousInk(g, px, bandTop - 1, -1, Math.round(space * 2), darkThresh),
+      contiguousInk(g, px, bandBottom + 1, 1, Math.round(space * 2), darkThresh)
+    );
+    if (protrude >= space * 0.6) { protruded++; continue; }
+    let endsOk = false;
+    for (let dx = -1; dx <= 1 && !endsOk; dx++) {
+      const xx = px + dx;
+      if (xx < 0 || xx >= g.w) continue;
+      const e1 = runExtentFrom(g, xx, (staves[0][0].y0 + staves[0][staves[0].length - 1].y1) / 2, darkThresh);
+      const lastSt = staves[K - 1];
+      const e2 = runExtentFrom(g, xx, (lastSt[0].y0 + lastSt[lastSt.length - 1].y1) / 2, darkThresh);
+      if (e1 && e2 && Math.abs(e1.top - bandTop) <= tolEnd && Math.abs(e2.bot - bandBottom) <= tolEnd) endsOk = true;
+    }
+    if (!endsOk) { endMismatch++; continue; }
+    if (frames) {
+      const ps = barPersistence(frames, x, bandTop, bandBottom, darkThresh);
+      if (ps.obs >= 2 && ps.seen / ps.obs < 0.7) { notPersistent++; continue; }
+    }
+    passed.push({ x: px, score: cov + (gapConn ? 0.05 : 0), gapConn });
   }
   // 헤더(첫 타일 악보 왼쪽 오선 간격×20) 제외, 제외 후 0이면 범위를 절반으로 재시도
   const run = hs => passed.filter(b => b.x >= left + space * hs);
@@ -2462,7 +2557,7 @@ function detectBarsThroughSystem(g, sys, T, left, darkThresh) {
   if (!kept.length && passed.length) kept = run(10);
   const afterHeader = kept.length;
   kept = pruneCloseBarObjs(kept);
-  return { bars: kept, stats: { cand, allStaff: passed.length, afterHeader, afterPrune: kept.length, T } };
+  return { bars: kept, stats: { cand, allStaff: passed.length, afterHeader, afterPrune: kept.length, T, protruded, endMismatch, notPersistent } };
 }
 
 // 품질 점수 — 마디 폭이 중앙값의 0.4~2.5배 안인 비율, "ROI 폭당 마디 수"(1~8 밖이면 의심)
@@ -2482,7 +2577,7 @@ function assessBarQuality(bars, totalLen, viewLen, weak) {
 // T를 0.9에서 0.05씩 낮추며(최저 0.5) 마디 수가 "ROI 폭 ÷ (오선 간격×10)"의 0.5배 이상이 되면 멈춘다.
 // 그래도 부족하면 weak(마디선 인식 약함) — 결과 화면이 폭 기준 그룹화로 자동 전환한다(마디선 0개여도 진행 가능).
 // 입력은 오버레이 없는 깨끗한 stitched canvas여야 한다.
-function detectStaffAndBars(canvas, staffThresh, barThresh, viewLen) {
+function detectStaffAndBars(canvas, staffThresh, barThresh, viewLen, frames) {
   const g = scrollGetFullGrayData(canvas);
   const darkThresh = 140;
   const sys = detectStaffSystem(g, Math.max(0.05, staffThresh * 0.5), darkThresh);
@@ -2498,12 +2593,12 @@ function detectStaffAndBars(canvas, staffThresh, barThresh, viewLen) {
   let res, T, weak = false;
   if (!auto) {
     T = barThresh;
-    res = detectBarsThroughSystem(g, sys, T, left, darkThresh);
+    res = detectBarsThroughSystem(g, sys, T, left, darkThresh, frames);
   } else {
     const expectMin = viewLen ? 0.5 * viewLen / (sys.space * 10) : 1;
     for (const t of [0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5]) {
       T = t;
-      res = detectBarsThroughSystem(g, sys, T, left, darkThresh);
+      res = detectBarsThroughSystem(g, sys, T, left, darkThresh, frames);
       if (res.bars.length >= expectMin) break;
     }
     weak = res.bars.length < expectMin;
@@ -2784,23 +2879,50 @@ async function captureRepCanvas(video, roi, t) {
   return c;
 }
 
-// burst별 전환 유형 판별. (a) 전환이 샘플 1스텝 안에 끝나 중간 프레임이 없고 (b) 오선 제거 후 NCC가
-// 유의미한 shift를 못 찾으면 "컷". 방향이 auto면 가로·세로 둘 다 실패해야 컷으로 본다. 전체 burst의
-// 절반 이상이 컷이면 컷 모드.
+// burst 전/후 화면을 한 장이 아니라 인접 최대 3장의 픽셀별 중앙값으로 만든다(움직이는 재생 표시 제거).
+async function medianRepCanvas(video, roi, times, idx, dir, scrollDefaults) {
+  const caps = [];
+  for (let k = 0; k < 3; k++) {
+    const i = idx + dir * k;
+    if (i < 0 || i >= times.length) break;
+    caps.push(await captureRepCanvas(video, roi, times[i]));
+  }
+  const c = caps.length >= 3 ? medianOfCanvases(caps) : caps[0];
+  scrollApplyPreprocInPlace(c, scrollDefaults);
+  return c;
+}
+
+// burst별 전환 유형 판별. 컷 = (a) 전환이 샘플 1스텝 안에 끝나 중간 프레임이 없고 (b) 오선 제거 + 재생바 열
+// 제외 후 NCC가 유의미한 shift를 못 찾고 (c) A의 오른쪽 끝(화면 폭 10~50%)과 B의 왼쪽 끝이 어떤 shift에서도
+// 겹치지 않음. 겹침이 확인되면 그 burst는 컷이 아니다. 방향이 auto면 가로·세로 둘 다 실패해야 한다.
+// kind: 'cut'(컷 burst 비율 > 0.9, 다중 샘플 burst 없음) | 'smooth' | 'ambiguous'(비율 0.5~0.9 또는 다중 샘플 burst가 섞임)
 async function classifyCutBursts(video, roi, times, bursts, scrollDefaults, directionPref) {
-  if (!bursts.length || directionPref === 'vertical') return { isCut: false, flags: [] };
+  if (!bursts.length || directionPref === 'vertical') return { kind: 'smooth', cutCount: 0, multi: 0, ratio: 0, flags: [] };
   const dirs = directionPref === 'horizontal' ? ['horizontal'] : ['horizontal', 'vertical'];
   const flags = [];
+  let multi = 0;
   for (const b of bursts) {
-    if (b.end !== b.start) { flags.push(false); continue; }
-    const A = await captureRepCanvas(video, roi, times[Math.max(0, b.start - 1)]);
-    const B = await captureRepCanvas(video, roi, times[Math.min(times.length - 1, b.end + 1)]);
-    scrollApplyPreprocInPlace(A, scrollDefaults);
-    scrollApplyPreprocInPlace(B, scrollDefaults);
-    flags.push(dirs.every(d => !scrollFindBestShift(A, B, d, { removeStaff: true }).ok));
+    if (b.end !== b.start) { flags.push(false); multi++; continue; }
+    const A = await medianRepCanvas(video, roi, times, Math.max(0, b.start - 1), -1, scrollDefaults);
+    const B = await medianRepCanvas(video, roi, times, Math.min(times.length - 1, b.end + 1), 1, scrollDefaults);
+    const noShift = dirs.every(d => !scrollFindBestShift(A, B, d, { removeStaff: true, maskPlaybar: true }).ok);
+    let overlap = false;
+    if (noShift) {
+      const W = A.width;
+      overlap = scrollFindBestShift(A, B, 'horizontal', {
+        removeStaff: true, maskPlaybar: true, minShift: Math.round(W * 0.5), maxShift: Math.round(W * 0.9),
+      }).ok;
+    }
+    flags.push(noShift && !overlap);
   }
   const cutCount = flags.filter(Boolean).length;
-  return { isCut: cutCount > 0 && cutCount * 2 >= bursts.length, flags };
+  const ratio = cutCount / bursts.length;
+  let kind;
+  if (cutCount === 0) kind = 'smooth';
+  else if ((ratio >= 0.5 && ratio <= 0.9) || multi > 0) kind = 'ambiguous';
+  else if (ratio > 0.9) kind = 'cut';
+  else kind = 'smooth';
+  return { kind, cutCount, multi, ratio, flags };
 }
 
 // 정지 구간(타일) 정의: 각 타일의 대표 시각은 구간 중앙, 시간 구간 [t0,t1]은 컷 시각으로 고정
@@ -2823,15 +2945,18 @@ function buildCutTileDefs(times, bursts) {
   return defs;
 }
 
-// 정지 구간 [startIdx,endIdx]에서 중앙값용 샘플 인덱스. 전환 직후·직전 1샘플은 제외하고, 남은 샘플이 3개
-// 미만이면 구간 중앙 1장만 쓴다.
+// 정지 구간 [startIdx,endIdx]에서 중앙값용 샘플 인덱스: 구간 앞·뒤 10%(최소 1샘플)를 제외한 전 구간에서 최대 7장을
+// 고르게 뽑는다. 남은 샘플이 3개 미만이면 구간 중앙 1장만 쓴다.
 function pickMedianIndices(startIdx, endIdx) {
+  const n = endIdx - startIdx + 1;
+  const trim = Math.max(1, Math.floor(n * 0.1));
+  const lo = startIdx + trim, hi = endIdx - trim;
   const usable = [];
-  for (let i = startIdx + 1; i <= endIdx - 1; i++) usable.push(i);
+  for (let i = lo; i <= hi; i++) usable.push(i);
   if (usable.length < 3) return [Math.round((startIdx + endIdx) / 2)];
-  const n = usable.length >= 5 ? 5 : 3;
+  const cnt = usable.length >= 7 ? 7 : (usable.length >= 5 ? 5 : 3);
   const out = [];
-  for (let i = 0; i < n; i++) out.push(usable[Math.round(i * (usable.length - 1) / (n - 1))]);
+  for (let i = 0; i < cnt; i++) out.push(usable[Math.round(i * (usable.length - 1) / (cnt - 1))]);
   return out;
 }
 
@@ -2976,35 +3101,34 @@ async function buildCutFrames(tiles, scrollDefaults) {
 }
 
 // ---- 대표 프레임 추출 + 이어붙이기 (메인 파이프라인과 구간 재스캔이 공유) ----
-// 반환: { mode:'cut'|'smooth', direction, directionNcc, rawFrames, frameLen, segments, notes }
-async function extractAndStitch({ video, roi, times, bursts, scrollDefaults, direction, log }) {
-  log = log || (() => {});
-  const cls = await classifyCutBursts(video, roi, times, bursts, scrollDefaults, direction);
-  if (cls.isCut) {
-    log('컷 전환(타일링) 영상으로 판별 — 정지 구간별로 대표 프레임을 추출합니다...');
-    const defs = buildCutTileDefs(times, bursts);
-    const tiles = [];
-    for (let k = 0; k < defs.length; k++) {
-      // 정지 구간 안 서로 다른 시각 3~5장의 픽셀별 중앙값 — 움직이는 재생 표시(색·모양 무관)가 사라진다
-      const idxs = pickMedianIndices(defs[k].startIdx, defs[k].endIdx);
-      const caps = [];
-      for (const ix of idxs) caps.push(await captureRepCanvas(video, roi, times[ix]));
-      const c = caps.length > 1 ? medianOfCanvases(caps) : caps[0];
-      tiles.push({ canvas: c, t: defs[k].time, t0: defs[k].t0, t1: defs[k].t1 });
-      log('타일 추출 중... ' + (k + 1) + '/' + defs.length);
-    }
-    const built = await buildCutFrames(tiles, scrollDefaults);
-    if (built && built.frames.length) {
-      return {
-        mode: 'cut', direction: 'horizontal', directionNcc: null, rawFrames: built.frames,
-        frameLen: tiles[0].canvas.width,
-        segments: defs.map((d, i) => ({ tA: d.tA, tB: d.tB, frameIdx: i })),
-        notes: built.notes,
-      };
-    }
-    log('컷 전환 처리에 필요한 오선을 찾지 못해 일반(NCC) 이어붙이기로 대체합니다.');
-  }
+// 반환: { mode:'cut'|'smooth', direction, directionNcc, rawFrames, frameLen, segments, notes, typeInfo }
+// 컷 전용 로직(오선 트리밍·타일링·중앙값 타일)은 extractCutResult 안에만 있고, 부드러운 스크롤 경로
+// (extractSmoothResult)는 그것을 전혀 거치지 않는다.
 
+async function extractCutResult({ video, roi, times, bursts, scrollDefaults, log }) {
+  log('컷 전환(타일링) 처리 — 정지 구간별로 대표 프레임을 추출합니다...');
+  const defs = buildCutTileDefs(times, bursts);
+  const tiles = [];
+  for (let k = 0; k < defs.length; k++) {
+    // 정지 구간 안 서로 다른 시각 3~7장의 픽셀별 중앙값 — 움직이는 재생 표시(색·모양 무관)가 사라진다
+    const idxs = pickMedianIndices(defs[k].startIdx, defs[k].endIdx);
+    const caps = [];
+    for (const ix of idxs) caps.push(await captureRepCanvas(video, roi, times[ix]));
+    const c = caps.length > 1 ? medianOfCanvases(caps) : caps[0];
+    tiles.push({ canvas: c, t: defs[k].time, t0: defs[k].t0, t1: defs[k].t1 });
+    log('타일 추출 중... ' + (k + 1) + '/' + defs.length);
+  }
+  const built = await buildCutFrames(tiles, scrollDefaults);
+  if (!built || !built.frames.length) return null;
+  return {
+    mode: 'cut', direction: 'horizontal', directionNcc: null, rawFrames: built.frames,
+    frameLen: tiles[0].canvas.width,
+    segments: defs.map((d, i) => ({ tA: d.tA, tB: d.tB, frameIdx: i })),
+    notes: built.notes,
+  };
+}
+
+async function extractSmoothResult({ video, roi, times, bursts, scrollDefaults, direction, log }) {
   const repIdx = scrollRepIndices(times, bursts);
   log('대표 프레임 ' + repIdx.length + '장 추출 중...');
   const repFrames = [];
@@ -3052,6 +3176,92 @@ async function extractAndStitch({ video, roi, times, bursts, scrollDefaults, dir
     mode: 'smooth', direction: stage3.direction, directionNcc: stage3.directionNcc, rawFrames: stage3.frames,
     frameLen, segments: smoothMarkerSegments(repIdx, times, bursts), notes: {},
   };
+}
+
+// 두 결과 중 더 나은 쪽을 고르기 위한 점수 — 이음매 검증 통과율(0.4) + 이음매 양쪽 내용 중복 없음(0.3) +
+// 마디 폭 균일성(0.3)
+function scoreStitchResult(rawFrames, direction, viewLen) {
+  const lay = renderFrames(rawFrames, direction);
+  const det = detectStaffAndBars(lay.canvas, 0.6, null, viewLen, direction === 'vertical' ? null : lay.placed);
+  if (!det.staffFound) return { score: 0, passRate: 0, dupFrac: 1, widthOk: 0 };
+  const checks = validateCutSeams(lay.seams, det.bars, det, det.quality.low);
+  let tot = 0, pass = 0, dupN = 0;
+  lay.seams.forEach((sm, i) => {
+    if (sm.dup) return;
+    tot++;
+    const flagged = sm.cut ? checks[i].flagged : (sm.score != null && sm.score < 0.7);
+    if (!flagged) pass++;
+    if (det.system && hasDuplicateTrace(det.gray, det.system, sm.pos)) dupN++;
+  });
+  const passRate = tot ? pass / tot : 1;
+  const dupFrac = tot ? dupN / tot : 0;
+  const widthOk = det.quality.measureCount >= 1 ? det.quality.widthOk : 0;
+  return { score: 0.4 * passRate + 0.3 * (1 - dupFrac) + 0.3 * widthOk, passRate, dupFrac, widthOk };
+}
+
+// transition: 'auto' | 'smooth' | 'cut'
+async function extractAndStitch({ video, roi, times, bursts, scrollDefaults, direction, transition, log }) {
+  log = log || (() => {});
+  transition = transition || 'auto';
+  const ctx = { video, roi, times, bursts, scrollDefaults, direction, log };
+  const withInfo = (r, info) => ({ ...r, typeInfo: { requested: transition, ...info } });
+  const smoothFallback = async reason => withInfo(await extractSmoothResult(ctx), { decided: 'smooth', reason });
+
+  if (transition === 'smooth') return smoothFallback('사용자 지정: 부드러운 스크롤(NCC 겹침)');
+  if (transition === 'cut') {
+    if (direction !== 'vertical') {
+      const r = await extractCutResult(ctx);
+      if (r) return withInfo(r, { decided: 'cut', reason: '사용자 지정: 컷 전환(타일링)' });
+    }
+    return smoothFallback('사용자 지정 컷 전환을 적용할 수 없어(세로 스크롤이거나 오선 미검출) 부드러운 스크롤(NCC)로 대체');
+  }
+
+  const cls = await classifyCutBursts(video, roi, times, bursts, scrollDefaults, direction);
+  const pct = Math.round(cls.ratio * 100);
+  const stat = '컷 burst ' + cls.cutCount + '/' + bursts.length + '개(' + pct + '%)' + (cls.multi ? ', 다중 샘플 burst ' + cls.multi + '개' : '');
+  if (cls.kind === 'smooth') {
+    return smoothFallback('자동: ' + stat + ' — ' + (cls.cutCount === 0 ? '화면 끝 겹침이 확인되어' : '컷 비율이 낮아') + ' 부드러운 스크롤(NCC)로 판정');
+  }
+  if (cls.kind === 'cut') {
+    const r = await extractCutResult(ctx);
+    if (r) return withInfo(r, { decided: 'cut', reason: '자동: ' + stat + ' — 겹침 없음이 확인되어 컷 전환(타일링)으로 판정' });
+    return smoothFallback('자동: 컷으로 판정됐으나 오선을 찾지 못해 부드러운 스크롤(NCC)로 대체');
+  }
+  // 애매함 — 둘 다 만들어 이음매 검증 통과율·내용 중복·마디 폭 균일성으로 점수를 매겨 더 좋은 쪽을 선택
+  log('유형이 애매해 컷/NCC 결과를 모두 만들어 비교합니다...');
+  const cutR = await extractCutResult(ctx);
+  const smR = await extractSmoothResult(ctx);
+  if (!cutR) return withInfo(smR, { decided: 'smooth', reason: '자동(애매): 컷 결과를 만들 수 없어(오선 미검출) NCC 선택' });
+  const sc = scoreStitchResult(cutR.rawFrames, 'horizontal', cutR.frameLen);
+  const ss = scoreStitchResult(smR.rawFrames, smR.direction, smR.frameLen);
+  const pickCut = sc.score > ss.score;
+  const fmt = x => '점수 ' + x.score.toFixed(2) + ' (이음매 통과 ' + Math.round(x.passRate * 100) + '%, 내용 중복 ' + Math.round(x.dupFrac * 100) + '%, 마디 폭 균일 ' + Math.round(x.widthOk * 100) + '%)';
+  return withInfo(pickCut ? cutR : smR, {
+    decided: pickCut ? 'cut' : 'smooth',
+    reason: '자동(애매): ' + stat + ' → 둘 다 생성해 비교 — 컷 ' + fmt(sc) + ' vs NCC ' + fmt(ss) + ' → ' + (pickCut ? '컷 전환' : '부드러운 스크롤(NCC)') + ' 선택',
+    scores: { cut: sc, smooth: ss },
+  });
+}
+
+// 추출 + 재생 표시 추적까지의 전체 파이프라인 (최초 실행과 "이 유형으로 다시 만들기"가 공유)
+async function buildScrollResult({ video, roi, times, bursts, scrollDefaults, direction, transition, log }) {
+  log = log || (() => {});
+  const ex = await extractAndStitch({ video, roi, times, bursts, scrollDefaults, direction, transition, log });
+  const lay = renderFrames(ex.rawFrames, ex.direction);
+  // 마디별 정밀 시간 동기화 — 실패해도(표시 없음/신뢰도 부족) 결과 화면이 조각 모델 폴백을 쓴다.
+  log('재생 위치 표시 추적 중 (있는 경우 마디별 시간을 더 정밀하게 맞춥니다)...');
+  let markerData = null;
+  try {
+    let cnt = 0;
+    const { rawPoints } = await detectPlaybackMarker({
+      video, roi, direction: ex.direction, segments: ex.segments, frames: lay.placed, frameLen: ex.frameLen,
+      onProgress: () => { cnt++; if (cnt % 5 === 0) log('재생 위치 표시 추적 중... (' + cnt + '개 샘플)'); },
+    });
+    markerData = { rawPoints, ...validateMarkerTrack(markerPointsToGlobal(rawPoints, lay.placed)) };
+  } catch (err) {
+    markerData = null;
+  }
+  return { ex, markerData };
 }
 
 // ---- 그룹 수동 오버라이드용 "구간 재스캔(미니 스티칭)" — 위 파이프라인(diff 샘플링 → burst 탐지 →
@@ -3273,6 +3483,7 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
   const [rangeEnd, setRangeEnd] = useState(0);
   const [roi, setRoi] = useState(null);
   const [direction, setDirection] = useState('auto');
+  const [transition, setTransition] = useState('auto'); // 영상 유형: auto | smooth | cut
   const [stepSec, setStepSec] = useState(0.2);
   const [analysis, setAnalysis] = useState(null); // {times, diffs}
   const [threshold, setThreshold] = useState(10);
@@ -3466,29 +3677,11 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
     try {
       const { times } = analysis;
       const video = videoRef.current;
-      const ex = await extractAndStitch({ video, roi, times, bursts, scrollDefaults, direction, log });
-      const flaggedBursts = flagOutlierBursts(bursts, times);
-      const lay = renderFrames(ex.rawFrames, ex.direction);
-
-      // 마디별 정밀 시간 동기화 — 안정 구간마다 촘촘히 재생 위치 표시를 추적해본다. 실패해도
-      // (표시가 없거나 신뢰도 부족) markerData.confident=false로 남을 뿐, 결과 화면은 자동으로 조각
-      // 모델 기반 폴백(컷: 타일 내 선형, 부드러운 스크롤: burst별 평균 속도)을 쓴다.
-      log('재생 위치 표시 추적 중 (있는 경우 마디별 시간을 더 정밀하게 맞춥니다)...');
-      let markerData = null;
-      try {
-        let markerProgressCount = 0;
-        const { rawPoints } = await detectPlaybackMarker({
-          video, roi, direction: ex.direction, segments: ex.segments, frames: lay.placed, frameLen: ex.frameLen,
-          onProgress: () => { markerProgressCount++; if (markerProgressCount % 5 === 0) log('재생 위치 표시 추적 중... (' + markerProgressCount + '개 샘플)'); },
-        });
-        markerData = { rawPoints, ...validateMarkerTrack(markerPointsToGlobal(rawPoints, lay.placed)) };
-      } catch (err) {
-        markerData = null;
-      }
-
+      const { ex, markerData } = await buildScrollResult({ video, roi, times, bursts, scrollDefaults, direction, transition, log });
       onDone({
         videoFile, roi, direction: ex.direction, directionNcc: ex.directionNcc, mode: ex.mode,
-        rawFrames: ex.rawFrames, frameLen: ex.frameLen, bursts: flaggedBursts, markerData, notes: ex.notes,
+        rawFrames: ex.rawFrames, frameLen: ex.frameLen, bursts: flagOutlierBursts(bursts, times), markerData, notes: ex.notes,
+        typeInfo: ex.typeInfo, times, rawBursts: bursts, directionPref: direction, transition,
       });
     } catch (err) {
       log('처리 중 오류: ' + err.message);
@@ -3508,6 +3701,13 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
         </p>
         <div className="controls">
           <label>영상 파일: <input type="file" accept="video/*" onChange={handleFileChange} /></label>
+          <label>영상 유형:
+            <select value={transition} onChange={e => setTransition(e.target.value)} style={{ width: 'auto', marginLeft: '6px' }}>
+              <option value="auto">자동 (겹침 유무로 판별)</option>
+              <option value="smooth">부드러운 스크롤 (NCC 겹침)</option>
+              <option value="cut">컷 전환 (타일링)</option>
+            </select>
+          </label>
           <label>스크롤 방향:
             <select value={direction} onChange={e => setDirection(e.target.value)} style={{ width: 'auto', marginLeft: '6px' }}>
               <option value="auto">자동 감지 (첫 이음매로 판단)</option>
@@ -4044,11 +4244,19 @@ function SeamZoom({ canvas, pos, space }) {
 }
 
 function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onModeBack }) {
-  const { videoFile, roi, direction, directionNcc, mode, frameLen, bursts, notes } = scrollCapture;
+  const { videoFile, roi, bursts } = scrollCapture;
+  // 영상 유형 재선택("이 유형으로 다시 만들기")으로 통째로 바뀔 수 있는 값들은 built 상태에 둔다
+  const [built, setBuilt] = useState({
+    direction: scrollCapture.direction, directionNcc: scrollCapture.directionNcc, mode: scrollCapture.mode,
+    frameLen: scrollCapture.frameLen, notes: scrollCapture.notes, typeInfo: scrollCapture.typeInfo, markerRaw: scrollCapture.markerData,
+  });
+  const { direction, directionNcc, mode, frameLen, notes, typeInfo, markerRaw } = built;
+  const [typeChoice, setTypeChoice] = useState(scrollCapture.transition || 'auto');
+  const [rebuilding, setRebuilding] = useState(false);
+  const [rebuildMsg, setRebuildMsg] = useState('');
   // 단일 진실 = 조각(frame) 목록. 이음새 미세 조정·구간 재스캔 패치는 이 목록만 편집하고, 스티치 이미지·
   // 이음새 위치·마커 좌표·시간 매핑은 모두 여기서 다시 파생된다.
   const [rawFrames, setRawFrames] = useState(scrollCapture.rawFrames);
-  const markerRaw = scrollCapture.markerData;
   const layout = useMemo(() => renderFrames(rawFrames, direction), [rawFrames, direction]);
   const stitchedCanvas = layout.canvas;
   const placed = layout.placed;
@@ -4062,7 +4270,7 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
   // "몇 마디씩 묶기(목표)"의 기본값 — 사용자가 아직 직접 입력하지 않았다면(null) 이미 감지된 총
   // 마디 수를 그대로 따라가며 채워둔다. 한 번이라도 직접 타이핑하면 그 값을 그대로 쓴다.
   const [groupSizeUser, setGroupSizeUser] = useState(null);
-  const [maxBarsPerGroup, setMaxBarsPerGroup] = useState(8);
+  const [maxBarsUser, setMaxBarsUser] = useState(null);
   const [overrides, setOverrides] = useState({}); // key -> dataUrl (로컬 이미지 업로드로 대체한 그룹)
   const [overrideOpenKey, setOverrideOpenKey] = useState(null);
   const [sending, setSending] = useState(false);
@@ -4088,14 +4296,18 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
   }, [staffThreshInput, barThreshInput]);
 
   const detection = useMemo(
-    () => detectStaffAndBars(stitchedCanvas, staffThresh, barAuto ? null : barThresh, frameLen),
-    [stitchedCanvas, staffThresh, barThresh, barAuto, frameLen]
+    () => detectStaffAndBars(stitchedCanvas, staffThresh, barAuto ? null : barThresh, frameLen, direction === 'vertical' ? null : placed),
+    [stitchedCanvas, staffThresh, barThresh, barAuto, frameLen, placed, direction]
   );
   const bars = detection.bars;
   const staffFound = detection.staffFound;
   const quality = detection.quality;
   const measureCount = Math.max(0, bars.length - 1);
-  const groupSize = groupSizeUser != null ? groupSizeUser : Math.max(1, measureCount || 4);
+  // 묶기 기본값: 목표 = round(화면 1장 폭 ÷ 중앙값 마디 폭)을 2~6으로 제한, 최대 = 목표+2. 사용자가 입력하기
+  // 전까지만 자동이고, 목표 > 최대면 최대를 목표로 올린다.
+  const autoGroupSize = quality.medianWidth ? Math.max(2, Math.min(6, Math.round(frameLen / quality.medianWidth))) : 4;
+  const groupSize = groupSizeUser != null ? groupSizeUser : autoGroupSize;
+  const maxBarsPerGroup = Math.max(maxBarsUser != null ? maxBarsUser : groupSize + 2, groupSize);
   const measureW = useMemo(() => robustMeasureWidth(bars), [bars]);
   const blank = useMemo(
     () => (detection.system ? computeBlankColumns(detection.gray, detection.system, 140) : new Uint8Array(stitchedCanvas.width)),
@@ -4212,6 +4424,30 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
     if (zoomBlockRef.current) zoomBlockRef.current.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 
+  async function rebuildWithType(type) {
+    const video = videoRef.current;
+    if (!video) return;
+    setRebuilding(true);
+    setRebuildMsg('다시 만드는 중...');
+    try {
+      const r = await buildScrollResult({
+        video, roi, times: scrollCapture.times, bursts: scrollCapture.rawBursts, scrollDefaults,
+        direction: scrollCapture.directionPref, transition: type, log: setRebuildMsg,
+      });
+      setRawFrames(r.ex.rawFrames);
+      setBuilt({
+        direction: r.ex.direction, directionNcc: r.ex.directionNcc, mode: r.ex.mode, frameLen: r.ex.frameLen,
+        notes: r.ex.notes, typeInfo: r.ex.typeInfo, markerRaw: r.markerData,
+      });
+      setOverrides({}); setOverrideOpenKey(null); setSeamSel(null); setWholeImageFallback(null);
+      setRebuildMsg('');
+    } catch (err) {
+      setRebuildMsg('다시 만들기 오류: ' + err.message);
+    } finally {
+      setRebuilding(false);
+    }
+  }
+
   function nudgeSeam(d) {
     if (!curSeam) return;
     setRawFrames(prev => adjustCutSeam(prev, curSeam.i, d, seamAdjAll));
@@ -4270,6 +4506,18 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
             ? <span className="badge badge-precise">정밀 동기화됨 (재생 표시 감지 · 추적점 {markerData.count}개)</span>
             : <span className="badge badge-estimate">추정값 (재생 표시 없음 — {mode === 'cut' ? '타일 내 선형 보간' : '구간별 보간'}){markerData ? ' · 추적점 ' + markerData.count + '개(부족)' : ''}</span>}
         </p>
+        <div className="toolbar">
+          <label>영상 유형:
+            <select value={typeChoice} onChange={e => setTypeChoice(e.target.value)} disabled={rebuilding} style={{ width: 'auto', marginLeft: '6px' }}>
+              <option value="auto">자동</option>
+              <option value="smooth">부드러운 스크롤</option>
+              <option value="cut">컷 전환</option>
+            </select>
+          </label>
+          <button className="icon-btn" onClick={() => rebuildWithType(typeChoice)} disabled={rebuilding}>{rebuilding ? '다시 만드는 중...' : '이 유형으로 다시 만들기'}</button>
+          {rebuildMsg && <span className="save-msg">{rebuildMsg}</span>}
+        </div>
+        {typeInfo && <p className="hint-text" style={{ margin: '4px 0' }}>선택된 유형: <b>{typeInfo.decided === 'cut' ? '컷 전환(타일링)' : '부드러운 스크롤(NCC)'}</b> — {typeInfo.reason}</p>}
         {notes && notes.roiNarrow && (
           <p className="hint-text" style={{ color: '#c0392b' }}>
             ⚠ 오선이 영역(ROI) 양쪽 끝까지 닿아 있습니다. 지정한 영역이 뷰어의 악보 영역보다 좁아 이음새에서 내용이 빠질 수 있으니, 영역을 더 넓게 지정해서 다시 시도하세요.
@@ -4305,7 +4553,7 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
             ? detection.system.connScores.map(c => c.toFixed(2)).join(', ')
             : (detection.system.splitScores.length ? ('연결 획 없음 → 분리됨 (' + detection.system.splitScores.map(c => c.toFixed(2)).join(', ') + ')') : '단일 보표')))}
           {staffFound && detection.stats && (
-            <span><br />마디선 검출: 후보 {detection.stats.cand} → 단별 통과 {detection.stats.allStaff} → 헤더제외 후 {detection.stats.afterHeader} → 정리 후 {detection.stats.afterPrune} (사용 T={detection.threshUsed.toFixed(2)}{detection.auto ? ' 자동' : ' 수동'})</span>
+            <span><br />마디선 검출: 후보 {detection.stats.cand} → 단별 통과 {detection.stats.allStaff} → 헤더제외 후 {detection.stats.afterHeader} → 정리 후 {detection.stats.afterPrune} (삐져나옴으로 제외 {detection.stats.protruded}개 / 지속성으로 제외 {detection.stats.notPersistent}개 / 양 끝 불일치 {detection.stats.endMismatch}개) (사용 T={detection.threshUsed.toFixed(2)}{detection.auto ? ' 자동' : ' 수동'})</span>
           )}
           {staffFound && quality.weak && <b style={{ color: '#c0392b' }}> · 마디선 인식 약함 — 폭 기준 그룹화로 자동 전환</b>}
           {staffFound && quality.low && !quality.weak && (
@@ -4382,7 +4630,8 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
           <label>몇 마디씩 묶기(목표): <input type="number" min="1" max="16" value={groupSize} disabled={effectiveFallback}
             onChange={e => setGroupSizeUser(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
           <label>그룹당 최대 마디수: <input type="number" min="1" max="20" value={maxBarsPerGroup} disabled={effectiveFallback}
-            onChange={e => setMaxBarsPerGroup(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
+            onChange={e => setMaxBarsUser(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
+          <span className="hint-text" style={{ margin: 0 }}>자동 기준: 화면 1장 분량{groupSizeUser == null ? ' (목표 ' + autoGroupSize + '마디, 최대 ' + (autoGroupSize + 2) + ')' : ''}</span>
           <label>그룹 기준:
             <select value={groupBasis} onChange={e => setGroupBasis(e.target.value)} disabled={effectiveFallback} style={{ width: 'auto', marginLeft: '6px' }}>
               <option value="auto">자동 (신뢰도 낮으면 폭 기준)</option>
