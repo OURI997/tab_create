@@ -2231,19 +2231,25 @@ function medianOf(arr) {
   return s[Math.floor(s.length / 2)];
 }
 
-// 두 보표 사이(위 보표 마지막 줄 yFrom ~ 아래 보표 첫 줄 yTo)를 1~2px 끊김까지만 허용하며 세로로 완전히
-// 가로지르는 연속 획(마디선/시스템 시작선)이 한 열이라도 있는지 — 있으면 같은 시스템(큰 보표)이다.
-function hasConnectingStroke(g, yFrom, yTo, darkThresh) {
-  if (yTo <= yFrom) return false;
+// 두 보표 사이(위 보표 마지막 줄 yFrom ~ 아래 보표 첫 줄 yTo)를 세로로 잇는 연속 획의 최대 열 커버리지(0~1).
+// 실제 영상은 마디선이 흐리거나 끊기므로 완화된 기준(어두움 임계 180, 3px 끊김 허용)으로 센다.
+function staffConnectionScore(g, yFrom, yTo) {
+  const len = yTo - yFrom + 1;
+  if (len <= 0) return 0;
+  let best = 0;
   for (let x = 0; x < g.w; x++) {
-    let gap = 0, ok = true;
+    let runStart = -1, lastDark = -1, colBest = 0;
     for (let y = yFrom; y <= yTo; y++) {
-      if (g.gray[y * g.w + x] < darkThresh) gap = 0;
-      else if (++gap > 2) { ok = false; break; }
+      if (g.gray[y * g.w + x] < 180) {
+        if (runStart < 0 || y - lastDark > 4) runStart = y;
+        lastDark = y;
+        if (lastDark - runStart + 1 > colBest) colBest = lastDark - runStart + 1;
+      }
     }
-    if (ok) return true;
+    if (colBest > best) best = colBest;
+    if (best >= len) break;
   }
-  return false;
+  return Math.min(1, best / len);
 }
 
 // lineFrac: 한 행에서 어두운 픽셀 비율이 이 이상이면 오선 후보 행(완화된 값 권장). 일부 줄이 연해서
@@ -2296,18 +2302,25 @@ function detectStaffSystem(g, lineFrac, darkThresh) {
   if (!valid.length) return null;
 
   const systems = [];
+  const splitScores = [];
   let sys = null;
   for (const st of valid) {
     const firstY = st[0].y, lastY = st[st.length - 1].y;
     if (sys) {
       const gapToPrev = firstY - sys.lastLineY;
-      // 간격 배수는 최대 15배까지만 완화해 두고, 실제 병합 근거는 두 보표를 잇는 연속 획의 존재
-      if (gapToPrev >= space * 1.5 && gapToPrev <= space * 15 && hasConnectingStroke(g, sys.bottom, st[0].y0, darkThresh)) {
-        sys.staves.push(st); sys.bottom = st[st.length - 1].y1; sys.lastLineY = lastY;
-        continue;
+      if (gapToPrev >= space * 1.5 && gapToPrev <= space * 15) {
+        // 위아래로 인접한 보표(간격 ≤15배)는 기본적으로 한 시스템. 연결 획이 전혀 없을 때(점수 < 0.3)만
+        // 별개 시스템(ROI에 서로 다른 줄이 들어온 경우)으로 분리한다.
+        const conn = staffConnectionScore(g, sys.bottom, st[0].y0);
+        if (conn >= 0.3) {
+          sys.staves.push(st); sys.bottom = st[st.length - 1].y1; sys.lastLineY = lastY;
+          sys.connScores.push(conn);
+          continue;
+        }
+        splitScores.push(conn);
       }
     }
-    sys = { staves: [st], top: st[0].y0, bottom: st[st.length - 1].y1, lastLineY: lastY };
+    sys = { staves: [st], top: st[0].y0, bottom: st[st.length - 1].y1, lastLineY: lastY, connScores: [] };
     systems.push(sys);
   }
   for (const s of systems) {
@@ -2324,7 +2337,7 @@ function detectStaffSystem(g, lineFrac, darkThresh) {
   for (const sy of systems) for (const l of sy.lines) {
     for (let y = Math.max(0, l.y0 - pad); y <= Math.min(g.h - 1, l.y1 + pad); y++) mask[y] = 1;
   }
-  return { systems, main, space, mask };
+  return { systems, main, space, mask, connScores: main.connScores, splitScores };
 }
 
 function staffLeftEdge(g, sys) {
@@ -2360,6 +2373,41 @@ function computeBarCoverage(g, top, bottom, darkThresh) {
   return cover;
 }
 
+// 병합된 시스템의 마디선 후보 연속도 — 모든 보표에서 같은 x(±1px)에 직선이 있어야 하므로 보표별 연속도의
+// 최솟값을 쓴다(한 보표에만 있는 줄기·물결선 제외). 보표 사이의 흐린/끊긴 연결 구간은 요구하지 않는다.
+function computeSystemCover(g, sys, darkThresh) {
+  const per = sys.staves.map(st => computeBarCoverage(g, st[0].y0, st[st.length - 1].y1, darkThresh));
+  const cover = new Float32Array(g.w);
+  for (let x = 0; x < g.w; x++) {
+    let m = 1;
+    for (const c of per) {
+      const v = Math.max(c[x], x > 0 ? c[x - 1] : 0, x + 1 < g.w ? c[x + 1] : 0);
+      if (v < m) m = v;
+    }
+    cover[x] = m;
+  }
+  return cover;
+}
+
+// 인접 후보 간격이 마디 폭 중앙값의 0.35배 미만이면 연속도 점수가 더 높은 하나만 남긴다.
+function pruneCloseBars(bars, cover) {
+  let cur = bars.slice();
+  for (let iter = 0; iter < 50 && cur.length >= 3; iter++) {
+    const gaps = [];
+    for (let i = 1; i < cur.length; i++) gaps.push(cur[i] - cur[i - 1]);
+    const med = medianOf(gaps);
+    let worst = -1, worstGap = Infinity;
+    for (let i = 0; i < gaps.length; i++) if (gaps[i] < med * 0.35 && gaps[i] < worstGap) { worst = i; worstGap = gaps[i]; }
+    if (worst < 0) break;
+    const a = cur[worst], b = cur[worst + 1];
+    cur.splice(cover[b] > cover[a] ? worst : worst + 1, 1);
+  }
+  return cur;
+}
+function detectBarsAt(cover, space, thr) {
+  return pruneCloseBars(barsFromCoverage(cover, space, thr), cover);
+}
+
 // 마디선 후보 조건: (a) 연속도 >= thr, (b) 폭 <= staff space*0.6, (c) 좌우 staff space*0.5~1.5 거리에
 // 굵은 연속 획(화음 덩어리 등)이 없음. 겹마디선·종지선은 staff space*2 이내 후보를 한 경계로 병합.
 function barsFromCoverage(cover, space, thr) {
@@ -2392,7 +2440,7 @@ function barsFromCoverage(cover, space, thr) {
 function autoBarThreshold(cover, space) {
   const thrAt = i => Math.min(1, Math.round((0.80 + i * 0.01) * 100) / 100);
   const counts = [];
-  for (let i = 0; i <= 20; i++) counts.push(barsFromCoverage(cover, space, thrAt(i)).length);
+  for (let i = 0; i <= 20; i++) counts.push(detectBarsAt(cover, space, thrAt(i)).length);
   let best = null, i = 0;
   while (i < counts.length) {
     let j = i;
@@ -2431,19 +2479,22 @@ function detectStaffAndBars(canvas, staffThresh, barThresh, viewLen) {
       quality: { low: true, widthOk: 0, perView: 0, measureCount: 0, medianWidth: null },
     };
   }
-  const cover = computeBarCoverage(g, sys.main.top, sys.main.bottom, darkThresh);
+  const cover = computeSystemCover(g, sys.main, darkThresh);
+  // 헤더(음자리표·조표·박자표) 구간 제외: 오선 시작 x로부터 오선 간격×20 이내는 마디선 후보에서 뺀다
+  const left = staffLeftEdge(g, sys);
+  const headerEnd = Math.min(g.w, Math.round(left + sys.space * 20));
+  for (let x = 0; x < headerEnd; x++) cover[x] = 0;
   const auto = barThresh == null;
   const thr = auto ? autoBarThreshold(cover, sys.space) : barThresh;
-  let bars = barsFromCoverage(cover, sys.space, thr);
-  // 맨 왼쪽 시스템 시작선은 마디 경계가 아니다 — 오선이 시작되는 x로 대체(마디 수에는 영향 없음)
-  const left = staffLeftEdge(g, sys);
-  if (bars.length && bars[0] <= left + sys.space * 1.5) bars = [left, ...bars.slice(1)];
+  let bars = detectBarsAt(cover, sys.space, thr);
+  // 시스템 시작(오선 시작 x)을 첫 경계로 둔다 — 첫 마디는 음자리표·조표·박자표 헤더를 포함한다
+  bars = [left, ...bars];
   if (bars.length && (canvas.width - bars[bars.length - 1]) > canvas.width * 0.02) {
     bars = [...bars, canvas.width - 1];
   }
   return {
     staffLines: sys.main.lines.map(l => l.y), bars, staffFound: true, system: sys, gray: g,
-    threshUsed: thr, auto, quality: assessBarQuality(bars, canvas.width, viewLen),
+    threshUsed: thr, auto, quality: assessBarQuality(bars, canvas.width, viewLen), cover,
   };
 }
 
@@ -4076,8 +4127,14 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
     const ctx = cv.getContext('2d');
     ctx.drawImage(stitchedCanvas, 0, 0, cv.width, cv.height);
     if (detection.system) {
-      ctx.strokeStyle = 'rgba(0,90,255,0.9)'; ctx.lineWidth = 1;
-      ctx.strokeRect(0.5, detection.system.main.top * scale, cv.width - 1, Math.max(1, (detection.system.main.bottom - detection.system.main.top) * scale));
+      ctx.lineWidth = 1;
+      for (const sy of detection.system.systems) {
+        ctx.strokeStyle = sy === detection.system.main ? 'rgba(0,90,255,0.9)' : 'rgba(150,150,150,0.9)';
+        for (const st of sy.staves) {
+          const y0 = st[0].y0 * scale, y1 = st[st.length - 1].y1 * scale;
+          ctx.strokeRect(0.5, y0, cv.width - 1, Math.max(1, y1 - y0));
+        }
+      }
     }
     ctx.strokeStyle = 'rgba(230,30,30,0.9)';
     for (const b of bars) { ctx.beginPath(); ctx.moveTo(b * scale + 0.5, 0); ctx.lineTo(b * scale + 0.5, cv.height); ctx.stroke(); }
@@ -4197,7 +4254,10 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
           <label><input type="checkbox" checked={barAuto} onChange={e => setBarAuto(e.target.checked)} /> 자동 보정</label>
         </div>
         <p className="hint-text" style={{ margin: '4px 0' }}>
-          {staffFound ? ('보표 구조 인식됨 · 마디선 ' + bars.length + '개 (마디 ' + measureCount + '개) 검출됨') : '보표(오선)를 찾지 못했습니다.'}
+          {staffFound ? ('보표 구조 인식됨 · 보표 ' + detection.system.main.staves.length + '개 · 마디선 ' + bars.length + '개 (마디 ' + measureCount + '개) 검출됨') : '보표(오선)를 찾지 못했습니다.'}
+          {staffFound && (' · 보표 간 연결 점수: ' + (detection.system.connScores.length
+            ? detection.system.connScores.map(c => c.toFixed(2)).join(', ')
+            : (detection.system.splitScores.length ? ('연결 획 없음 → 분리됨 (' + detection.system.splitScores.map(c => c.toFixed(2)).join(', ') + ')') : '단일 보표')))}
           {staffFound && quality.low && (
             <b style={{ color: '#c0392b' }}> · 마디 인식 신뢰도 낮음
               ({quality.measureCount < 1 ? '마디선 없음' : ('폭 정상 비율 ' + Math.round(quality.widthOk * 100) + '%' + (quality.perView != null ? ', ROI 폭당 ' + quality.perView.toFixed(1) + '마디' : ''))})
@@ -4209,13 +4269,19 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
           <label><input type="checkbox" checked={effectiveFallback} onChange={e => setWholeImageFallback(e.target.checked)} />
             마디선 없이 스티칭 결과 전체를 그대로 하나의 이미지로 사용</label>
           <label><input type="checkbox" checked={showOverlay} onChange={e => setShowOverlay(e.target.checked)} /> 디버그 오버레이 표시</label>
+          <button className="icon-btn" onClick={() => stitchedCanvas.toBlob(blob => {
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob); a.download = 'stitched-original.png';
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+          }, 'image/png')}>스티치 원본 PNG 다운로드 (디버그)</button>
         </div>
         {showOverlay && (
           <div style={{ overflowX: 'auto', border: '1px solid var(--border-strong)', background: '#fff' }}>
             <canvas ref={overlayRef} />
           </div>
         )}
-        {showOverlay && <p className="hint-text" style={{ margin: '4px 0' }}>파랑 = 사용된 보표 밴드 · 빨강 = 검출된 마디선 · 초록 = 이음새 위치 (화면 표시용, 내보내는 이미지에는 포함되지 않음)</p>}
+        {showOverlay && <p className="hint-text" style={{ margin: '4px 0' }}>파랑 = 사용된 시스템의 각 보표 밴드(회색 = 다른 시스템) · 빨강 = 검출된 마디선 · 초록 = 이음새 위치 (화면 표시용, 내보내는 이미지에는 포함되지 않음)</p>}
 
         <div className="hr" />
         <div className="toolbar">
