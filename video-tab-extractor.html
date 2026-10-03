@@ -2231,6 +2231,21 @@ function medianOf(arr) {
   return s[Math.floor(s.length / 2)];
 }
 
+// 두 보표 사이(위 보표 마지막 줄 yFrom ~ 아래 보표 첫 줄 yTo)를 1~2px 끊김까지만 허용하며 세로로 완전히
+// 가로지르는 연속 획(마디선/시스템 시작선)이 한 열이라도 있는지 — 있으면 같은 시스템(큰 보표)이다.
+function hasConnectingStroke(g, yFrom, yTo, darkThresh) {
+  if (yTo <= yFrom) return false;
+  for (let x = 0; x < g.w; x++) {
+    let gap = 0, ok = true;
+    for (let y = yFrom; y <= yTo; y++) {
+      if (g.gray[y * g.w + x] < darkThresh) gap = 0;
+      else if (++gap > 2) { ok = false; break; }
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
 // lineFrac: 한 행에서 어두운 픽셀 비율이 이 이상이면 오선 후보 행(완화된 값 권장). 일부 줄이 연해서
 // 빠져도 등간격(약 2배 간격이면 빠진 줄 1개로 간주)으로 보충한다.
 function detectStaffSystem(g, lineFrac, darkThresh) {
@@ -2286,7 +2301,8 @@ function detectStaffSystem(g, lineFrac, darkThresh) {
     const firstY = st[0].y, lastY = st[st.length - 1].y;
     if (sys) {
       const gapToPrev = firstY - sys.lastLineY;
-      if (gapToPrev >= space * 1.5 && gapToPrev <= space * 6) {
+      // 간격 배수는 최대 15배까지만 완화해 두고, 실제 병합 근거는 두 보표를 잇는 연속 획의 존재
+      if (gapToPrev >= space * 1.5 && gapToPrev <= space * 15 && hasConnectingStroke(g, sys.bottom, st[0].y0, darkThresh)) {
         sys.staves.push(st); sys.bottom = st[st.length - 1].y1; sys.lastLineY = lastY;
         continue;
       }
@@ -2304,11 +2320,25 @@ function detectStaffSystem(g, lineFrac, darkThresh) {
     if (s.lineCount > main.lineCount || (s.lineCount === main.lineCount && (s.bottom - s.top) > (main.bottom - main.top))) main = s;
   }
   const pad = Math.max(1, Math.round(space * 0.15));
-  const mask = new Uint8Array(g.h);
-  for (const l of main.lines) {
+  const mask = new Uint8Array(g.h); // 모든 시스템의 오선 행 (공백 열 판정에서 오선을 잉크로 보지 않기 위함)
+  for (const sy of systems) for (const l of sy.lines) {
     for (let y = Math.max(0, l.y0 - pad); y <= Math.min(g.h - 1, l.y1 + pad); y++) mask[y] = 1;
   }
   return { systems, main, space, mask };
+}
+
+function staffLeftEdge(g, sys) {
+  const lns = sys.main.lines.filter(l => !l.synth);
+  for (let x = 0; x < g.w; x++) {
+    let c = 0;
+    for (const l of lns) {
+      for (let y = Math.max(0, l.y0 - 1); y <= Math.min(g.h - 1, l.y1 + 1); y++) {
+        if (g.gray[y * g.w + x] < 140) { c++; break; }
+      }
+    }
+    if (c >= lns.length * 0.5) return x;
+  }
+  return 0;
 }
 
 // 열별 "밴드 높이 대비 가장 긴 수직 연속 획 비율" (1~2px 끊김 허용)
@@ -2342,7 +2372,7 @@ function barsFromCoverage(cover, space, thr) {
     }
   }
   if (cur) clusters.push(cur);
-  const maxThin = Math.max(2, space * 0.6);
+  const maxThin = Math.min(3, Math.max(2, space * 0.6)); // 마디선은 1~3px 폭의 꽉 찬 직선
   const thin = [], wide = [];
   for (const c of clusters) ((c.x1 - c.x0 + 1) <= maxThin ? thin : wide).push(c);
   const iso = thin.filter(c => !wide.some(wc => {
@@ -2405,6 +2435,9 @@ function detectStaffAndBars(canvas, staffThresh, barThresh, viewLen) {
   const auto = barThresh == null;
   const thr = auto ? autoBarThreshold(cover, sys.space) : barThresh;
   let bars = barsFromCoverage(cover, sys.space, thr);
+  // 맨 왼쪽 시스템 시작선은 마디 경계가 아니다 — 오선이 시작되는 x로 대체(마디 수에는 영향 없음)
+  const left = staffLeftEdge(g, sys);
+  if (bars.length && bars[0] <= left + sys.space * 1.5) bars = [left, ...bars.slice(1)];
   if (bars.length && (canvas.width - bars[bars.length - 1]) > canvas.width * 0.02) {
     bars = [...bars, canvas.width - 1];
   }
@@ -2424,47 +2457,57 @@ function robustMeasureWidth(bars) {
   return good.length >= 3 ? medianOf(good) : med;
 }
 
-// '세로 공백 열' — 시스템 밴드(위아래 여유 포함)에서 오선 행을 제외하고 잉크가 하나도 없는 열
+// '세로 공백 열' — 스티치 이미지 전체 높이(보표 위아래 고음·저음 음표, 레저선, 아르페지오 물결선, 8va 포함)에서
+// 오선 행만 제외하고 잉크가 하나도 없는 열
 function computeBlankColumns(g, sys, darkThresh) {
-  const y0 = Math.max(0, Math.round(sys.main.top - sys.space * 3));
-  const y1 = Math.min(g.h - 1, Math.round(sys.main.bottom + sys.space * 3));
   const blank = new Uint8Array(g.w);
   for (let x = 0; x < g.w; x++) {
     let ink = false;
-    for (let y = y0; y <= y1; y++) {
-      if (!sys.mask[y] && g.gray[y * g.w + x] < darkThresh) { ink = true; break; }
+    for (let y = 0; y < g.h; y++) {
+      if (!(sys && sys.mask[y]) && g.gray[y * g.w + x] < darkThresh) { ink = true; break; }
     }
     blank[x] = ink ? 0 : 1;
   }
   return blank;
 }
 
-function snapGroupBoundary(target, minX, radius, bars, blank) {
+// target 근처에서 가장 가까운 공백 열 구간의 중앙 (없으면 null)
+function nearestBlankCenter(target, lo, hi, blank) {
+  lo = Math.max(0, Math.ceil(lo)); hi = Math.min(blank.length - 1, Math.floor(hi));
   let best = null, bestD = Infinity;
-  for (const b of bars) {
-    const d = Math.abs(b - target);
-    if (b > minX && d <= radius && d < bestD) { best = b; bestD = d; }
-  }
-  if (best != null) return best;
-  const lo = Math.max(Math.ceil(minX), Math.floor(target - radius));
-  const hi = Math.min(blank.length - 1, Math.ceil(target + radius));
-  let bestC = null, bestCD = Infinity;
   let x = lo;
   while (x <= hi) {
     if (blank[x]) {
       let e = x;
       while (e + 1 <= hi && blank[e + 1]) e++;
-      const c = (x + e) / 2;
-      if (Math.abs(c - target) < bestCD) { bestCD = Math.abs(c - target); bestC = c; }
+      const c = Math.floor((x + e) / 2);
+      if (Math.abs(c - target) < bestD) { bestD = Math.abs(c - target); best = c; }
       x = e + 1;
     } else x++;
   }
-  return bestC != null ? Math.round(bestC) : Math.round(target);
+  return best;
+}
+
+// 경계는 음표·기호를 가르지 않도록 항상 공백 열을 우선한다. 마디선이 목표 근처에 있으면 그 마디선 바로 옆
+// 공백 열(±2 staff space)로, 없으면 목표 근처의 가장 가까운 공백 열로. 공백 열이 전혀 없을 때만 마디선/목표 위치.
+function snapGroupBoundary(target, minX, radius, bars, blank, space) {
+  let bar = null, bestD = Infinity;
+  for (const b of bars) {
+    const d = Math.abs(b - target);
+    if (b > minX && d <= radius && d < bestD) { bar = b; bestD = d; }
+  }
+  if (bar != null) {
+    const near = nearestBlankCenter(bar, bar - space * 2, bar + space * 2, blank);
+    if (near != null && near > minX) return near;
+  }
+  const c = nearestBlankCenter(target, Math.max(minX, target - radius), target + radius, blank);
+  if (c != null) return c;
+  return bar != null ? bar : Math.round(target);
 }
 
 // 목표 폭 = N × 견고하게 추정한 마디 폭(추정 불가 시 ROI 폭). 경계는 목표 폭 근처에서 마디선 우선,
 // 없으면 가장 가까운 세로 공백 열.
-function groupByWidth(totalLen, targetN, maxBars, measureW, viewLen, bars, blank) {
+function groupByWidth(totalLen, targetN, maxBars, measureW, viewLen, bars, blank, space) {
   const n = Math.max(1, targetN);
   let targetW = measureW ? measureW * n : (viewLen || totalLen);
   if (measureW && maxBars) targetW = Math.min(targetW, measureW * Math.max(1, maxBars));
@@ -2475,7 +2518,7 @@ function groupByWidth(totalLen, targetN, maxBars, measureW, viewLen, bars, blank
     const target = x + targetW;
     let end;
     if (target >= totalLen - targetW * 0.35) end = totalLen;
-    else end = snapGroupBoundary(target, x + targetW * 0.3, targetW * 0.5, bars, blank);
+    else end = snapGroupBoundary(target, x + targetW * 0.3, targetW * 0.5, bars, blank, space || 8);
     end = Math.min(totalLen, Math.max(Math.round(end), Math.round(x) + 1));
     out.push({ startIdx: out.length, endIdx: out.length + 1, startX: Math.round(x), endX: end, count: null, byWidth: true });
     x = end;
@@ -2502,14 +2545,17 @@ function hasDuplicateTrace(g, sys, pos) {
 
 // 이음새를 낀 마디 폭이 전체 중앙값의 0.4~2.5배인지, 이음새 양쪽에 같은 내용이 반복되는 흔적이
 // 없는지. 통과 못 한 컷 이음새만 flagged.
-function validateCutSeams(seams, bars, det) {
+function validateCutSeams(seams, bars, det, qualityLow) {
   const widths = [];
   for (let i = 0; i < bars.length - 1; i++) widths.push(bars[i + 1] - bars[i]);
   const med = medianOf(widths);
   return seams.map(s => {
     if (!s.cut || s.dup) return { flagged: false };
     let reason = null;
-    if (med > 0 && bars.length >= 3) {
+    if (qualityLow) {
+      // 마디 인식 품질이 낮으면 마디 폭 판정은 쓰지 않고(과검출로 정상 이음새까지 연쇄 실패하므로) 경계 연속성 점수만 본다
+      if (s.weight >= 4 && s.score != null && s.score < 0.4) reason = '이음새 경계 연속성 낮음';
+    } else if (med > 0 && bars.length >= 3) {
       for (let j = 0; j < bars.length - 1; j++) {
         if (s.pos > bars[j] + 2 && s.pos < bars[j + 1] - 2) {
           const w = bars[j + 1] - bars[j];
@@ -2703,6 +2749,37 @@ function buildCutTileDefs(times, bursts) {
   return defs;
 }
 
+// 정지 구간 [startIdx,endIdx]에서 중앙값용 샘플 인덱스. 전환 직후·직전 1샘플은 제외하고, 남은 샘플이 3개
+// 미만이면 구간 중앙 1장만 쓴다.
+function pickMedianIndices(startIdx, endIdx) {
+  const usable = [];
+  for (let i = startIdx + 1; i <= endIdx - 1; i++) usable.push(i);
+  if (usable.length < 3) return [Math.round((startIdx + endIdx) / 2)];
+  const n = usable.length >= 5 ? 5 : 3;
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(usable[Math.round(i * (usable.length - 1) / (n - 1))]);
+  return out;
+}
+
+// 같은 크기 canvas들의 픽셀별(채널별) 중앙값 canvas. 짝수 개면 위쪽 중앙값.
+function medianOfCanvases(canvases) {
+  const w = canvases[0].width, h = canvases[0].height;
+  const datas = canvases.map(c => c.getContext('2d').getImageData(0, 0, w, h).data);
+  const out = document.createElement('canvas');
+  out.width = w; out.height = h;
+  const octx = out.getContext('2d');
+  const img = octx.createImageData(w, h);
+  const n = datas.length, mid = Math.floor(n / 2);
+  const buf = new Array(n);
+  for (let i = 0; i < img.data.length; i++) {
+    for (let k = 0; k < n; k++) buf[k] = datas[k][i];
+    buf.sort((a, b) => a - b);
+    img.data[i] = buf[mid];
+  }
+  octx.putImageData(img, 0, 0);
+  return out;
+}
+
 // 타일 한 장의 오선 구조 + 오선이 실제로 그려진 x 구간(트리밍 범위)
 function analyzeTileStaff(canvas) {
   const g = scrollGetFullGrayData(canvas);
@@ -2834,7 +2911,11 @@ async function extractAndStitch({ video, roi, times, bursts, scrollDefaults, dir
     const defs = buildCutTileDefs(times, bursts);
     const tiles = [];
     for (let k = 0; k < defs.length; k++) {
-      const c = await captureRepCanvas(video, roi, defs[k].time);
+      // 정지 구간 안 서로 다른 시각 3~5장의 픽셀별 중앙값 — 움직이는 재생 표시(색·모양 무관)가 사라진다
+      const idxs = pickMedianIndices(defs[k].startIdx, defs[k].endIdx);
+      const caps = [];
+      for (const ix of idxs) caps.push(await captureRepCanvas(video, roi, times[ix]));
+      const c = caps.length > 1 ? medianOfCanvases(caps) : caps[0];
       tiles.push({ canvas: c, t: defs[k].time, t0: defs[k].t0, t1: defs[k].t1 });
       log('타일 추출 중... ' + (k + 1) + '/' + defs.length);
     }
@@ -3957,10 +4038,10 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
   let groups;
   if (effectiveFallback) groups = [{ startIdx: 0, endIdx: measureCount, startX: 0, endX: stitchAxisLen, count: measureCount || null, whole: true }];
   else if (useBarGroups) groups = groupBarsByTargetWidth(bars, groupSize, maxBarsPerGroup);
-  else groups = groupByWidth(stitchAxisLen, groupSize, maxBarsPerGroup, measureW, frameLen, bars, blank);
+  else groups = groupByWidth(stitchAxisLen, groupSize, maxBarsPerGroup, measureW, frameLen, bars, blank, detection.system ? detection.system.space : 8);
 
   // 컷 이음새 자동 검증 — 이음새를 낀 마디 폭, 양쪽 내용 중복 흔적. 통과 못 한 이음새만 저신뢰.
-  const seamChecks = useMemo(() => validateCutSeams(layout.seams, bars, detection), [layout.seams, bars, detection]);
+  const seamChecks = useMemo(() => validateCutSeams(layout.seams, bars, detection, quality.low), [layout.seams, bars, detection, quality.low]);
   const seamsV = layout.seams.map((s, i) => ({ ...s, flagged: !!(seamChecks[i] && seamChecks[i].flagged), reason: seamChecks[i] && seamChecks[i].reason }));
   const flaggedSeams = seamsV.filter(s => s.flagged);
   const curSeam = flaggedSeams.length ? (flaggedSeams.find(s => s.i === seamSel) || flaggedSeams[0]) : null;
