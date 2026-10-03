@@ -3061,7 +3061,10 @@ function weightedMedian(items) {
 }
 
 // ---- 이음매 단위 겹침 탐지 (컷 전환인데 앞 화면 마지막 마디가 다음 화면에 다시 나오는 영상) ----
-// 잉크 이진 배열 + ±1px 팽창본. 모든 비교는 전처리된 원본 해상도 타일에서 한다.
+// 비교 영역은 오선 밴드만이 아니라 타일 전체 높이(오선 줄 행만 제외) — 코드명·마디 번호·연주 기호도 단서로 쓴다.
+// 영역이 커진 만큼 재생바 열(밴드를 넘는 선)은 양쪽 타일에서 마스킹한다. 마디선은 마스킹하지 않는다.
+
+// 잉크 이진 배열 + ±1px 팽창본
 function tileInkSet(info) {
   if (info.inkSet) return info.inkSet;
   const { w, h } = info.g;
@@ -3084,48 +3087,112 @@ function tileInkSet(info) {
   return info.inkSet;
 }
 
-// 정렬 관계: B의 로컬 x좌표 u는 A의 x = u + s. 겹침 영역(오선 밴드 높이, 오선 줄 행 제외)에서 ±1px 팽창을 허용한
-// 잉크 일치율(IoU). 겹침 영역의 잉크가 (오선 간격²×5)개 미만이면 검증 불가(null).
-function verifyOverlap(infoA, infoB, setA, setB, s, mask, band, space) {
-  const w = setA.w;
-  const xs = Math.max(infoA.xL, infoB.xL + s), xe = Math.min(infoA.xR, infoB.xR + s);
-  const ow = xe - xs + 1;
-  if (ow < 4) return null;
+// 재생바 열: 보표 밴드 밖으로 끊김 없이 0.6 staff space 이상 삐져나오는 열
+function tileFullInfo(info) {
+  if (info.playCols) return info;
+  const g = info.g;
+  info.playCols = new Uint8Array(g.w);
+  if (info.sys) {
+    const sp = info.sys.space, lim = Math.max(2, Math.round(sp * 2));
+    for (let x = 0; x < g.w; x++) {
+      const prot = Math.max(
+        contiguousInk(g, x, info.sys.main.top - 1, -1, lim, 128),
+        contiguousInk(g, x, info.sys.main.bottom + 1, 1, lim, 128)
+      );
+      if (prot >= sp * 0.6) info.playCols[x] = 1;
+    }
+  }
+  return info;
+}
+const tileInfoCache = new WeakMap();
+function tileInfoOf(canvas) {
+  let v = tileInfoCache.get(canvas);
+  if (!v) { v = analyzeTileStaff(canvas); tileFullInfo(v); tileInkSet(v); tileInfoCache.set(canvas, v); }
+  return v;
+}
+
+// 잉크 최소 기준은 max(60px, 오선 간격²×0.5) + 연결 성분 3개 이상, 채택 IoU ≥ 0.85.
+// "판단 불가"면 한 단계 완화(잉크 40px, IoU ≥ 0.9)해 재시도한다.
+function overlapLevels(space) {
+  return [
+    { minInk: Math.max(60, space * space * 0.5), iou: 0.85 },
+    { minInk: 40, iou: 0.9 },
+  ];
+}
+
+// 영역 내 A 잉크의 연결 성분 개수 (cap에 도달하면 중단)
+function countRegionComponents(set, xs, xe, mask, colMask, cap) {
+  const { ink, w, h } = set;
+  const seen = new Uint8Array(w * h);
+  const stack = [];
+  let comps = 0;
+  for (let y = 0; y < h && comps < cap; y++) {
+    if (mask[y]) continue;
+    for (let x = xs; x <= xe && comps < cap; x++) {
+      const p = y * w + x;
+      if (!ink[p] || seen[p] || (colMask && colMask[x])) continue;
+      comps++;
+      seen[p] = 1; stack.push(p);
+      while (stack.length) {
+        const q = stack.pop();
+        const qx = q % w, qy = (q - qx) / w;
+        for (let dy = -1; dy <= 1; dy++) {
+          const yy = qy + dy;
+          if (yy < 0 || yy >= h || mask[yy]) continue;
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = qx + dx;
+            if (xx < xs || xx > xe) continue;
+            const pp = yy * w + xx;
+            if (ink[pp] && !seen[pp] && !(colMask && colMask[xx])) { seen[pp] = 1; stack.push(pp); }
+          }
+        }
+      }
+    }
+  }
+  return comps;
+}
+
+// 정렬 관계: B의 로컬 x좌표 u는 A의 x = u + s. 겹침 영역(타일 전체 높이, 오선 줄 행·재생바 열 제외)에서 ±1px 팽창을
+// 허용한 잉크 일치율(IoU). 영역이 4열 미만이면 null.
+function verifyOverlap(infoA, infoB, setA, setB, s, mask) {
+  const w = setA.w, h = setA.h;
+  const xs = Math.max(infoA.xL, infoB.xL + s, 0), xe = Math.min(infoA.xR, infoB.xR + s, w - 1);
+  if (xe - xs + 1 < 4) return null;
   let nA = 0, nB = 0, mA = 0, mB = 0;
-  for (let y = band.top; y <= band.bottom; y++) {
+  for (let y = 0; y < h; y++) {
     if (mask[y]) continue;
     const row = y * w;
     for (let x = xs; x <= xe; x++) {
       const u = x - s;
-      if (u < 0 || u >= w || x < 0 || x >= w) continue;
+      if (u < 0 || u >= w || infoA.playCols[x] || infoB.playCols[u]) continue;
       const a = setA.ink[row + x], b = setB.ink[row + u];
       if (a) { nA++; if (setB.dil[row + u]) mA++; }
       if (b) { nB++; if (setA.dil[row + x]) mB++; }
     }
   }
-  if (Math.max(nA, nB) < space * space * 5) return null;
-  return { iou: (mA + mB) / Math.max(1, nA + nB), ink: Math.max(nA, nB), overlapW: ow };
+  return { iou: (mA + mB) / Math.max(1, nA + nB), ink: Math.max(nA, nB), xs, xe };
 }
 
-// 보조 탐색(b): maxDim 900에서 잉크 이진 이미지 일치율로 겹침 폭 5~60% 범위의 shift 후보 상위 3개
-function coarseOverlapCandidates(canvasA, canvasB, mask, band) {
+// 보조 탐색(b): maxDim 900 잉크 이진 이미지(타일 전체 높이)로 겹침 폭 3~95% 범위의 shift 후보 상위 3개
+function coarseOverlapCandidates(canvasA, canvasB, mask) {
   const gA = scrollGetGray(canvasA, 900), gB = scrollGetGray(canvasB, 900);
   const sc = gA.scale, w2 = Math.min(gA.w, gB.w), h2 = Math.min(gA.h, gB.h);
-  const y0 = Math.max(0, Math.floor(band.top * sc)), y1 = Math.min(h2 - 1, Math.ceil(band.bottom * sc));
   const inkA = new Uint8Array(w2 * h2), inkB = new Uint8Array(w2 * h2);
-  for (let y = y0; y <= y1; y++) {
+  const rows = [];
+  for (let y = 0; y < h2; y++) {
     if (mask[Math.min(mask.length - 1, Math.round(y / sc))]) continue;
+    rows.push(y);
     for (let x = 0; x < w2; x++) {
       inkA[y * w2 + x] = gA.gray[y * gA.w + x] < 160 ? 1 : 0;
       inkB[y * w2 + x] = gB.gray[y * gB.w + x] < 160 ? 1 : 0;
     }
   }
-  const sMin = Math.round(w2 * 0.4), sMax = Math.round(w2 * 0.95);
+  const sMin = Math.round(w2 * 0.05), sMax = Math.round(w2 * 0.97);
   const scores = [];
   for (let sp = sMin; sp <= sMax; sp++) {
     const ow = w2 - sp;
     let m = 0, na = 0, nb = 0;
-    for (let y = y0; y <= y1; y++) {
+    for (const y of rows) {
       const row = y * w2;
       for (let x = 0; x < ow; x++) {
         const a = inkA[row + sp + x], b = inkB[row + x];
@@ -3144,14 +3211,26 @@ function coarseOverlapCandidates(canvasA, canvasB, mask, band) {
   return picked.map(c => Math.round(c.sp / sc));
 }
 
-// 반환: { status: 'overlap'|'none'|'unverifiable', s, px(겹친 폭), iou, cands:[상위 3개 {s,iou,ink,src}] }
+// 후보 목록 → 판정. 채택 조건: IoU ≥ lvl.iou, 연결 성분 ≥ 3, 후보가 둘 이상이면 2위(shift 차 4px 초과)보다 0.1 이상 높음.
+function decideOverlap(cands, lvl, infoA, setA, mask) {
+  const ver = cands.filter(c => c.ink >= lvl.minInk).sort((p, q) => q.iou - p.iou);
+  if (!ver.length) return { status: 'unverifiable', why: '잉크 부족' };
+  const b1 = ver[0];
+  if (b1.iou < lvl.iou) return { status: 'none' };
+  if (countRegionComponents(setA, b1.xs, b1.xe, mask, infoA.playCols, 3) < 3) return { status: 'unverifiable', why: '구조(연결 성분) 부족' };
+  const second = ver.find(c => Math.abs(c.s - b1.s) > 4);
+  if (second && b1.iou - second.iou < 0.1) return { status: 'unverifiable', why: '후보 모호' };
+  return { status: 'overlap', best: b1 };
+}
+
+// 반환: { status: 'overlap'|'none'|'unverifiable', s, px(겹친 폭), iou, ink, cands:[상위 3개 {s,iou,ink,src,weak}] }
 function findSeamOverlap(infoA, infoB, canvasA, canvasB, mask, space) {
   const W = infoA.g.w;
-  const sysInfo = infoA.sys || infoB.sys;
-  if (!sysInfo) return { status: 'unverifiable', cands: [] };
-  const band = { top: sysInfo.main.top, bottom: sysInfo.main.bottom };
+  if (!infoA.sys && !infoB.sys) return { status: 'unverifiable', cands: [] };
+  tileFullInfo(infoA); tileFullInfo(infoB);
   const setA = tileInkSet(infoA), setB = tileInkSet(infoB);
-  const lo = Math.round(W * 0.05), hi = Math.round(W * 0.6);
+  const lo = Math.round(W * 0.03), hi = Math.round(W * 0.95);
+  const levels = overlapLevels(space);
   const cands = [];
   const seen = new Set();
   const evalS = (sv, src) => {
@@ -3159,58 +3238,72 @@ function findSeamOverlap(infoA, infoB, canvasA, canvasB, mask, space) {
     seen.add(sv);
     const ow = infoA.xR - (infoB.xL + sv) + 1;
     if (ow < lo || ow > hi) return;
-    const r = verifyOverlap(infoA, infoB, setA, setB, sv, mask, band, space);
-    if (r) cands.push({ s: sv, iou: r.iou, ink: r.ink, src });
+    const r = verifyOverlap(infoA, infoB, setA, setB, sv, mask);
+    if (r) cands.push({ s: sv, iou: r.iou, ink: r.ink, xs: r.xs, xe: r.xe, src });
   };
-  // (a) 마디선 x좌표 쌍의 차 (밴드 정확 일치 규칙을 통과한 마디선만, 재생바 제외 — 마디선은 마스킹하지 않고 단서로 사용)
+  const bestOf = () => cands.filter(c => c.ink >= levels[1].minInk).reduce((m, c) => (!m || c.iou > m.iou ? c : m), null);
+  // (a) 마디선 x좌표 쌍의 차 (밴드 정확 일치 규칙을 통과한 마디선만, 재생바 제외)
   if (infoA.sys && infoB.sys) {
     const barsA = detectBarsThroughSystem(infoA.g, infoA.sys, 0.8, infoA.xL, 140, null, 0).bars.map(b => b.x);
     const barsB = detectBarsThroughSystem(infoB.g, infoB.sys, 0.8, infoB.xL, 140, null, 0).bars.map(b => b.x);
     for (const xa of barsA) for (const xb of barsB) evalS(xa - xb, 'bar');
   }
-  const bestOf = () => cands.reduce((m, c) => (!m || c.iou > m.iou ? c : m), null);
   let best = bestOf();
-  // (b) 마디선이 없거나 후보 검증에 모두 실패하면 maxDim 900 잉크 이진 이미지 탐색
-  if (!best || best.iou < 0.8) {
-    for (const sv of coarseOverlapCandidates(canvasA, canvasB, mask, band)) {
+  // (b) 마디선이 없거나 후보 검증에 모두 실패하면 maxDim 900 잉크 이진 탐색
+  if (!best || best.iou < levels[0].iou) {
+    for (const sv of coarseOverlapCandidates(canvasA, canvasB, mask)) {
       for (let d = -3; d <= 3; d++) evalS(sv + d, 'ncc');
     }
     best = bestOf();
   }
   if (best) {
     for (let d = -2; d <= 2; d++) evalS(best.s + d, best.src); // 정밀 보정
-    best = bestOf();
   }
-  const top = cands.slice().sort((p, q) => q.iou - p.iou).slice(0, 3);
-  if (best && best.iou >= 0.8) {
-    return { status: 'overlap', s: best.s, px: infoA.xR - (infoB.xL + best.s) + 1, iou: best.iou, ink: best.ink, cands: top };
+  // 판정: 기본 기준 → 판단 불가면 한 단계 완화해 재시도
+  let dec = decideOverlap(cands, levels[0], infoA, setA, mask);
+  if (dec.status === 'unverifiable') {
+    const d2 = decideOverlap(cands, levels[1], infoA, setA, mask);
+    dec = d2.status === 'unverifiable' ? dec : d2;
   }
-  return { status: cands.length ? 'none' : 'unverifiable', cands: top };
+  const top = cands.slice().sort((p, q) => q.iou - p.iou).slice(0, 3).map(c => ({ s: c.s, iou: c.iou, ink: c.ink, src: c.src, weak: c.ink < levels[0].minInk }));
+  if (dec.status === 'overlap') {
+    const b = dec.best;
+    return { status: 'overlap', s: b.s, px: infoA.xR - (infoB.xL + b.s) + 1, iou: b.iou, ink: b.ink, cands: top };
+  }
+  return { status: dec.status, why: dec.why, cands: top };
 }
 
-// 사후 중복 검사: 이음매 왼쪽 끝 d열(A의 마지막 그려진 열까지)과 오른쪽 처음 d열(B의 첫 그려진 열부터)이
-// 같은 마디(잉크 일치)인지, d = 폭 5~40%. 중복이면 {d, iou}.
-function detectSeamDuplicate(setA, setB, aEnd, bStart, bEnd, mask, band, space, W) {
-  const w = setA.w;
-  let best = null;
+// 사후 중복 검사: 이음매 왼쪽 끝 d열(A의 마지막 그려진 열까지)과 오른쪽 처음 d열(B의 첫 그려진 열부터)이 같은 마디(잉크
+// 일치)인지, d = 폭 5~40%. 타일 전체 높이(오선 줄·재생바 제외)에서 비교. 반환 {status:'dup'|'ok'|'unverifiable', d, iou}
+function detectSeamDuplicate(infoA, infoB, aEnd, bStart, bEnd, mask, space, W) {
+  tileFullInfo(infoA); tileFullInfo(infoB);
+  const setA = tileInkSet(infoA), setB = tileInkSet(infoB);
+  const w = setA.w, h = setA.h;
+  const cands = [];
   for (let d = Math.round(W * 0.05); d <= Math.round(W * 0.4); d += 2) {
     if (aEnd - d + 1 < 0 || bStart + d - 1 > bEnd) continue;
     let nA = 0, nB = 0, mA = 0, mB = 0;
-    for (let y = band.top; y <= band.bottom; y++) {
+    for (let y = 0; y < h; y++) {
       if (mask[y]) continue;
       const row = y * w;
       for (let k = 0; k < d; k++) {
         const xa = aEnd - d + 1 + k, xb = bStart + k;
+        if (infoA.playCols[xa] || infoB.playCols[xb]) continue;
         const a = setA.ink[row + xa], b = setB.ink[row + xb];
         if (a) { nA++; if (setB.dil[row + xb]) mA++; }
         if (b) { nB++; if (setA.dil[row + xa]) mB++; }
       }
     }
-    if (Math.max(nA, nB) < space * space * 5) continue;
-    const iou = (mA + mB) / Math.max(1, nA + nB);
-    if (iou >= 0.8 && (!best || iou > best.iou)) best = { d, iou };
+    cands.push({ d, iou: (mA + mB) / Math.max(1, nA + nB), ink: Math.max(nA, nB), xs: aEnd - d + 1, xe: aEnd });
   }
-  return best;
+  for (const lvl of overlapLevels(space)) {
+    const ver = cands.filter(c => c.ink >= lvl.minInk).sort((p, q) => q.iou - p.iou);
+    if (!ver.length) continue;
+    const b1 = ver[0];
+    if (b1.iou >= lvl.iou && countRegionComponents(setA, b1.xs, b1.xe, mask, infoA.playCols, 3) >= 3) return { status: 'dup', d: b1.d, iou: b1.iou };
+    return { status: 'ok' };
+  }
+  return { status: 'unverifiable' };
 }
 
 // tiles: [{canvas, t, t0, t1}] → 조각 목록(타일 하나당 조각 하나, 중복 타일은 dup) 또는 null(오선을 못 찾음)
@@ -3276,7 +3369,7 @@ async function buildCutFrames(tiles, scrollDefaults) {
       delta = common;
       score = pr && pr.r ? pr.r.match / Math.max(1, pr.r.match + pr.r.mism) : null;
       weight = pr && pr.r ? pr.r.match : 0;
-      ovl = { kind: pr ? pr.ov.status : 'none', px: 0, cands: pr ? pr.ov.cands : [] };
+      ovl = { kind: pr ? pr.ov.status : 'none', px: 0, why: pr ? pr.ov.why : null, cands: pr ? pr.ov.cands : [] };
     }
     srcX = Math.min(srcX, Math.max(0, e));
     const f = newScrollFrame({
@@ -3288,16 +3381,15 @@ async function buildCutFrames(tiles, scrollDefaults) {
     prevKeptIdx = k;
   }
 
-  // 사후 중복 검사 — 이음매 양쪽 5~40% 구간이 같은 마디면 중복 의심: 겹침 탐지(1번)가 놓친 것이므로 중복 폭만큼
+  // 사후 중복 검사 — 이음매 양쪽 5~40% 구간이 같은 마디면 중복 의심: 겹침 탐지가 놓친 것이므로 중복 폭만큼
   // B 왼쪽을 잘라 자동 수정하고, 그래도 남으면 dupSuspect로 표시(주황 깃발 대상)
   const realFrames = frames.filter(f => !f.dup);
   for (let j = 1; j < keep.length; j++) {
-    const fp = frames.filter(f => !f.dup)[j - 1], fc = realFrames[j];
+    const fp = realFrames[j - 1], fc = realFrames[j];
     const ia = keep[j - 1], ib = keep[j];
-    const setA = tileInkSet(infos[ia]), setB = tileInkSet(infos[ib]);
     for (let pass = 0; pass < 2; pass++) {
-      const dd = detectSeamDuplicate(setA, setB, fp.srcX + fp.len - 1, fc.srcX, fc.srcX + fc.len - 1, mask, band, space, w);
-      if (!dd) break;
+      const dd = detectSeamDuplicate(infos[ia], infos[ib], fp.srcX + fp.len - 1, fc.srcX, fc.srcX + fc.len - 1, mask, space, w);
+      if (dd.status !== 'dup') break;
       if (pass === 0 && fc.len - dd.d >= 1) {
         fc.srcX += dd.d; fc.len -= dd.d;
         fc.dupFixed = (fc.dupFixed || 0) + dd.d;
@@ -3394,20 +3486,41 @@ async function extractSmoothResult({ video, roi, times, bursts, scrollDefaults, 
 function scoreStitchResult(rawFrames, direction, viewLen) {
   const lay = renderFrames(rawFrames, direction);
   const det = detectStaffAndBars(lay.canvas, 0.6, null, viewLen, direction === 'vertical' ? null : lay.placed);
-  if (!det.staffFound) return { score: 0, passRate: 0, dupFrac: 1, widthOk: 0 };
+  if (!det.staffFound) return { score: 0, passRate: 0, dupFrac: 1, widthOk: 0, unverFrac: 0 };
   const checks = validateCutSeams(lay.seams, det.bars, det, det.quality.low);
-  let tot = 0, pass = 0, dupN = 0;
+  let tot = 0, pass = 0;
   lay.seams.forEach((sm, i) => {
     if (sm.dup) return;
     tot++;
     const flagged = sm.cut ? checks[i].flagged : (sm.score != null && sm.score < 0.7);
     if (!flagged) pass++;
-    if (det.system && hasDuplicateTrace(det.gray, det.system, sm.pos)) dupN++;
   });
+  // 내용 중복 비율은 개선된 detectSeamDuplicate(타일 전체 높이)로 전체 이음매에서 계산한다.
+  let pairs = 0, dupN = 0, unverN = 0;
+  if (direction !== 'vertical') {
+    const real = lay.placed.filter(f => !f.dup);
+    for (let j = 1; j < real.length; j++) {
+      const fp = real[j - 1], fc = real[j];
+      if (fp.canvas.width !== fc.canvas.width || fp.canvas.height !== fc.canvas.height) continue;
+      const ia = tileInfoOf(fp.canvas), ib = tileInfoOf(fc.canvas);
+      if (!ia.sys && !ib.sys) { pairs++; unverN++; continue; }
+      const mask = new Uint8Array(fp.canvas.height);
+      for (const inf of [ia, ib]) if (inf.sys) for (let y = 0; y < mask.length; y++) if (inf.sys.mask[y]) mask[y] = 1;
+      const space = (ia.sys || ib.sys).space;
+      const dd = detectSeamDuplicate(ia, ib, fp.srcX + fp.len - 1, fc.srcX, fc.srcX + fc.len - 1, mask, space, fp.canvas.width);
+      pairs++;
+      if (dd.status === 'dup') dupN++;
+      else if (dd.status === 'unverifiable' || (fc.ovl && fc.ovl.kind === 'unverifiable')) unverN++;
+    }
+  }
   const passRate = tot ? pass / tot : 1;
-  const dupFrac = tot ? dupN / tot : 0;
+  const dupFrac = pairs ? dupN / pairs : 0;
+  const unverFrac = pairs ? unverN / pairs : 0;
   const widthOk = det.quality.measureCount >= 1 ? det.quality.widthOk : 0;
-  return { score: 0.4 * passRate + 0.3 * (1 - dupFrac) + 0.3 * widthOk, passRate, dupFrac, widthOk };
+  let score = 0.4 * passRate + 0.3 * (1 - dupFrac) + 0.3 * widthOk;
+  // 판단 불가 이음매가 20%를 넘으면 크게 감점 (만점 불가)
+  if (unverFrac > 0.2) score = Math.min(score * 0.6, 0.55);
+  return { score, passRate, dupFrac, widthOk, unverFrac };
 }
 
 // transition: 'auto' | 'smooth' | 'cut'
@@ -3446,7 +3559,7 @@ async function extractAndStitch({ video, roi, times, bursts, scrollDefaults, dir
   const sc = scoreStitchResult(cutR.rawFrames, 'horizontal', cutR.frameLen);
   const ss = scoreStitchResult(smR.rawFrames, smR.direction, smR.frameLen);
   const pickCut = sc.score > ss.score;
-  const fmt = x => '점수 ' + x.score.toFixed(2) + ' (이음매 통과 ' + Math.round(x.passRate * 100) + '%, 내용 중복 ' + Math.round(x.dupFrac * 100) + '%, 마디 폭 균일 ' + Math.round(x.widthOk * 100) + '%)';
+  const fmt = x => '점수 ' + x.score.toFixed(2) + ' (이음매 통과 ' + Math.round(x.passRate * 100) + '%, 내용 중복 ' + Math.round(x.dupFrac * 100) + '%, 판단 불가 ' + Math.round(x.unverFrac * 100) + '%, 마디 폭 균일 ' + Math.round(x.widthOk * 100) + '%)';
   return withInfo(pickCut ? cutR : smR, {
     decided: pickCut ? 'cut' : 'smooth',
     reason: '자동(애매): ' + stat + ' → 둘 다 생성해 비교 — 컷 ' + fmt(sc) + ' vs NCC ' + fmt(ss) + ' → ' + (pickCut ? '컷 전환' : '부드러운 스크롤(NCC)') + ' 선택',
@@ -4541,11 +4654,11 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
   const seamChecks = useMemo(() => validateCutSeams(layout.seams, bars, detection, quality.low), [layout.seams, bars, detection, quality.low]);
   const seamsV = layout.seams.map((s, i) => ({
     ...s, flagged: !!(seamChecks[i] && seamChecks[i].flagged),
-    reason: (seamChecks[i] && seamChecks[i].reason) || (s.dupSuspect ? '이음매 양쪽에 같은 마디가 반복됨 (자동 수정 실패)' : null),
+    reason: (seamChecks[i] && seamChecks[i].reason) || (s.dupSuspect ? '이음매 양쪽에 같은 마디가 반복됨 (자동 수정 실패)' : (s.ovl && s.ovl.kind === 'unverifiable' ? ('겹침 판단 불가' + (s.ovl.why ? ' (' + s.ovl.why + ')' : '')) : null)),
   }));
   const seamsInfo = seamsV.map((s, i) => ({
     ...s, widthRatio: seamChecks[i] ? seamChecks[i].widthRatio : null,
-    needsFix: s.flagged || s.dupSuspect || (!s.cut && !s.dup && s.score != null && s.score < 0.7),
+    needsFix: s.flagged || s.dupSuspect || (s.ovl && s.ovl.kind === 'unverifiable') || (!s.cut && !s.dup && s.score != null && s.score < 0.7),
   }));
   const fixSeams = seamsInfo.filter(s => s.needsFix); // 수정 후 검증을 다시 통과하면 자동으로 목록·깃발에서 빠진다
   const curSeam = fixSeams.length ? (fixSeams.find(s => s.i === seamSel) || fixSeams[0]) : null;
@@ -4731,6 +4844,11 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
           <button className="icon-btn" onClick={() => rebuildWithType(typeChoice)} disabled={rebuilding}>{rebuilding ? '다시 만드는 중...' : '이 유형으로 다시 만들기'}</button>
           {rebuildMsg && <span className="save-msg">{rebuildMsg}</span>}
         </div>
+        {seamsInfo.some(x => x.cut && !x.dup) && (
+          <p className="hint-text" style={{ margin: '4px 0' }}>
+            겹침 확정 {seamsInfo.filter(x => x.cut && !x.dup && x.ovl && x.ovl.kind === 'overlap').length} / 없음 {seamsInfo.filter(x => x.cut && !x.dup && x.ovl && x.ovl.kind === 'none').length} / 판단 불가 {seamsInfo.filter(x => x.cut && !x.dup && x.ovl && x.ovl.kind === 'unverifiable').length}
+          </p>
+        )}
         {typeInfo && <p className="hint-text" style={{ margin: '4px 0' }}>선택된 유형: <b>{typeInfo.decided === 'cut' ? '컷 전환(타일링)' : '부드러운 스크롤(NCC)'}</b> — {typeInfo.reason}</p>}
         {notes && notes.roiNarrow && (
           <p className="hint-text" style={{ color: '#c0392b' }}>
@@ -4831,10 +4949,10 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
                 const ovText = s.dupSuspect ? '중복 의심 (자동 수정 실패)'
                   : (s.dupFixed ? ('중복 의심 → 자동 수정 (' + s.dupFixed + 'px 제거)')
                     : (o && o.kind === 'overlap' ? ('겹침 ' + o.px + 'px 제거 (IoU ' + o.iou.toFixed(2) + ')')
-                      : (o && o.kind === 'unverifiable' ? '겹침 판단 불가(잉크 부족) → 겹침 없음으로 처리' : '겹침 없음')));
+                      : (o && o.kind === 'unverifiable' ? ('겹침 판단 불가' + (o.why ? '(' + o.why + ')' : '') + ' — 맞대어 붙임, 확인 필요') : '겹침 없음')));
                 scoreText = ovText + ' · ' + scoreText;
                 if (o && o.cands && o.cands.length) {
-                  criterion += ' · 후보: ' + o.cands.map(c => 'shift ' + c.s + ' / IoU ' + c.iou.toFixed(2) + ' / 잉크 ' + c.ink + ' (' + (c.src === 'bar' ? '마디선' : 'NCC') + ')').join(' ; ');
+                  criterion += ' · 후보: ' + o.cands.map(c => 'shift ' + c.s + ' / IoU ' + c.iou.toFixed(2) + ' / 잉크 ' + c.ink + ' (' + (c.src === 'bar' ? '마디선' : 'NCC') + (c.weak ? ', 잉크 부족' : '') + ')').join(' ; ');
                 }
               } else { scoreText = 'NCC ' + (s.score != null ? s.score.toFixed(2) : '-'); criterion = '실패 기준: NCC < 0.70'; }
               return (
