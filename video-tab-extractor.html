@@ -2373,128 +2373,151 @@ function computeBarCoverage(g, top, bottom, darkThresh) {
   return cover;
 }
 
-// 병합된 시스템의 마디선 후보 연속도 — 모든 보표에서 같은 x(±1px)에 직선이 있어야 하므로 보표별 연속도의
-// 최솟값을 쓴다(한 보표에만 있는 줄기·물결선 제외). 보표 사이의 흐린/끊긴 연결 구간은 요구하지 않는다.
-function computeSystemCover(g, sys, darkThresh) {
-  const per = sys.staves.map(st => computeBarCoverage(g, st[0].y0, st[st.length - 1].y1, darkThresh));
-  const cover = new Float32Array(g.w);
-  for (let x = 0; x < g.w; x++) {
-    let m = 1;
-    for (const c of per) {
-      const v = Math.max(c[x], x > 0 ? c[x - 1] : 0, x + 1 < g.w ? c[x + 1] : 0);
-      if (v < m) m = v;
+// ---- 마디선 = "시스템 전체 관통선" ----
+// 열별로 각 오선 구간(줄 5~6개 범위)의 어두운 픽셀 연속도를 단마다 따로 계산한다(단 사이 간격 구간은 제외).
+// 시스템의 모든 단에서 연속도 ≥ T인 열을 후보로 보고, 단마다 찾은 x는 ±max(3px, 오선 간격×0.4) 안에서
+// 같은 선으로 병합(x 평균). 선 두께 1~6px 허용(겹마디선·반복기호 포함). 단 사이 간격 구간의 연속도도
+// ≥0.7이면 신뢰도 가점(통과 여부에는 영향 없음). 1단 악보도 같은 기준(그 단 전체 관통).
+function columnRunFraction(g, x, y0, y1, darkThresh) {
+  const len = y1 - y0 + 1;
+  if (len <= 0) return 0;
+  let best = 0, runStart = -1, lastDark = -1;
+  for (let y = y0; y <= y1; y++) {
+    if (g.gray[y * g.w + x] < darkThresh) {
+      if (runStart < 0 || y - lastDark > 3) runStart = y;
+      lastDark = y;
+      if (lastDark - runStart + 1 > best) best = lastDark - runStart + 1;
     }
-    cover[x] = m;
   }
-  return cover;
+  return best / len;
 }
 
-// 인접 후보 간격이 마디 폭 중앙값의 0.35배 미만이면 연속도 점수가 더 높은 하나만 남긴다.
-function pruneCloseBars(bars, cover) {
-  let cur = bars.slice();
-  for (let iter = 0; iter < 50 && cur.length >= 3; iter++) {
+// 이웃 후보 간격이 마디 폭 중앙값의 0.35배 미만이면 점수가 높은 쪽만 유지 (후보 5개 미만이면 생략)
+function pruneCloseBarObjs(list) {
+  let cur = list.slice();
+  for (let iter = 0; iter < 100 && cur.length >= 5; iter++) {
     const gaps = [];
-    for (let i = 1; i < cur.length; i++) gaps.push(cur[i] - cur[i - 1]);
+    for (let i = 1; i < cur.length; i++) gaps.push(cur[i].x - cur[i - 1].x);
     const med = medianOf(gaps);
     let worst = -1, worstGap = Infinity;
     for (let i = 0; i < gaps.length; i++) if (gaps[i] < med * 0.35 && gaps[i] < worstGap) { worst = i; worstGap = gaps[i]; }
     if (worst < 0) break;
-    const a = cur[worst], b = cur[worst + 1];
-    cur.splice(cover[b] > cover[a] ? worst : worst + 1, 1);
+    cur.splice(cur[worst + 1].score > cur[worst].score ? worst : worst + 1, 1);
   }
   return cur;
 }
-function detectBarsAt(cover, space, thr) {
-  return pruneCloseBars(barsFromCoverage(cover, space, thr), cover);
-}
 
-// 마디선 후보 조건: (a) 연속도 >= thr, (b) 폭 <= staff space*0.6, (c) 좌우 staff space*0.5~1.5 거리에
-// 굵은 연속 획(화음 덩어리 등)이 없음. 겹마디선·종지선은 staff space*2 이내 후보를 한 경계로 병합.
-function barsFromCoverage(cover, space, thr) {
-  const clusters = [];
-  let cur = null;
-  for (let x = 0; x < cover.length; x++) {
-    if (cover[x] >= thr) {
-      if (cur && x - cur.x1 <= 1) cur.x1 = x;
-      else { if (cur) clusters.push(cur); cur = { x0: x, x1: x }; }
+function detectBarsThroughSystem(g, sys, T, left, darkThresh) {
+  const space = sys.space, staves = sys.main.staves, K = staves.length;
+  const tol = Math.max(3, space * 0.4);
+  const bands = staves.map(st => [st[0].y0, st[st.length - 1].y1]);
+  const members = [];
+  bands.forEach(([y0, y1], k) => {
+    const cv = computeBarCoverage(g, y0, y1, darkThresh);
+    let cur = null;
+    const flush = () => {
+      if (!cur) return;
+      const w = cur.x1 - cur.x0 + 1;
+      if (w >= 1 && w <= 6) members.push({ x: (cur.x0 + cur.x1) / 2, k, cov: cur.cov });
+    };
+    for (let x = 0; x < g.w; x++) {
+      if (cv[x] >= T) {
+        if (cur && x - cur.x1 <= 1) { cur.x1 = x; cur.cov = Math.max(cur.cov, cv[x]); }
+        else { flush(); cur = { x0: x, x1: x, cov: cv[x] }; }
+      }
     }
-  }
-  if (cur) clusters.push(cur);
-  const maxThin = Math.min(3, Math.max(2, space * 0.6)); // 마디선은 1~3px 폭의 꽉 찬 직선
-  const thin = [], wide = [];
-  for (const c of clusters) ((c.x1 - c.x0 + 1) <= maxThin ? thin : wide).push(c);
-  const iso = thin.filter(c => !wide.some(wc => {
-    const gap = wc.x0 > c.x1 ? wc.x0 - c.x1 : c.x0 - wc.x1;
-    return gap >= space * 0.5 && gap <= space * 1.5;
-  }));
+    flush();
+  });
+  members.sort((a, b) => a.x - b.x);
   const groups = [];
-  for (const c of iso) {
+  for (const m of members) {
     const last = groups[groups.length - 1];
-    if (last && c.x0 - last.x1 <= space * 2) last.x1 = c.x1;
-    else groups.push({ x0: c.x0, x1: c.x1 });
+    if (last && m.x - last.lastX <= tol) { last.items.push(m); last.lastX = m.x; }
+    else groups.push({ items: [m], lastX: m.x });
   }
-  return groups.map(gp => Math.round((gp.x0 + gp.x1) / 2));
-}
-
-// 연속도 임계 0.80~1.00을 훑어 검출 개수가 가장 오래 유지되는 구간(plateau)의 중앙값을 채택
-function autoBarThreshold(cover, space) {
-  const thrAt = i => Math.min(1, Math.round((0.80 + i * 0.01) * 100) / 100);
-  const counts = [];
-  for (let i = 0; i <= 20; i++) counts.push(detectBarsAt(cover, space, thrAt(i)).length);
-  let best = null, i = 0;
-  while (i < counts.length) {
-    let j = i;
-    while (j + 1 < counts.length && counts[j + 1] === counts[i]) j++;
-    const len = j - i + 1;
-    if (counts[i] > 0 && (!best || len > best.len || (len === best.len && counts[i] > best.count))) best = { i, j, len, count: counts[i] };
-    i = j + 1;
+  const cand = groups.length;
+  const passed = [];
+  for (const gr of groups) {
+    if (new Set(gr.items.map(m => m.k)).size < K) continue;
+    const x = gr.items.reduce((s, m) => s + m.x, 0) / gr.items.length;
+    const cov = gr.items.reduce((s, m) => s + m.cov, 0) / gr.items.length;
+    let gapConn = false;
+    if (K > 1) {
+      gapConn = true;
+      for (let j = 0; j < K - 1 && gapConn; j++) {
+        const y0 = bands[j][1] + 1, y1 = bands[j + 1][0] - 1;
+        let best = 0;
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = Math.round(x) + dx;
+          if (xx >= 0 && xx < g.w) best = Math.max(best, columnRunFraction(g, xx, y0, y1, darkThresh));
+        }
+        if (best < 0.7) gapConn = false;
+      }
+    }
+    passed.push({ x: Math.round(x), score: cov + (gapConn ? 0.05 : 0), gapConn });
   }
-  if (!best) return 0.9;
-  return thrAt(Math.round((best.i + best.j) / 2));
+  // 헤더(첫 타일 악보 왼쪽 오선 간격×20) 제외, 제외 후 0이면 범위를 절반으로 재시도
+  const run = hs => passed.filter(b => b.x >= left + space * hs);
+  let kept = run(20);
+  if (!kept.length && passed.length) kept = run(10);
+  const afterHeader = kept.length;
+  kept = pruneCloseBarObjs(kept);
+  return { bars: kept, stats: { cand, allStaff: passed.length, afterHeader, afterPrune: kept.length, T } };
 }
 
 // 품질 점수 — 마디 폭이 중앙값의 0.4~2.5배 안인 비율, "ROI 폭당 마디 수"(1~8 밖이면 의심)
-function assessBarQuality(bars, totalLen, viewLen) {
+function assessBarQuality(bars, totalLen, viewLen, weak) {
   const measureCount = Math.max(0, bars.length - 1);
-  if (measureCount < 1) return { low: true, widthOk: 0, perView: 0, measureCount, medianWidth: null };
+  if (measureCount < 1) return { low: true, widthOk: 0, perView: 0, measureCount, medianWidth: null, weak: !!weak };
   const widths = [];
   for (let i = 0; i < measureCount; i++) widths.push(bars[i + 1] - bars[i]);
   const med = medianOf(widths);
   const widthOk = widths.filter(w => w >= med * 0.4 && w <= med * 2.5).length / widths.length;
   const perView = viewLen ? measureCount / (totalLen / viewLen) : null;
-  const low = widthOk < 0.7 || (perView != null && (perView < 1 || perView > 8));
-  return { low, widthOk, perView, measureCount, medianWidth: med };
+  const low = !!weak || widthOk < 0.7 || (perView != null && (perView < 1 || perView > 8));
+  return { low, widthOk, perView, measureCount, medianWidth: med, weak: !!weak };
 }
 
-// staffThresh(슬라이더, 기본 0.6)는 줄 검출 비율의 1/2로 환산해 완화해서 쓴다. barThresh가 null이면
-// 임계 자동 보정. 입력은 오버레이 없는 깨끗한 stitched canvas여야 한다.
+// staffThresh(슬라이더, 기본 0.6)는 줄 검출 비율의 1/2로 환산해 완화해서 쓴다. barThresh가 null이면 자동:
+// T를 0.9에서 0.05씩 낮추며(최저 0.5) 마디 수가 "ROI 폭 ÷ (오선 간격×10)"의 0.5배 이상이 되면 멈춘다.
+// 그래도 부족하면 weak(마디선 인식 약함) — 결과 화면이 폭 기준 그룹화로 자동 전환한다(마디선 0개여도 진행 가능).
+// 입력은 오버레이 없는 깨끗한 stitched canvas여야 한다.
 function detectStaffAndBars(canvas, staffThresh, barThresh, viewLen) {
   const g = scrollGetFullGrayData(canvas);
   const darkThresh = 140;
   const sys = detectStaffSystem(g, Math.max(0.05, staffThresh * 0.5), darkThresh);
   if (!sys) {
     return {
-      staffLines: [], bars: [], staffFound: false, system: null, gray: g,
+      staffLines: [], bars: [], barInfos: [], staffFound: false, system: null, gray: g, stats: null,
       threshUsed: barThresh == null ? 0.9 : barThresh, auto: barThresh == null,
-      quality: { low: true, widthOk: 0, perView: 0, measureCount: 0, medianWidth: null },
+      quality: { low: true, widthOk: 0, perView: 0, measureCount: 0, medianWidth: null, weak: true },
     };
   }
-  const cover = computeSystemCover(g, sys.main, darkThresh);
-  // 헤더(음자리표·조표·박자표) 구간 제외: 오선 시작 x로부터 오선 간격×20 이내는 마디선 후보에서 뺀다
   const left = staffLeftEdge(g, sys);
-  const headerEnd = Math.min(g.w, Math.round(left + sys.space * 20));
-  for (let x = 0; x < headerEnd; x++) cover[x] = 0;
   const auto = barThresh == null;
-  const thr = auto ? autoBarThreshold(cover, sys.space) : barThresh;
-  let bars = detectBarsAt(cover, sys.space, thr);
+  let res, T, weak = false;
+  if (!auto) {
+    T = barThresh;
+    res = detectBarsThroughSystem(g, sys, T, left, darkThresh);
+  } else {
+    const expectMin = viewLen ? 0.5 * viewLen / (sys.space * 10) : 1;
+    for (const t of [0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5]) {
+      T = t;
+      res = detectBarsThroughSystem(g, sys, T, left, darkThresh);
+      if (res.bars.length >= expectMin) break;
+    }
+    weak = res.bars.length < expectMin;
+  }
   // 시스템 시작(오선 시작 x)을 첫 경계로 둔다 — 첫 마디는 음자리표·조표·박자표 헤더를 포함한다
-  bars = [left, ...bars];
+  const barInfos = [{ kind: 'start' }, ...res.bars.map(b => ({ kind: 'bar', gapConn: b.gapConn, score: b.score }))];
+  let bars = [left, ...res.bars.map(b => b.x)];
   if (bars.length && (canvas.width - bars[bars.length - 1]) > canvas.width * 0.02) {
     bars = [...bars, canvas.width - 1];
+    barInfos.push({ kind: 'end' });
   }
   return {
-    staffLines: sys.main.lines.map(l => l.y), bars, staffFound: true, system: sys, gray: g,
-    threshUsed: thr, auto, quality: assessBarQuality(bars, canvas.width, viewLen), cover,
+    staffLines: sys.main.lines.map(l => l.y), bars, barInfos, staffFound: true, system: sys, gray: g, stats: res.stats,
+    threshUsed: T, auto, quality: assessBarQuality(bars, canvas.width, viewLen, weak),
   };
 }
 
@@ -2603,20 +2626,20 @@ function validateCutSeams(seams, bars, det, qualityLow) {
   return seams.map(s => {
     if (!s.cut || s.dup) return { flagged: false };
     let reason = null;
+    let widthRatio = null;
+    if (med > 0 && bars.length >= 3) {
+      for (let j = 0; j < bars.length - 1; j++) {
+        if (s.pos > bars[j] + 2 && s.pos < bars[j + 1] - 2) { widthRatio = (bars[j + 1] - bars[j]) / med; break; }
+      }
+    }
     if (qualityLow) {
       // 마디 인식 품질이 낮으면 마디 폭 판정은 쓰지 않고(과검출로 정상 이음새까지 연쇄 실패하므로) 경계 연속성 점수만 본다
       if (s.weight >= 4 && s.score != null && s.score < 0.4) reason = '이음새 경계 연속성 낮음';
-    } else if (med > 0 && bars.length >= 3) {
-      for (let j = 0; j < bars.length - 1; j++) {
-        if (s.pos > bars[j] + 2 && s.pos < bars[j + 1] - 2) {
-          const w = bars[j + 1] - bars[j];
-          if (w < med * 0.4 || w > med * 2.5) reason = '이음새를 낀 마디 폭이 비정상';
-          break;
-        }
-      }
+    } else if (widthRatio != null && (widthRatio < 0.4 || widthRatio > 2.5)) {
+      reason = '이음새를 낀 마디 폭이 비정상';
     }
     if (!reason && det.system && det.gray && hasDuplicateTrace(det.gray, det.system, s.pos)) reason = '이음새 양쪽에 같은 내용이 반복됨';
-    return { flagged: !!reason, reason };
+    return { flagged: !!reason, reason, widthRatio };
   });
 }
 
@@ -4094,8 +4117,19 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
   // 컷 이음새 자동 검증 — 이음새를 낀 마디 폭, 양쪽 내용 중복 흔적. 통과 못 한 이음새만 저신뢰.
   const seamChecks = useMemo(() => validateCutSeams(layout.seams, bars, detection, quality.low), [layout.seams, bars, detection, quality.low]);
   const seamsV = layout.seams.map((s, i) => ({ ...s, flagged: !!(seamChecks[i] && seamChecks[i].flagged), reason: seamChecks[i] && seamChecks[i].reason }));
-  const flaggedSeams = seamsV.filter(s => s.flagged);
-  const curSeam = flaggedSeams.length ? (flaggedSeams.find(s => s.i === seamSel) || flaggedSeams[0]) : null;
+  const seamsInfo = seamsV.map((s, i) => ({
+    ...s, widthRatio: seamChecks[i] ? seamChecks[i].widthRatio : null,
+    needsFix: s.flagged || (!s.cut && !s.dup && s.score != null && s.score < 0.7),
+  }));
+  const fixSeams = seamsInfo.filter(s => s.needsFix); // 수정 후 검증을 다시 통과하면 자동으로 목록·깃발에서 빠진다
+  const curSeam = fixSeams.length ? (fixSeams.find(s => s.i === seamSel) || fixSeams[0]) : null;
+  const overlayScale = Math.min(1, 150 / stitchedCanvas.height, 12000 / stitchedCanvas.width);
+  const stripW = Math.max(1, Math.round(stitchedCanvas.width * overlayScale));
+  const stripH = Math.max(1, Math.round(stitchedCanvas.height * overlayScale));
+  const stripScrollRef = useRef(null);
+  const zoomBlockRef = useRef(null);
+  const CIRCLED = ['①','②','③','④','⑤','⑥','⑦','⑧','⑨','⑩','⑪','⑫','⑬','⑭','⑮','⑯','⑰','⑱','⑲','⑳'];
+  const circled = n => CIRCLED[n - 1] || ('(' + n + ')');
 
   const groupsBase = groups.map(g => {
     const confidence = groupConfidence(seamsV, g.startX, g.endX);
@@ -4122,7 +4156,7 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
     const cv = overlayRef.current;
     if (!cv || !showOverlay) return;
     const h0 = stitchedCanvas.height, w0 = stitchedCanvas.width;
-    const scale = Math.min(1, 150 / h0, 12000 / w0);
+    const scale = overlayScale;
     cv.width = Math.max(1, Math.round(w0 * scale)); cv.height = Math.max(1, Math.round(h0 * scale));
     const ctx = cv.getContext('2d');
     ctx.drawImage(stitchedCanvas, 0, 0, cv.width, cv.height);
@@ -4136,14 +4170,18 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
         }
       }
     }
-    ctx.strokeStyle = 'rgba(230,30,30,0.9)';
-    for (const b of bars) { ctx.beginPath(); ctx.moveTo(b * scale + 0.5, 0); ctx.lineTo(b * scale + 0.5, cv.height); ctx.stroke(); }
+    // 마디선: 모든 단 통과 = 빨강, 단 사이 간격 구간까지 연속 = 진한 빨강, 시작/끝 경계 = 연한 빨강
+    bars.forEach((b, i) => {
+      const info = detection.barInfos && detection.barInfos[i];
+      ctx.strokeStyle = !info || info.kind !== 'bar' ? 'rgba(255,120,120,0.6)' : (info.gapConn ? 'rgb(140,0,0)' : 'rgba(230,30,30,0.9)');
+      ctx.beginPath(); ctx.moveTo(b * scale + 0.5, 0); ctx.lineTo(b * scale + 0.5, cv.height); ctx.stroke();
+    });
     ctx.strokeStyle = 'rgba(0,160,0,0.9)';
     for (const s of layout.seams) {
       if (s.dup) continue;
       ctx.beginPath(); ctx.moveTo(s.pos * scale + 0.5, 0); ctx.lineTo(s.pos * scale + 0.5, cv.height); ctx.stroke();
     }
-  }, [stitchedCanvas, detection, bars, layout.seams, showOverlay]);
+  }, [stitchedCanvas, detection, bars, layout.seams, showOverlay, overlayScale]);
 
   function applyOverride(key, dataUrl) {
     setOverrides(prev => ({ ...prev, [key]: dataUrl }));
@@ -4164,6 +4202,14 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
     setOverrides({}); // 그룹 경계가 바뀌므로 로컬 업로드로 대체한 그룹 이미지는 초기화
     setOverrideOpenKey(null);
     setSeamSel(null);
+  }
+
+  function selectSeam(i) {
+    setSeamSel(i);
+    const sm = layout.seams.find(x => x.i === i);
+    const el = stripScrollRef.current;
+    if (sm && el) el.scrollTo({ left: Math.max(0, sm.pos * overlayScale - el.clientWidth / 2), behavior: 'smooth' });
+    if (zoomBlockRef.current) zoomBlockRef.current.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 
   function nudgeSeam(d) {
@@ -4258,7 +4304,11 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
           {staffFound && (' · 보표 간 연결 점수: ' + (detection.system.connScores.length
             ? detection.system.connScores.map(c => c.toFixed(2)).join(', ')
             : (detection.system.splitScores.length ? ('연결 획 없음 → 분리됨 (' + detection.system.splitScores.map(c => c.toFixed(2)).join(', ') + ')') : '단일 보표')))}
-          {staffFound && quality.low && (
+          {staffFound && detection.stats && (
+            <span><br />마디선 검출: 후보 {detection.stats.cand} → 단별 통과 {detection.stats.allStaff} → 헤더제외 후 {detection.stats.afterHeader} → 정리 후 {detection.stats.afterPrune} (사용 T={detection.threshUsed.toFixed(2)}{detection.auto ? ' 자동' : ' 수동'})</span>
+          )}
+          {staffFound && quality.weak && <b style={{ color: '#c0392b' }}> · 마디선 인식 약함 — 폭 기준 그룹화로 자동 전환</b>}
+          {staffFound && quality.low && !quality.weak && (
             <b style={{ color: '#c0392b' }}> · 마디 인식 신뢰도 낮음
               ({quality.measureCount < 1 ? '마디선 없음' : ('폭 정상 비율 ' + Math.round(quality.widthOk * 100) + '%' + (quality.perView != null ? ', ROI 폭당 ' + quality.perView.toFixed(1) + '마디' : ''))})
               {!effectiveFallback && !useBarGroups && ' — 폭 기준 분할로 자동 전환됨'}
@@ -4276,12 +4326,56 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
             setTimeout(() => URL.revokeObjectURL(a.href), 1000);
           }, 'image/png')}>스티치 원본 PNG 다운로드 (디버그)</button>
         </div>
+        {fixSeams.length > 0 ? (
+          <div className="toolbar">
+            <b style={{ color: '#e07000' }}>수정 필요 이음매 {fixSeams.length}개:</b>
+            {fixSeams.map((s, n) => (
+              <button key={s.i} className="icon-btn" title={s.reason || ('NCC ' + (s.score != null ? s.score.toFixed(2) : '-'))}
+                style={{ color: '#e07000', borderColor: '#e07000', fontWeight: 700, background: curSeam && curSeam.i === s.i ? '#fff1de' : undefined }}
+                onClick={() => selectSeam(s.i)}>{circled(n + 1)}</button>
+            ))}
+          </div>
+        ) : (seamsInfo.some(s => !s.dup) && <p className="hint-text" style={{ margin: '4px 0', color: '#1e7d3c' }}>수정 필요한 이음매 없음 (모든 이음매가 검증 통과)</p>)}
         {showOverlay && (
-          <div style={{ overflowX: 'auto', border: '1px solid var(--border-strong)', background: '#fff' }}>
-            <canvas ref={overlayRef} />
+          <div ref={stripScrollRef} style={{ overflowX: 'auto', border: '1px solid var(--border-strong)', background: '#fff' }}>
+            <div style={{ position: 'relative', width: stripW, paddingTop: 22 }}>
+              <canvas ref={overlayRef} style={{ display: 'block' }} />
+              {fixSeams.map((s, n) => {
+                const sel = curSeam && curSeam.i === s.i;
+                return (
+                  <React.Fragment key={s.i}>
+                    <div style={{ position: 'absolute', left: s.pos * overlayScale - (sel ? 2 : 1), top: 22, width: sel ? 4 : 2, height: stripH, background: 'rgba(240,128,0,0.9)', pointerEvents: 'none' }} />
+                    <button onClick={() => selectSeam(s.i)} title={s.reason || 'NCC 낮음'}
+                      style={{ position: 'absolute', left: s.pos * overlayScale, top: 0, transform: 'translateX(-50%)', fontSize: sel ? 18 : 12, fontWeight: 700, color: '#fff', background: '#f08000', border: 'none', borderRadius: 4, padding: '0 5px', lineHeight: '20px', cursor: 'pointer', whiteSpace: 'nowrap' }}>
+                      ▼{n + 1}
+                    </button>
+                  </React.Fragment>
+                );
+              })}
+            </div>
           </div>
         )}
-        {showOverlay && <p className="hint-text" style={{ margin: '4px 0' }}>파랑 = 사용된 시스템의 각 보표 밴드(회색 = 다른 시스템) · 빨강 = 검출된 마디선 · 초록 = 이음새 위치 (화면 표시용, 내보내는 이미지에는 포함되지 않음)</p>}
+        <details open={fixSeams.length > 0}>
+          <summary className="slider-label" style={{ cursor: 'pointer' }}>이음매 점수 목록 ({seamsInfo.length}개, 정상 포함 — 실패 기준을 같이 표시)</summary>
+          <div style={{ fontSize: '12px' }}>
+            {seamsInfo.map(s => {
+              let scoreText, criterion;
+              if (s.dup) { scoreText = '중복 타일(제외됨)'; criterion = '-'; }
+              else if (s.cut) {
+                scoreText = (s.score == null || !(s.weight >= 4)) ? ('연속도 판단 보류 (가중 ' + (s.weight || 0) + ')') : ('연속도 ' + s.score.toFixed(2) + ' (가중 ' + s.weight + ')');
+                criterion = (quality.low ? '실패 기준: 연속도 < 0.40 (가중 ≥ 4) 또는 내용 중복' : '실패 기준: 낀 마디 폭이 중앙값의 0.4~2.5배 밖 또는 내용 중복')
+                  + (s.widthRatio != null ? ' · 마디 폭 비 ' + s.widthRatio.toFixed(2) : '');
+              } else { scoreText = 'NCC ' + (s.score != null ? s.score.toFixed(2) : '-'); criterion = '실패 기준: NCC < 0.70'; }
+              return (
+                <div key={s.i} onClick={() => !s.dup && selectSeam(s.i)}
+                  style={{ padding: '2px 4px', cursor: s.dup ? 'default' : 'pointer', color: s.needsFix ? '#c05000' : undefined, fontWeight: s.needsFix ? 700 : 400 }}>
+                  #{s.i + 1} · {s.cut ? '컷' : 'NCC'} · x={Math.round(s.pos)}px · {scoreText} · {criterion} · {s.dup ? '제외' : (s.needsFix ? ('수정 필요' + (s.reason ? ' (' + s.reason + ')' : '')) : '정상')}
+                </div>
+              );
+            })}
+          </div>
+        </details>
+        {showOverlay && <p className="hint-text" style={{ margin: '4px 0' }}>파랑 = 사용된 시스템의 각 보표 밴드(회색 = 다른 시스템) · 빨강 = 모든 단 통과 마디선 / 진한 빨강 = 단 사이 간격까지 연속 · 초록 = 이음새 위치 · 주황 깃발 = 수정 필요 이음새 (화면 표시용, 내보내는 이미지에는 포함되지 않음)</p>}
 
         <div className="hr" />
         <div className="toolbar">
@@ -4300,16 +4394,16 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
         </div>
       </div>
 
-      {flaggedSeams.length > 0 && curSeam && (
-        <div className="block" style={{ borderColor: '#c0392b' }}>
-          <div className="block-head"><span>이음새 미세 조정 — 자동 검증에 실패한 이음새 {flaggedSeams.length}개</span></div>
+      {fixSeams.length > 0 && curSeam && (
+        <div className="block" style={{ borderColor: '#c0392b' }} ref={zoomBlockRef}>
+          <div className="block-head"><span>이음새 미세 조정 — 수정 필요 이음새 {fixSeams.length}개</span></div>
           <p className="hint-text">
-            선택한 이음새: {curSeam.reason}. 아래 확대 미리보기를 클릭한 뒤 ←/→ 키(1px, Shift+키는 10px) 또는 버튼으로 오른쪽 타일의 위치를 맞추세요. 초록선이 현재 이음새입니다.
+            선택한 이음새 {circled(fixSeams.findIndex(s => s.i === curSeam.i) + 1)}: {curSeam.reason || ('NCC ' + (curSeam.score != null ? curSeam.score.toFixed(2) : '-') + ' (기준 0.70 미만)')}. 아래 확대 미리보기를 클릭한 뒤 ←/→ 키(1px, Shift+키는 10px) 또는 버튼으로 오른쪽 타일의 위치를 맞추세요. 초록선이 현재 이음새입니다.
           </p>
           <div className="toolbar">
-            {flaggedSeams.map(s => (
+            {fixSeams.map((s, n) => (
               <button key={s.i} className="icon-btn" style={s.i === curSeam.i ? { borderColor: 'var(--accent)', color: 'var(--accent)' } : undefined}
-                onClick={() => setSeamSel(s.i)}>이음새 {s.i + 1}</button>
+                onClick={() => selectSeam(s.i)}>{circled(n + 1)} 이음새 {s.i + 1}</button>
             ))}
           </div>
           <div tabIndex={0} onKeyDown={onSeamKey} style={{ outline: 'none' }}>
