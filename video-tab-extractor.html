@@ -910,7 +910,9 @@ function waitForFramePresented(video) {
   });
 }
 
+let seekCounter = 0; // 스크롤 모드 단계별 계측용 (seek 횟수)
 function seekTo(video, t) {
+  seekCounter++;
   return new Promise(resolve => {
     const onSeeked = () => {
       video.removeEventListener('seeked', onSeeked);
@@ -2824,7 +2826,7 @@ function flagOutlierBursts(bursts, times) {
 // 탐색 범위를 제한하기 위해 첫 패스가 끝난 뒤에 호출한다.
 async function runScrollStage3(repFrames, scrollDefaults, directionPref, refineHook) {
   // 1) 전처리 — 반드시 원본 해상도에서 먼저 (다운스케일은 스티칭 탐색(scrollGetGray)에서만)
-  for (const f of repFrames) scrollApplyPreprocInPlace(f.canvas, scrollDefaults);
+  for (const f of repFrames) { f.orig = cloneCanvas(f.canvas); scrollApplyPreprocInPlace(f.canvas, scrollDefaults); } // orig: 디버그 내보내기용 전처리 전 원본
 
   // 2) 방향 자동 감지 (첫 프레임 쌍 기준, 이후 동일 방향 유지) + 스티칭
   let direction = directionPref;
@@ -2864,14 +2866,14 @@ async function runScrollStage3(repFrames, scrollDefaults, directionPref, refineH
 
   const first = repFrames[0].canvas;
   const fullLen = direction === 'vertical' ? first.height : first.width;
-  const frames = [newScrollFrame({ canvas: first, t: repFrames[0].time, srcX: 0, len: fullLen, score: null, ok: true })];
+  const frames = [newScrollFrame({ canvas: first, orig: repFrames[0].orig, t: repFrames[0].time, srcX: 0, len: fullLen, score: null, ok: true })];
   for (let i = 0; i < seamDecisions.length; i++) {
     const d = seamDecisions[i];
     const bCanvas = repFrames[i + 1].canvas;
     const bLen = direction === 'vertical' ? bCanvas.height : bCanvas.width;
     const len = Math.min(bLen, Math.max(1, d.shift));
     frames.push(newScrollFrame({
-      canvas: bCanvas, t: repFrames[i + 1].time,
+      canvas: bCanvas, orig: repFrames[i + 1].orig, t: repFrames[i + 1].time,
       srcX: d.dup ? 0 : bLen - len, len: d.dup ? 0 : len,
       dup: d.dup, score: d.score, ok: d.ok, shift: d.shift,
     }));
@@ -2884,14 +2886,65 @@ async function runScrollStage3(repFrames, scrollDefaults, directionPref, refineH
 // 대신: 정지 구간(타일)마다 1장 → 오선이 실제로 그려진 구간만 트리밍 → 이동량 0으로 맞대어 붙이되
 // 이음새를 가로지르는 잉크(줄기·빔·음표머리)의 연속성으로 미세 오프셋 δ를 고른다. (가로 방향 전용)
 
+function downloadBlobFile(blob, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+function downloadCanvasPng(canvas, name) {
+  return new Promise(res => canvas.toBlob(b => { downloadBlobFile(b, name); res(); }, 'image/png'));
+}
+
+// ---- 단계별 소요 시간 계측 (결과 화면의 접기 영역에 표시) ----
+let captureCounter = 0, cacheHitCounter = 0;
+const scrollProf = { stages: {}, diff: null };
+async function profRun(name, fn) {
+  const t0 = performance.now(), k0 = seekCounter, c0 = captureCounter, h0 = cacheHitCounter;
+  try {
+    return await fn();
+  } finally {
+    const r = scrollProf.stages[name] || (scrollProf.stages[name] = { sec: 0, seeks: 0, captures: 0, hits: 0 });
+    r.sec += (performance.now() - t0) / 1000;
+    r.seeks += seekCounter - k0; r.captures += captureCounter - c0; r.hits += cacheHitCounter - h0;
+  }
+}
+
+// ---- 영상 프레임 캡처 캐시: 키 = 영상 + ROI + 시각(1/30초 반올림). 최근 60장 LRU(+메모리 상한). 캐시에는 원본
+// (전처리 전) 캡처를 두고, 호출자가 제자리에서 전처리해도 캐시가 오염되지 않도록 항상 복사본을 돌려준다.
+const frameCache = new Map();
+let frameCacheBytes = 0;
+const FRAME_CACHE_MAX = 60, FRAME_CACHE_MAX_BYTES = 400 * 1024 * 1024;
+function cloneCanvas(c) {
+  const o = document.createElement('canvas');
+  o.width = c.width; o.height = c.height;
+  o.getContext('2d').drawImage(c, 0, 0);
+  return o;
+}
 async function captureRepCanvas(video, roi, t) {
-  await seekTo(video, t);
-  const captured = captureRoiNative(video, roi);
-  const img = await loadImage(captured.dataUrl);
+  const roiKey = roi ? [roi.x0, roi.y0, roi.x1, roi.y1].map(v => v.toFixed(4)).join(',') : 'full';
+  const key = (video.currentSrc || '') + '|' + roiKey + '|' + Math.round(t * 30);
+  const hit = frameCache.get(key);
+  if (hit) {
+    frameCache.delete(key); frameCache.set(key, hit); // LRU 갱신
+    cacheHitCounter++;
+    return cloneCanvas(hit);
+  }
+  await seekTo(video, t); // waitForFramePresented를 포함한 기존 seek 대기 유지
+  const { rx0, ry0, rw, rh } = roiRectPx(video, roi);
   const c = document.createElement('canvas');
-  c.width = captured.w; c.height = captured.h;
-  c.getContext('2d').drawImage(img, 0, 0);
-  return c;
+  c.width = Math.max(1, Math.round(rw)); c.height = Math.max(1, Math.round(rh));
+  c.getContext('2d').drawImage(video, rx0, ry0, rw, rh, 0, 0, c.width, c.height);
+  captureCounter++;
+  frameCache.set(key, c);
+  frameCacheBytes += c.width * c.height * 4;
+  while (frameCache.size > FRAME_CACHE_MAX || (frameCacheBytes > FRAME_CACHE_MAX_BYTES && frameCache.size > 1)) {
+    const oldest = frameCache.keys().next().value;
+    const oc = frameCache.get(oldest);
+    frameCacheBytes -= oc.width * oc.height * 4;
+    frameCache.delete(oldest);
+  }
+  return cloneCanvas(c);
 }
 
 // burst 전/후 화면을 한 장이 아니라 인접 최대 3장의 픽셀별 중앙값으로 만든다(움직이는 재생 표시 제거).
@@ -3310,7 +3363,7 @@ function detectSeamDuplicate(infoA, infoB, aEnd, bStart, bEnd, mask, space, W) {
 // 이음 방식은 이음매마다 독립 결정: 겹침 확정이면 겹친 폭만큼 B 왼쪽을 잘라 이어 붙이고, 겹침 없음이면
 // butt-join(연속성 점수로 고른 공통 δ). 타일 경계 양쪽 2px는 트림해 연한 회색 세로선을 없앤다.
 async function buildCutFrames(tiles, scrollDefaults) {
-  for (const tl of tiles) scrollApplyPreprocInPlace(tl.canvas, scrollDefaults);
+  for (const tl of tiles) { tl.orig = cloneCanvas(tl.canvas); scrollApplyPreprocInPlace(tl.canvas, scrollDefaults); }
   const infos = tiles.map(tl => analyzeTileStaff(tl.canvas));
   const withSys = infos.filter(i => i.sys);
   if (!withSys.length) return null;
@@ -3350,7 +3403,7 @@ async function buildCutFrames(tiles, scrollDefaults) {
     const tl = tiles[k], inf = infos[k];
     if (dupFlags[k]) {
       if (lastReal) lastReal.t1 = tl.t1;
-      frames.push(newScrollFrame({ canvas: tl.canvas, t: tl.t, srcX: 0, len: 0, dup: true, cut: true, t0: tl.t0, t1: tl.t1, score: 1, ok: true }));
+      frames.push(newScrollFrame({ canvas: tl.canvas, orig: tl.orig, t: tl.t, srcX: 0, len: 0, dup: true, cut: true, t0: tl.t0, t1: tl.t1, score: 1, ok: true }));
       continue;
     }
     const first = k === keep[0];
@@ -3373,7 +3426,7 @@ async function buildCutFrames(tiles, scrollDefaults) {
     }
     srcX = Math.min(srcX, Math.max(0, e));
     const f = newScrollFrame({
-      canvas: tl.canvas, t: tl.t, srcX, len: Math.max(1, e - srcX + 1), cut: true, t0: tl.t0, t1: tl.t1,
+      canvas: tl.canvas, orig: tl.orig, t: tl.t, srcX, len: Math.max(1, e - srcX + 1), cut: true, t0: tl.t0, t1: tl.t1,
       score, ok: true, weight, delta, ovl,
     });
     frames.push(f);
@@ -3412,16 +3465,18 @@ async function extractCutResult({ video, roi, times, bursts, scrollDefaults, log
   log('컷 전환(타일링) 처리 — 정지 구간별로 대표 프레임을 추출합니다...');
   const defs = buildCutTileDefs(times, bursts);
   const tiles = [];
-  for (let k = 0; k < defs.length; k++) {
-    // 정지 구간 안 서로 다른 시각 3~7장의 픽셀별 중앙값 — 움직이는 재생 표시(색·모양 무관)가 사라진다
-    const idxs = pickMedianIndices(defs[k].startIdx, defs[k].endIdx);
-    const caps = [];
-    for (const ix of idxs) caps.push(await captureRepCanvas(video, roi, times[ix]));
-    const c = caps.length > 1 ? medianOfCanvases(caps) : caps[0];
-    tiles.push({ canvas: c, t: defs[k].time, t0: defs[k].t0, t1: defs[k].t1 });
-    log('타일 추출 중... ' + (k + 1) + '/' + defs.length);
-  }
-  const built = await buildCutFrames(tiles, scrollDefaults);
+  await profRun('캡처', async () => {
+    for (let k = 0; k < defs.length; k++) {
+      // 정지 구간 안 서로 다른 시각 3~7장의 픽셀별 중앙값 — 움직이는 재생 표시(색·모양 무관)가 사라진다
+      const idxs = pickMedianIndices(defs[k].startIdx, defs[k].endIdx);
+      const caps = [];
+      for (const ix of idxs) caps.push(await captureRepCanvas(video, roi, times[ix]));
+      const c = caps.length > 1 ? medianOfCanvases(caps) : caps[0];
+      tiles.push({ canvas: c, t: defs[k].time, t0: defs[k].t0, t1: defs[k].t1 });
+      log('타일 추출 중... ' + (k + 1) + '/' + defs.length);
+    }
+  });
+  const built = await profRun('이음', () => buildCutFrames(tiles, scrollDefaults));
   if (!built || !built.frames.length) return null;
   return {
     mode: 'cut', direction: 'horizontal', directionNcc: null, rawFrames: built.frames,
@@ -3435,11 +3490,13 @@ async function extractSmoothResult({ video, roi, times, bursts, scrollDefaults, 
   const repIdx = scrollRepIndices(times, bursts);
   log('대표 프레임 ' + repIdx.length + '장 추출 중...');
   const repFrames = [];
-  for (let k = 0; k < repIdx.length; k++) {
-    const t = times[repIdx[k]];
-    repFrames.push({ time: t, canvas: await captureRepCanvas(video, roi, t) });
-    log('대표 프레임 추출 중... ' + (k + 1) + '/' + repIdx.length);
-  }
+  await profRun('캡처', async () => {
+    for (let k = 0; k < repIdx.length; k++) {
+      const t = times[repIdx[k]];
+      repFrames.push({ time: t, canvas: await captureRepCanvas(video, roi, t) });
+      log('대표 프레임 추출 중... ' + (k + 1) + '/' + repIdx.length);
+    }
+  });
 
   // 저신뢰 seam 재정합(부드러운 스크롤 한정): 해당 burst를 1/20초 간격으로 촘촘히 샘플링해 연속 프레임끼리
   // NCC 정합 후 오프셋을 누적. 탐색 범위는 신뢰 높은 이웃 seam 중앙값 ±30%.
@@ -3473,7 +3530,7 @@ async function extractSmoothResult({ video, roi, times, bursts, scrollDefaults, 
   };
 
   log('전처리 · 이어붙이기 진행 중...');
-  const stage3 = await runScrollStage3(repFrames, scrollDefaults, direction, refineHook);
+  const stage3 = await profRun('이음', () => runScrollStage3(repFrames, scrollDefaults, direction, refineHook));
   const frameLen = stage3.direction === 'vertical' ? repFrames[0].canvas.height : repFrames[0].canvas.width;
   return {
     mode: 'smooth', direction: stage3.direction, directionNcc: stage3.directionNcc, rawFrames: stage3.frames,
@@ -3540,7 +3597,7 @@ async function extractAndStitch({ video, roi, times, bursts, scrollDefaults, dir
     return smoothFallback('사용자 지정 컷 전환을 적용할 수 없어(세로 스크롤이거나 오선 미검출) 부드러운 스크롤(NCC)로 대체');
   }
 
-  const cls = await classifyCutBursts(video, roi, times, bursts, scrollDefaults, direction);
+  const cls = await profRun('분류', () => classifyCutBursts(video, roi, times, bursts, scrollDefaults, direction));
   const pct = Math.round(cls.ratio * 100);
   const stat = '컷 burst ' + cls.cutCount + '/' + bursts.length + '개(' + pct + '%)' + (cls.multi ? ', 다중 샘플 burst ' + cls.multi + '개' : '');
   if (cls.kind === 'smooth') {
@@ -3570,6 +3627,8 @@ async function extractAndStitch({ video, roi, times, bursts, scrollDefaults, dir
 // 추출 + 재생 표시 추적까지의 전체 파이프라인 (최초 실행과 "이 유형으로 다시 만들기"가 공유)
 async function buildScrollResult({ video, roi, times, bursts, scrollDefaults, direction, transition, log }) {
   log = log || (() => {});
+  scrollProf.stages = {};
+  const tAll = performance.now();
   const ex = await extractAndStitch({ video, roi, times, bursts, scrollDefaults, direction, transition, log });
   const lay = renderFrames(ex.rawFrames, ex.direction);
   // 마디별 정밀 시간 동기화 — 실패해도(표시 없음/신뢰도 부족) 결과 화면이 조각 모델 폴백을 쓴다.
@@ -3577,15 +3636,19 @@ async function buildScrollResult({ video, roi, times, bursts, scrollDefaults, di
   let markerData = null;
   try {
     let cnt = 0;
-    const { rawPoints } = await detectPlaybackMarker({
+    const { rawPoints } = await profRun('재생표시', () => detectPlaybackMarker({
       video, roi, direction: ex.direction, segments: ex.segments, frames: lay.placed, frameLen: ex.frameLen,
       onProgress: () => { cnt++; if (cnt % 5 === 0) log('재생 위치 표시 추적 중... (' + cnt + '개 샘플)'); },
-    });
+    }));
     markerData = { rawPoints, ...validateMarkerTrack(markerPointsToGlobal(rawPoints, lay.placed)) };
   } catch (err) {
     markerData = null;
   }
-  return { ex, markerData };
+  const profile = {
+    stages: JSON.parse(JSON.stringify(scrollProf.stages)), diff: scrollProf.diff ? { ...scrollProf.diff } : null,
+    pipelineSec: (performance.now() - tAll) / 1000, videoDuration: video.duration || 0,
+  };
+  return { ex, markerData, profile };
 }
 
 // ---- 그룹 수동 오버라이드용 "구간 재스캔(미니 스티칭)" — 위 파이프라인(diff 샘플링 → burst 탐지 →
@@ -3963,6 +4026,7 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
     // 실제로는 안 바뀐 프레임에서도 리렌더가 도는 게 체감 속도 저하의 큰 부분이었다. 표시되는
     // 정수 %가 실제로 바뀔 때만 갱신해서 리렌더 횟수를 총 진행 스텝 수(수백 번일 수 있음)에서
     // 100번 이하로 줄인다.
+    const profT0 = performance.now(), profK0 = seekCounter;
     try {
       let t = rangeS, idx = 0;
       while (t < rangeE) {
@@ -3977,6 +4041,7 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
         if (idx % 10 === 0) log('분석 중... ' + t.toFixed(1) + 's / ' + rangeE.toFixed(1) + 's');
         t += step;
       }
+      scrollProf.diff = { sec: (performance.now() - profT0) / 1000, seeks: seekCounter - profK0, captures: times.length, hits: 0 };
       setAnalyzeProgress(100);
       setAnalysis({ times, diffs });
       const maxObserved = Math.max(...diffs, 0.1);
@@ -4001,11 +4066,11 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
     try {
       const { times } = analysis;
       const video = videoRef.current;
-      const { ex, markerData } = await buildScrollResult({ video, roi, times, bursts, scrollDefaults, direction, transition, log });
+      const { ex, markerData, profile } = await buildScrollResult({ video, roi, times, bursts, scrollDefaults, direction, transition, log });
       onDone({
         videoFile, roi, direction: ex.direction, directionNcc: ex.directionNcc, mode: ex.mode,
         rawFrames: ex.rawFrames, frameLen: ex.frameLen, bursts: flagOutlierBursts(bursts, times), markerData, notes: ex.notes,
-        typeInfo: ex.typeInfo, times, rawBursts: bursts, directionPref: direction, transition,
+        typeInfo: ex.typeInfo, times, rawBursts: bursts, directionPref: direction, transition, profile,
       });
     } catch (err) {
       log('처리 중 오류: ' + err.message);
@@ -4573,8 +4638,10 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
   const [built, setBuilt] = useState({
     direction: scrollCapture.direction, directionNcc: scrollCapture.directionNcc, mode: scrollCapture.mode,
     frameLen: scrollCapture.frameLen, notes: scrollCapture.notes, typeInfo: scrollCapture.typeInfo, markerRaw: scrollCapture.markerData,
+    profile: scrollCapture.profile,
   });
-  const { direction, directionNcc, mode, frameLen, notes, typeInfo, markerRaw } = built;
+  const { direction, directionNcc, mode, frameLen, notes, typeInfo, markerRaw, profile } = built;
+  const barsProfRef = useRef(0), groupProfRef = useRef(0);
   const [typeChoice, setTypeChoice] = useState(scrollCapture.transition || 'auto');
   const [rebuilding, setRebuilding] = useState(false);
   const [rebuildMsg, setRebuildMsg] = useState('');
@@ -4620,7 +4687,12 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
   }, [staffThreshInput, barThreshInput]);
 
   const detection = useMemo(
-    () => detectStaffAndBars(stitchedCanvas, staffThresh, barAuto ? null : barThresh, frameLen, direction === 'vertical' ? null : placed),
+    () => {
+      const tb = performance.now();
+      const r = detectStaffAndBars(stitchedCanvas, staffThresh, barAuto ? null : barThresh, frameLen, direction === 'vertical' ? null : placed);
+      barsProfRef.current = (performance.now() - tb) / 1000;
+      return r;
+    },
     [stitchedCanvas, staffThresh, barThresh, barAuto, frameLen, placed, direction]
   );
   const bars = detection.bars;
@@ -4645,11 +4717,13 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
 
   const useBarGroups = !effectiveFallback && bars.length >= 2 && (groupBasis === 'bar' || (groupBasis === 'auto' && !quality.low));
 
+  const tg = performance.now();
   let groups;
   if (effectiveFallback) groups = [{ startIdx: 0, endIdx: measureCount, startX: 0, endX: stitchAxisLen, count: measureCount || null, whole: true }];
   else if (useBarGroups) groups = groupBarsByTargetWidth(bars, groupSize, maxBarsPerGroup);
   else groups = groupByWidth(stitchAxisLen, groupSize, maxBarsPerGroup, measureW, frameLen, bars, blank, detection.system ? detection.system.space : 8);
 
+  groupProfRef.current = (performance.now() - tg) / 1000;
   // 컷 이음새 자동 검증 — 이음새를 낀 마디 폭, 양쪽 내용 중복 흔적. 통과 못 한 이음새만 저신뢰.
   const seamChecks = useMemo(() => validateCutSeams(layout.seams, bars, detection, quality.low), [layout.seams, bars, detection, quality.low]);
   const seamsV = layout.seams.map((s, i) => ({
@@ -4751,6 +4825,48 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
     if (zoomBlockRef.current) zoomBlockRef.current.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 
+  // 이음매 디버그 내보내기 — 앞 타일 A / 뒤 타일 B의 전처리 전·후 원본 해상도 PNG 4개 + 탐지 후보·파라미터 JSON 1개
+  async function exportSeamDebug(seam) {
+    const B = placed[seam.i + 1];
+    if (!B) return;
+    let ai = seam.i;
+    while (ai > 0 && placed[ai].dup) ai--;
+    const A = placed[ai];
+    const n = seam.i + 1;
+    const infoA = tileInfoOf(A.canvas), infoB = tileInfoOf(B.canvas);
+    const sysRef = infoA.sys || infoB.sys;
+    const space = sysRef ? sysRef.space : null;
+    const frameMeta = (f, inf) => ({
+      t: f.t, t0: f.t0 != null ? f.t0 : null, t1: f.t1 != null ? f.t1 : null,
+      srcX: f.srcX, len: f.len, dup: !!f.dup, start: f.start,
+      staff: { xL: inf.xL, xR: inf.xR, touchL: inf.touchL, touchR: inf.touchR, space: inf.sys ? inf.sys.space : null },
+    });
+    const meta = {
+      seam: n, type: seam.cut ? 'cut' : 'smooth', posX: seam.pos,
+      roiFraction: roi || null, roiSizePx: { w: A.canvas.width, h: A.canvas.height },
+      videoDuration: videoRef.current ? videoRef.current.duration : null,
+      params: {
+        staffSpace: space, levels: space ? overlapLevels(space) : null, trimPx: 2,
+        commonDelta: notes ? notes.commonDelta : null,
+      },
+      tileA: frameMeta(A, infoA), tileB: frameMeta(B, infoB),
+      result: {
+        score: seam.score, weight: seam.weight, delta: seam.delta,
+        overlapKind: B.ovl ? B.ovl.kind : null, overlapPx: B.ovl ? B.ovl.px : null, overlapIou: B.ovl ? B.ovl.iou : null,
+        why: B.ovl ? B.ovl.why || null : null,
+        dupSuspect: !!B.dupSuspect, dupFixedPx: B.dupFixed || 0,
+      },
+      candidates: (B.ovl && B.ovl.cands) ? B.ovl.cands.map(c => ({ shift: c.s, iou: c.iou, ink: c.ink, source: c.src, weakInk: !!c.weak })) : [],
+    };
+    const pause = ms => new Promise(r => setTimeout(r, ms));
+    const files = [
+      ['seam' + n + '_A_original.png', A.orig || A.canvas], ['seam' + n + '_A_processed.png', A.canvas],
+      ['seam' + n + '_B_original.png', B.orig || B.canvas], ['seam' + n + '_B_processed.png', B.canvas],
+    ];
+    for (const [name, cv] of files) { await downloadCanvasPng(cv, name); await pause(250); }
+    downloadBlobFile(new Blob([JSON.stringify(meta, null, 2)], { type: 'application/json' }), 'seam' + n + '_debug.json');
+  }
+
   async function rebuildWithType(type) {
     const video = videoRef.current;
     if (!video) return;
@@ -4764,7 +4880,7 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
       setRawFrames(r.ex.rawFrames);
       setBuilt({
         direction: r.ex.direction, directionNcc: r.ex.directionNcc, mode: r.ex.mode, frameLen: r.ex.frameLen,
-        notes: r.ex.notes, typeInfo: r.ex.typeInfo, markerRaw: r.markerData,
+        notes: r.ex.notes, typeInfo: r.ex.typeInfo, markerRaw: r.markerData, profile: r.profile,
       });
       setOverrides({}); setOverrideOpenKey(null); setSeamSel(null); setWholeImageFallback(null);
       setRebuildMsg('');
@@ -4844,6 +4960,31 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
           <button className="icon-btn" onClick={() => rebuildWithType(typeChoice)} disabled={rebuilding}>{rebuilding ? '다시 만드는 중...' : '이 유형으로 다시 만들기'}</button>
           {rebuildMsg && <span className="save-msg">{rebuildMsg}</span>}
         </div>
+        {profile && (() => {
+          const st = profile.stages || {};
+          const barsSec = barsProfRef.current, grpSec = groupProfRef.current;
+          const pipeKeys = ['분류', '캡처', '이음', '재생표시'];
+          const pipeSum = pipeKeys.reduce((a, k) => a + (st[k] ? st[k].sec : 0), 0);
+          const other = Math.max(0, profile.pipelineSec - pipeSum) + grpSec;
+          const total = (profile.diff ? profile.diff.sec : 0) + profile.pipelineSec + barsSec + grpSec;
+          const rows = [
+            ['diff 스캔', profile.diff], ['burst 분류', st['분류']], ['타일 대표 프레임 캡처', st['캡처']],
+            ['타일 이음(겹침 탐지 포함)', st['이음']], ['재생 표시 추적', st['재생표시']],
+            ['마디선 검출', { sec: barsSec, seeks: 0, captures: 0, hits: 0 }], ['그룹화·기타', { sec: other, seeks: 0, captures: 0, hits: 0 }],
+          ];
+          return (
+            <details>
+              <summary className="slider-label" style={{ cursor: 'pointer' }}>
+                단계별 소요 시간 — 총 {total.toFixed(1)}초{profile.videoDuration ? ' (영상 ' + profile.videoDuration.toFixed(1) + '초 대비 ' + (total / profile.videoDuration).toFixed(2) + '배)' : ''}
+              </summary>
+              <div style={{ fontSize: '12px' }}>
+                {rows.map(([name, r]) => (
+                  <div key={name}>{name}: {r ? r.sec.toFixed(2) : '0.00'}초 · seek {r ? r.seeks : 0}회 · 캡처 {r ? r.captures : 0}회{r && r.hits ? ' (캐시 재사용 ' + r.hits + '회)' : ''}</div>
+                ))}
+              </div>
+            </details>
+          );
+        })()}
         {seamsInfo.some(x => x.cut && !x.dup) && (
           <p className="hint-text" style={{ margin: '4px 0' }}>
             겹침 확정 {seamsInfo.filter(x => x.cut && !x.dup && x.ovl && x.ovl.kind === 'overlap').length} / 없음 {seamsInfo.filter(x => x.cut && !x.dup && x.ovl && x.ovl.kind === 'none').length} / 판단 불가 {seamsInfo.filter(x => x.cut && !x.dup && x.ovl && x.ovl.kind === 'unverifiable').length}
@@ -4959,6 +5100,7 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
                 <div key={s.i} onClick={() => !s.dup && selectSeam(s.i)}
                   style={{ padding: '2px 4px', cursor: s.dup ? 'default' : 'pointer', color: s.needsFix ? '#c05000' : undefined, fontWeight: s.needsFix ? 700 : 400 }}>
                   #{s.i + 1} · {s.cut ? '컷' : 'NCC'} · x={Math.round(s.pos)}px · {scoreText} · {criterion} · {s.dup ? '제외' : (s.needsFix ? ('수정 필요' + (s.reason ? ' (' + s.reason + ')' : '')) : '정상')}
+                  {!s.dup && <button className="icon-btn" style={{ marginLeft: '8px', fontSize: '11px' }} onClick={e => { e.stopPropagation(); exportSeamDebug(s); }}>디버그 내보내기</button>}
                 </div>
               );
             })}
