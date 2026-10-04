@@ -2023,8 +2023,166 @@ const SCROLL_DEFAULTS_INIT = {
 // drawProcessed와 동일한 순서(재생 커서 제거 → 배경 threshold[+자동 반전 판단] → 잡티 제거)로,
 // 이미 원본 해상도로 캡처된 canvas에 "크롭 없이 제자리에서" 적용한다 — 대표 프레임은 스티칭 전에
 // 반드시 이 순서(원본 해상도에서 전처리 먼저, 축소는 나중)를 지켜야 스페클 노이즈가 생기지 않는다.
+// ---- 오선 줄 복원 (전처리) ----
+// 임계값을 적용하기 전 그레이 이미지의 행별 평균 어두움 프로파일에서, 주변 행보다 뚜렷이 어두운 행(피크)을 오선 후보로
+// 잡는다. 간격이 일정(±15%)한 5~6줄 묶음이 확인되면(4줄 + 규칙적인 위치의 옅은 피크 1줄도 인정) 그 행들은 임계값과
+// 무관하게 가로로 연속된 구간을 잉크로 복원한다 — 맨 위·맨 아래 줄이 옅어도 살아남는다.
+function detectStaffRowsFromGray(d, w, h, invert) {
+  const prof = new Float32Array(h);
+  for (let y = 0; y < h; y++) {
+    let sum = 0;
+    const base = y * w * 4;
+    for (let x = 0; x < w; x++) {
+      const i = base + x * 4;
+      const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      sum += invert ? lum : 255 - lum;
+    }
+    prof[y] = sum / (w * 255);
+  }
+  const con = new Float32Array(h);
+  for (let y = 0; y < h; y++) {
+    const vals = [];
+    for (let k = -8; k <= 8; k++) {
+      if (Math.abs(k) <= 2) continue;
+      const yy = y + k;
+      if (yy >= 0 && yy < h) vals.push(prof[yy]);
+    }
+    vals.sort((p, q) => p - q);
+    con[y] = prof[y] - (vals.length ? vals[vals.length >> 1] : 0);
+  }
+  const cluster = thr => {
+    const out = [];
+    let cur = null;
+    for (let y = 0; y < h; y++) {
+      if (con[y] >= thr) {
+        if (cur && y - cur.y1 <= 1) { cur.y1 = y; if (con[y] > cur.peak) { cur.peak = con[y]; cur.py = y; } }
+        else { if (cur) out.push(cur); cur = { y0: y, y1: y, peak: con[y], py: y }; }
+      }
+    }
+    if (cur) out.push(cur);
+    for (const l of out) l.y = (l.y0 + l.y1) / 2;
+    return out;
+  };
+  const strong = cluster(0.12);
+  if (strong.length < 4) return [];
+  const weak = cluster(0.03);
+  const groups = [];
+  let i = 0;
+  while (i < strong.length) {
+    let best = null;
+    for (let j = i + 1; j < strong.length; j++) {
+      const d0 = strong[j].y - strong[i].y;
+      if (d0 < 3) continue;
+      if (d0 > h / 4) break;
+      const chain = [i, j];
+      let avg = d0, last = j;
+      while (chain.length < 6) {
+        let found = -1;
+        for (let k = last + 1; k < strong.length; k++) {
+          const gap = strong[k].y - strong[last].y;
+          if (gap > avg * 1.15) break;
+          if (gap >= avg * 0.85) { found = k; break; }
+        }
+        if (found < 0) break;
+        chain.push(found);
+        avg = (strong[found].y - strong[i].y) / (chain.length - 1);
+        last = found;
+      }
+      if (chain.length >= 4 && (!best || chain.length > best.chain.length)) best = { chain, d: avg };
+    }
+    if (!best) { i++; continue; }
+    groups.push(best);
+    i = best.chain[best.chain.length - 1] + 1;
+  }
+  const rows = [];
+  for (const gr of groups) {
+    const ls = gr.chain.map(k => ({ y0: strong[k].y0, y1: strong[k].y1, weakAdded: false }));
+    const thick = Math.max(1, Math.round(medianOf(gr.chain.map(k => strong[k].y1 - strong[k].y0 + 1))));
+    const findWeak = target => {
+      let bestW = null;
+      for (const wk of weak) {
+        if (Math.abs(wk.py - target) <= gr.d * 0.15 && (!bestW || wk.peak > bestW.peak)) bestW = wk;
+      }
+      return bestW;
+    };
+    const firstY = (ls[0].y0 + ls[0].y1) / 2, lastY = (ls[ls.length - 1].y0 + ls[ls.length - 1].y1) / 2;
+    if (ls.length < 6) {
+      const up = findWeak(firstY - gr.d), dn = findWeak(lastY + gr.d);
+      const need = ls.length === 4 ? 0.03 : 0.06; // 4줄 → 5줄은 옅은 피크도 인정, 5줄 → 6줄(TAB)은 조금 더 뚜렷할 때만
+      const cand = [up, dn].filter(c => c && c.peak >= need).sort((p, q) => q.peak - p.peak)[0];
+      if (cand) {
+        const y0 = cand.py - Math.floor((thick - 1) / 2);
+        const nl = { y0, y1: y0 + thick - 1, weakAdded: true };
+        if (cand === up) ls.unshift(nl); else ls.push(nl);
+      }
+    }
+    if (ls.length < 5) continue;
+    for (const l of ls) rows.push({ y0: Math.max(0, l.y0), y1: Math.min(h - 1, l.y1), d: gr.d, weakAdded: l.weakAdded });
+  }
+  return rows;
+}
+
+// 임계값 적용 전 그레이에서 줄 행별로 "가로로 연속된 선 구간"을 계획한다 (줄 행 vs 줄 사이 중간 행의 국소 대비).
+function planStaffRestore(d, w, h, invert) {
+  const rows = detectStaffRowsFromGray(d, w, h, invert);
+  const ink = (x, y) => {
+    const i = (y * w + x) * 4;
+    const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    return (invert ? lum : 255 - lum) / 255;
+  };
+  const minRun = Math.max(12, Math.round(w * 0.05));
+  return rows.map(r => {
+    const half = Math.max(2, Math.round(r.d / 2));
+    const refRows = [r.y0 - half, r.y1 + half].filter(y => y >= 0 && y < h);
+    const marks = new Uint8Array(w);
+    for (let x = 0; x < w; x++) {
+      let la = 0;
+      for (let y = r.y0; y <= r.y1; y++) la += ink(x, y);
+      la /= (r.y1 - r.y0 + 1);
+      let ref = 0;
+      for (const y of refRows) ref += ink(x, y);
+      ref = refRows.length ? ref / refRows.length : 0;
+      if (la - ref >= 0.05) marks[x] = 1;
+    }
+    const gapMax = Math.max(3, Math.round(r.d * 0.6));
+    const segs = [];
+    let x = 0;
+    while (x < w) {
+      if (!marks[x]) { x++; continue; }
+      let e = x, gap = 0;
+      for (let k = x + 1; k < w; k++) {
+        if (marks[k]) { e = k; gap = 0; } else if (++gap > gapMax) break;
+      }
+      if (e - x + 1 >= minRun) segs.push([x, e]);
+      x = e + 1;
+    }
+    return { y0: r.y0, y1: r.y1, weakAdded: r.weakAdded, segs };
+  });
+}
+
+// 임계값·잡티 제거가 끝난 뒤 계획된 구간을 잉크(검정)로 복원. 복원으로 새로 검게 된 비율이 5% 이상이면 restored.
+function paintStaffRestore(imageData, w, plan) {
+  const dd = imageData.data;
+  return plan.map(r => {
+    let added = 0, total = 0;
+    for (const [xa, xb] of r.segs) {
+      for (let y = r.y0; y <= r.y1; y++) {
+        for (let x = xa; x <= xb; x++) {
+          const i = (y * w + x) * 4;
+          total++;
+          if (dd[i] > 127) added++;
+          dd[i] = dd[i + 1] = dd[i + 2] = 0; dd[i + 3] = 255;
+        }
+      }
+    }
+    const rowsN = r.y1 - r.y0 + 1;
+    return { y0: r.y0, y1: r.y1, weakAdded: r.weakAdded, restored: added / Math.max(1, rowsN * w) >= 0.05, added };
+  });
+}
+
+// 반환: 복원 정보 [{y0,y1,restored,weakAdded}] 또는 null (디버그 오버레이용)
 function scrollApplyPreprocInPlace(canvas, opts) {
-  if (!opts.removeBg && !opts.playheadRemove) return;
+  if (!opts.removeBg && !opts.playheadRemove) return null;
   const ctx = canvas.getContext('2d');
   const w = canvas.width, h = canvas.height;
   if (opts.playheadRemove) {
@@ -2036,14 +2194,19 @@ function scrollApplyPreprocInPlace(canvas, opts) {
     removePlayheadRuns(imageData, w, h, runs, [], { r: 255, g: 255, b: 255 });
     ctx.putImageData(imageData, 0, 0);
   }
+  let info = null;
   if (opts.removeBg) {
     const avg = computeAvgLuminanceFromCanvas(canvas);
     const invert = opts.invertMode === 'auto' ? (avg < 128) : (opts.invertMode === 'on');
     const imageData = ctx.getImageData(0, 0, w, h);
+    // 기존 임계값·번짐·잡티 제거는 그대로 두고, 오선 행에만 보정을 추가한다
+    const plan = opts.restoreStaff === false ? null : planStaffRestore(imageData.data, w, h, invert);
     applyThreshold(imageData, opts.threshold, invert, opts.softness || 0);
     if (opts.despeckle) despeckleBinary(imageData, w, h, opts.despeckleSize || 0);
+    if (plan && plan.length) info = paintStaffRestore(imageData, w, plan);
     ctx.putImageData(imageData, 0, 0);
   }
+  return info;
 }
 
 // 표시(미리보기)용으로만 쓰는 고품질 축소 — 브라우저의 drawImage 한 번으로 큰 비율(예: 7~8배)을
@@ -2313,7 +2476,15 @@ function detectStaffSystem(g, lineFrac, darkThresh) {
     }
   }
   if (cur) lines.push(cur);
-  for (const l of lines) l.y = (l.y0 + l.y1) / 2;
+  // 줄 두께 포함: 줄 행 바로 바깥의 옅은 가장자리 행(임계의 절반 이상)도 줄에 포함, 행별 어두움 비율 기록
+  for (const l of lines) {
+    for (let k = 0; k < 2 && l.y0 - 1 >= 0 && rowDark[l.y0 - 1] >= lineFrac * 0.5; k++) l.y0--;
+    for (let k = 0; k < 2 && l.y1 + 1 < g.h && rowDark[l.y1 + 1] >= lineFrac * 0.5; k++) l.y1++;
+    l.y = (l.y0 + l.y1) / 2;
+    let r = 0;
+    for (let y = l.y0; y <= l.y1; y++) if (rowDark[y] > r) r = rowDark[y];
+    l.ratio = r;
+  }
   if (lines.length < 4) return null;
 
   const gaps = [];
@@ -2339,6 +2510,28 @@ function detectStaffSystem(g, lineFrac, darkThresh) {
     }
   }
   staves.push(chain);
+  // 밴드 보강: 줄 수가 5(또는 TAB 6)에서 1개 모자라면 규칙적인 간격(±15%) 위치의 위·아래에서 어두움 비율 ≥ 0.15인 줄이
+  // 있는지 확인해 포함한다. 밴드 top/bottom은 첫 줄의 윗가장자리·마지막 줄의 아랫가장자리(줄 두께 포함).
+  for (const st of staves) {
+    if (st.length !== 4 && st.length !== 5) continue;
+    const gs = [];
+    for (let i = 1; i < st.length; i++) gs.push(st[i].y - st[i - 1].y);
+    const sp = medianOf(gs);
+    if (!(sp >= 2)) continue;
+    const tryFind = cy => {
+      const lo = Math.max(0, Math.round(cy - sp * 0.15)), hi = Math.min(g.h - 1, Math.round(cy + sp * 0.15));
+      let by = -1, br = 0;
+      for (let y = lo; y <= hi; y++) if (rowDark[y] > br) { br = rowDark[y]; by = y; }
+      if (by < 0 || br < 0.15) return null;
+      let y0 = by, y1 = by;
+      while (y0 - 1 >= 0 && rowDark[y0 - 1] >= 0.075 && by - y0 < 2) y0--;
+      while (y1 + 1 < g.h && rowDark[y1 + 1] >= 0.075 && y1 - by < 2) y1++;
+      return { y: (y0 + y1) / 2, y0, y1, ratio: br, weak: true };
+    };
+    const up = tryFind(st[0].y - sp), dn = tryFind(st[st.length - 1].y + sp);
+    const cand = [up, dn].filter(Boolean).sort((p, q) => q.ratio - p.ratio)[0];
+    if (cand) { if (cand === up) st.unshift(cand); else st.push(cand); }
+  }
   const valid = staves.filter(s => s.length >= 5 && s.length <= 6);
   if (!valid.length) return null;
 
@@ -2378,7 +2571,7 @@ function detectStaffSystem(g, lineFrac, darkThresh) {
   for (const sy of systems) for (const l of sy.lines) {
     for (let y = Math.max(0, l.y0 - pad); y <= Math.min(g.h - 1, l.y1 + pad); y++) mask[y] = 1;
   }
-  return { systems, main, space, mask, connScores: main.connScores, splitScores };
+  return { systems, main, space, mask, connScores: main.connScores, splitScores, rowDark };
 }
 
 function staffLeftEdge(g, sys) {
@@ -2826,7 +3019,7 @@ function flagOutlierBursts(bursts, times) {
 // 탐색 범위를 제한하기 위해 첫 패스가 끝난 뒤에 호출한다.
 async function runScrollStage3(repFrames, scrollDefaults, directionPref, refineHook) {
   // 1) 전처리 — 반드시 원본 해상도에서 먼저 (다운스케일은 스티칭 탐색(scrollGetGray)에서만)
-  for (const f of repFrames) { f.orig = cloneCanvas(f.canvas); scrollApplyPreprocInPlace(f.canvas, scrollDefaults); } // orig: 디버그 내보내기용 전처리 전 원본
+  for (const f of repFrames) { f.orig = cloneCanvas(f.canvas); f.staffPre = scrollApplyPreprocInPlace(f.canvas, scrollDefaults); } // orig: 디버그 내보내기용 전처리 전 원본
 
   // 2) 방향 자동 감지 (첫 프레임 쌍 기준, 이후 동일 방향 유지) + 스티칭
   let direction = directionPref;
@@ -2866,14 +3059,14 @@ async function runScrollStage3(repFrames, scrollDefaults, directionPref, refineH
 
   const first = repFrames[0].canvas;
   const fullLen = direction === 'vertical' ? first.height : first.width;
-  const frames = [newScrollFrame({ canvas: first, orig: repFrames[0].orig, t: repFrames[0].time, srcX: 0, len: fullLen, score: null, ok: true })];
+  const frames = [newScrollFrame({ canvas: first, orig: repFrames[0].orig, staffPre: repFrames[0].staffPre, t: repFrames[0].time, srcX: 0, len: fullLen, score: null, ok: true })];
   for (let i = 0; i < seamDecisions.length; i++) {
     const d = seamDecisions[i];
     const bCanvas = repFrames[i + 1].canvas;
     const bLen = direction === 'vertical' ? bCanvas.height : bCanvas.width;
     const len = Math.min(bLen, Math.max(1, d.shift));
     frames.push(newScrollFrame({
-      canvas: bCanvas, orig: repFrames[i + 1].orig, t: repFrames[i + 1].time,
+      canvas: bCanvas, orig: repFrames[i + 1].orig, staffPre: repFrames[i + 1].staffPre, t: repFrames[i + 1].time,
       srcX: d.dup ? 0 : bLen - len, len: d.dup ? 0 : len,
       dup: d.dup, score: d.score, ok: d.ok, shift: d.shift,
     }));
@@ -3363,7 +3556,7 @@ function detectSeamDuplicate(infoA, infoB, aEnd, bStart, bEnd, mask, space, W) {
 // 이음 방식은 이음매마다 독립 결정: 겹침 확정이면 겹친 폭만큼 B 왼쪽을 잘라 이어 붙이고, 겹침 없음이면
 // butt-join(연속성 점수로 고른 공통 δ). 타일 경계 양쪽 2px는 트림해 연한 회색 세로선을 없앤다.
 async function buildCutFrames(tiles, scrollDefaults) {
-  for (const tl of tiles) { tl.orig = cloneCanvas(tl.canvas); scrollApplyPreprocInPlace(tl.canvas, scrollDefaults); }
+  for (const tl of tiles) { tl.orig = cloneCanvas(tl.canvas); tl.staffPre = scrollApplyPreprocInPlace(tl.canvas, scrollDefaults); }
   const infos = tiles.map(tl => analyzeTileStaff(tl.canvas));
   const withSys = infos.filter(i => i.sys);
   if (!withSys.length) return null;
@@ -3403,7 +3596,7 @@ async function buildCutFrames(tiles, scrollDefaults) {
     const tl = tiles[k], inf = infos[k];
     if (dupFlags[k]) {
       if (lastReal) lastReal.t1 = tl.t1;
-      frames.push(newScrollFrame({ canvas: tl.canvas, orig: tl.orig, t: tl.t, srcX: 0, len: 0, dup: true, cut: true, t0: tl.t0, t1: tl.t1, score: 1, ok: true }));
+      frames.push(newScrollFrame({ canvas: tl.canvas, orig: tl.orig, staffPre: tl.staffPre, t: tl.t, srcX: 0, len: 0, dup: true, cut: true, t0: tl.t0, t1: tl.t1, score: 1, ok: true }));
       continue;
     }
     const first = k === keep[0];
@@ -3426,7 +3619,7 @@ async function buildCutFrames(tiles, scrollDefaults) {
     }
     srcX = Math.min(srcX, Math.max(0, e));
     const f = newScrollFrame({
-      canvas: tl.canvas, orig: tl.orig, t: tl.t, srcX, len: Math.max(1, e - srcX + 1), cut: true, t0: tl.t0, t1: tl.t1,
+      canvas: tl.canvas, orig: tl.orig, staffPre: tl.staffPre, t: tl.t, srcX, len: Math.max(1, e - srcX + 1), cut: true, t0: tl.t0, t1: tl.t1,
       score, ok: true, weight, delta, ovl,
     });
     frames.push(f);
@@ -4736,6 +4929,10 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
   }));
   const fixSeams = seamsInfo.filter(s => s.needsFix); // 수정 후 검증을 다시 통과하면 자동으로 목록·깃발에서 빠진다
   const curSeam = fixSeams.length ? (fixSeams.find(s => s.i === seamSel) || fixSeams[0]) : null;
+  // 전처리에서 복원한 오선 줄의 y좌표들 (가로 스크롤: 스티치 y == 타일 y)
+  const restoredRows = [];
+  for (const f of placed) if (f.staffPre) for (const r of f.staffPre) if (r.restored || r.weakAdded) restoredRows.push((r.y0 + r.y1) / 2);
+  const isRestoredY = y => restoredRows.some(ry => Math.abs(ry - y) <= 2);
   const overlayScale = Math.min(1, 150 / stitchedCanvas.height, 12000 / stitchedCanvas.width);
   const stripW = Math.max(1, Math.round(stitchedCanvas.width * overlayScale));
   const stripH = Math.max(1, Math.round(stitchedCanvas.height * overlayScale));
@@ -4789,6 +4986,16 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
       ctx.strokeStyle = !info || info.kind !== 'bar' ? 'rgba(255,120,120,0.6)' : (info.gapConn ? 'rgb(140,0,0)' : 'rgba(230,30,30,0.9)');
       ctx.beginPath(); ctx.moveTo(b * scale + 0.5, 0); ctx.lineTo(b * scale + 0.5, cv.height); ctx.stroke();
     });
+    // 검출된 오선 줄: 실선 = 일반, 점선(주황) = 복원/보강된 줄
+    if (detection.system) {
+      for (const l of detection.system.main.lines) {
+        const dashed = l.weak || l.synth || isRestoredY(l.y);
+        ctx.setLineDash(dashed ? [4, 3] : []);
+        ctx.strokeStyle = dashed ? 'rgba(240,128,0,0.95)' : 'rgba(0,90,255,0.35)';
+        ctx.beginPath(); ctx.moveTo(0, l.y * scale + 0.5); ctx.lineTo(cv.width, l.y * scale + 0.5); ctx.stroke();
+      }
+      ctx.setLineDash([]);
+    }
     ctx.strokeStyle = 'rgba(0,160,0,0.9)';
     for (const s of layout.seams) {
       if (s.dup) continue;
@@ -5025,6 +5232,11 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
           {staffFound && (' · 보표 간 연결 점수: ' + (detection.system.connScores.length
             ? detection.system.connScores.map(c => c.toFixed(2)).join(', ')
             : (detection.system.splitScores.length ? ('연결 획 없음 → 분리됨 (' + detection.system.splitScores.map(c => c.toFixed(2)).join(', ') + ')') : '단일 보표')))}
+          {staffFound && (
+            <span><br />검출된 오선 줄 (y좌표 · 행별 어두움 비율): {detection.system.main.lines.map((l, k) =>
+              (k > 0 ? ' / ' : '') + Math.round(l.y) + ' (' + (l.ratio != null ? l.ratio.toFixed(2) : '-') + ')' + (l.weak ? ' 보강' : '') + (isRestoredY(l.y) ? ' 복원' : '')).join('')}
+              · 밴드 {Math.round(detection.system.main.top)}~{Math.round(detection.system.main.bottom)}</span>
+          )}
           {staffFound && detection.stats && (
             <span><br />마디선 검출: 후보 {detection.stats.cand} → 단별 통과 {detection.stats.allStaff} → 헤더제외 후 {detection.stats.afterHeader} → 정리 후 {detection.stats.afterPrune} (삐져나옴으로 제외 {detection.stats.protruded}개 / 지속성으로 제외 {detection.stats.notPersistent}개 / 양 끝 불일치 {detection.stats.endMismatch}개) (사용 T={detection.threshUsed.toFixed(2)}{detection.auto ? ' 자동' : ' 수동'})</span>
           )}
