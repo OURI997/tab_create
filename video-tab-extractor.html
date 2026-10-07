@@ -5729,7 +5729,7 @@ async function flowRebuildStrip({ video, roi, track, medianObs, rate, abortRef, 
   let poolIdx = 0;
   const tStart = track.t[track.k0], tEnd = track.t[track.k1];
   const Xref = track.X[track.k0];
-  let Gprev = null, last = null, gaps = 0, frames = 0;
+  let Gprev = null, last = null, gaps = 0, frames = 0, tFirst = null;
   const hist = []; // medianObs용: [{cap, G}]
 
   const medianSlice = (prev, center, next, wj, wn) => {
@@ -5778,6 +5778,7 @@ async function flowRebuildStrip({ video, roi, track, medianObs, rate, abortRef, 
     last = cap;
     if (Gprev == null) {
       builder.append(cap, 0, u0); // 처음 화면에서 u0 왼쪽(이미 화면에 있던 부분)
+      tFirst = t;
       Gprev = G;
       if (medianObs) hist.push({ cap, G });
       return;
@@ -5805,7 +5806,7 @@ async function flowRebuildStrip({ video, roi, track, medianObs, rate, abortRef, 
   if (!last) throw new Error('스트립 재구성 중 프레임을 얻지 못했습니다.');
   if (medianObs && hist.length >= 2) emitMedianFor(hist.length - 1, true);
   builder.append(last, u0, W - u0); // 마지막 화면에서 u0 오른쪽(아직 지나가지 않은 부분)
-  return { chunks: builder.finish(), totalW: builder.total(), H, u0, maxDelta, gaps, frames, barRanges };
+  return { chunks: builder.finish(), totalW: builder.total(), H, u0, maxDelta, gaps, frames, barRanges, tFirst };
 }
 
 // ---- 전체 파이프라인 ----
@@ -5849,7 +5850,7 @@ async function flowRunPipeline({ video, roi, playbarFrac, rate, medianObs, scrol
   onProgress('완료', 100);
   const confCnt = track.interp.slice(track.k0 + 1, track.k1 + 1).filter(Boolean).length;
   return {
-    track, chunks: strip.chunks, totalW: strip.totalW, H: strip.H,
+    track, chunks: strip.chunks, totalW: strip.totalW, H: strip.H, tFirst: strip.tFirst,
     stats: {
       duration: dur, samples: samples.length, usedRvfc, rate, elapsed: (performance.now() - t0) / 1000,
       motionStart: track.t[track.k0], motionEnd: track.t[track.k1],
@@ -6099,6 +6100,392 @@ function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
           </div>
         </div>
       )}
+
+      {result && <FlowStage2 result={result} videoFile={videoFile} flowDefaults={flowDefaults} />}
+    </div>
+  );
+}
+
+// ================================================================================================
+// 연속 이동형 2단계 — 마디 분할 + 악보 빌더로 넘기기. 1단계 결과(스트립 조각 목록, x(t))를 입력으로만 쓴다.
+// ================================================================================================
+
+// 스트립 전체 좌표 [x0,x1) 구간을 조각 목록에서 잘라 한 장으로 이어 그린다 (조각 경계에 걸쳐도 연속)
+function flowCropStrip(chunks, x0, x1) {
+  x0 = Math.max(0, Math.round(x0));
+  const H = chunks[0].height;
+  const w = Math.max(1, Math.round(x1) - x0);
+  const out = document.createElement('canvas');
+  out.width = w; out.height = H;
+  const ctx = out.getContext('2d');
+  ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, w, H);
+  let base = 0;
+  for (const c of chunks) {
+    const cs = base, ce = base + c.width;
+    const a = Math.max(x0, cs), b = Math.min(x0 + w, ce);
+    if (b > a) ctx.drawImage(c, a - cs, 0, b - a, H, a - x0, 0, b - a, H);
+    base = ce;
+  }
+  return out;
+}
+
+// 조각별로 기존 마디선 검출(detectStaffSystem / detectBarsThroughSystem — 밴드 정확 일치·재생바 제외 규칙 포함)을
+// 실행하고 전체 좌표로 합친다. 조각 경계 ±(오선 간격×3)는 인접 조각을 이어 붙인 확장 캔버스에서 검사하고, 각 마디선은
+// 그것이 속한 조각 한 곳에서만 채택해(소유권) 경계에서 갈라지거나 중복되지 않게 한다. 헤더 제외는 첫 조각만.
+async function flowDetectBars(chunks, nativeW, onProgress) {
+  const starts = [];
+  let total = 0;
+  for (const c of chunks) { starts.push(total); total += c.width; }
+  const g0 = scrollGetFullGrayData(chunks[0]);
+  const sys0 = detectStaffSystem(g0, 0.3, 140);
+  const blank = new Uint8Array(total);
+  if (!sys0) return { bars: [], weak: true, staffFound: false, blank, space: 12, total, T: null };
+  const space = sys0.space;
+  const margin = Math.max(40, Math.round(space * 3));
+  const ext = i => {
+    const x0 = Math.max(0, starts[i] - margin), x1 = Math.min(total, starts[i] + chunks[i].width + margin);
+    return { canvas: flowCropStrip(chunks, x0, x1), x0 };
+  };
+  // 연속도 임계 T: 첫 조각에서 0.9부터 0.05씩 낮추며 마디 수가 기대치 이상이 될 때까지 (기존 자동 규칙과 동일), 전체에 동일 적용
+  const e0 = ext(0);
+  const gE = scrollGetFullGrayData(e0.canvas);
+  const sysE = detectStaffSystem(gE, 0.3, 140);
+  const leftE = sysE ? staffLeftEdge(gE, sysE) : 0;
+  const expectMin = 0.5 * nativeW / (space * 10);
+  let T = 0.9, weak = false;
+  if (sysE) {
+    let res = null;
+    for (const t of [0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5]) {
+      T = t;
+      res = detectBarsThroughSystem(gE, sysE, T, leftE, 140, null, 20);
+      if (res.bars.length >= expectMin) break;
+    }
+    weak = !res || res.bars.length < expectMin;
+  } else weak = true;
+  const all = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const e = i === 0 ? { canvas: e0.canvas, x0: 0 } : ext(i);
+    const g = i === 0 ? gE : scrollGetFullGrayData(e.canvas);
+    const sys = i === 0 ? sysE : detectStaffSystem(g, 0.3, 140);
+    if (sys) {
+      const r = detectBarsThroughSystem(g, sys, T, staffLeftEdge(g, sys), 140, null, i === 0 ? 20 : 0);
+      const lo = starts[i], hi = starts[i] + chunks[i].width;
+      for (const b of r.bars) {
+        const gx = b.x + e.x0;
+        if (gx >= lo && gx < hi) all.push({ x: gx, score: b.score, gapConn: b.gapConn });
+      }
+      const bl = computeBlankColumns(g, sys, 140);
+      for (let gx = lo; gx < hi; gx++) { const lx = gx - e.x0; if (lx >= 0 && lx < bl.length) blank[gx] = bl[lx]; }
+    }
+    if (onProgress) onProgress((i + 1) / chunks.length);
+    await flowYield();
+  }
+  all.sort((p, q) => p.x - q.x);
+  // 경계 근처에서 같은 마디선이 약간 다른 위치로 두 번 잡힌 경우 정리 + 기존 이웃 정리 규칙
+  const tol = Math.max(3, space * 0.4);
+  const merged = [];
+  for (const b of all) {
+    const last = merged[merged.length - 1];
+    if (last && b.x - last.x <= tol) { if (b.score > last.score) merged[merged.length - 1] = b; }
+    else merged.push(b);
+  }
+  const kept = pruneCloseBarObjs(merged);
+  let bars = [staffLeftEdge(g0, sys0), ...kept.map(b => b.x)];
+  if (total - 1 - bars[bars.length - 1] > space * 4) bars.push(total - 1);
+  return { bars, weak, staffFound: true, blank, space, total, T };
+}
+
+// 재생바 열(원본 해상도 px): 지정했으면 그 열, 아니면 정적 열 중 ROI 가장자리가 아닌 좁은 열이 정확히 하나일 때 그 열
+function flowResolvePlaybar(track) {
+  const W = track.nativeW;
+  if (track.barCols) return { x: (track.barCols[0] + track.barCols[1]) / 2, source: 'user' };
+  const cands = track.staticRanges.filter(r => r[0] > W * 0.02 && r[1] < W * 0.98 && (r[1] - r[0]) <= W * 0.04);
+  if (cands.length === 1) return { x: (cands[0][0] + cands[0][1]) / 2, source: 'auto' };
+  return null;
+}
+
+// 누적 이동량 X가 target에 처음 도달하는 시각 (x(t)의 역변환). X는 단조 증가하도록 보정해서 쓴다.
+function flowInvX(T, Xm, target) {
+  const n = T.length;
+  if (target <= Xm[0]) return T[0];
+  if (target >= Xm[n - 1]) return T[n - 1];
+  let lo = 0, hi = n - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (Xm[m] >= target) hi = m; else lo = m; }
+  const dx = Xm[hi] - Xm[lo];
+  return T[lo] + (dx > 1e-9 ? (target - Xm[lo]) / dx : 0) * (T[hi] - T[lo]);
+}
+
+// 스트립 위 마디선 오버레이 + 수동 보정: 빈 곳 클릭 = 추가, 마디선 클릭 = 선택(삭제 대상), 드래그 = 위치 미세 조정.
+// 드래그 중에는 화면 위치만 갱신하고, 놓을 때 한 번만 상위로 커밋해서 그룹이 재계산된다.
+function FlowBarStrip({ chunks, totalW, H, scale, bars, flagged, selIdx, onSelect, onCommit, scrollRef }) {
+  const [drag, setDrag] = useState(null);
+  const dragRef = useRef(null);
+  const latest = useRef({});
+  latest.current = { bars, onCommit, onSelect, scale, totalW };
+  useEffect(() => {
+    function onMove(e) {
+      const d = dragRef.current;
+      if (!d) return;
+      const dx = e.clientX - d.startClient;
+      if (!d.moved && Math.abs(dx) < 3) return;
+      d.moved = true;
+      d.x = Math.max(0, Math.min(latest.current.totalW - 1, d.origX + dx / latest.current.scale));
+      setDrag({ i: d.i, x: d.x });
+    }
+    function onUp() {
+      const d = dragRef.current;
+      dragRef.current = null;
+      if (!d) return;
+      setDrag(null);
+      const L = latest.current;
+      if (d.moved) {
+        const nb = L.bars.slice();
+        nb[d.i] = Math.round(d.x);
+        nb.sort((a, b) => a - b);
+        L.onCommit(nb, nb.indexOf(Math.round(d.x)));
+      } else L.onSelect(d.i);
+    }
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    return () => { window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp); };
+  }, []);
+  function onBgClick(e) {
+    if (e.target !== e.currentTarget) return;
+    const r = e.currentTarget.getBoundingClientRect();
+    const x = Math.round((e.clientX - r.left) / scale);
+    const nb = [...bars, x].sort((a, b) => a - b);
+    onCommit(nb, nb.indexOf(x));
+  }
+  return (
+    <div ref={scrollRef} style={{ overflowX: 'auto', border: '1px solid var(--border-strong)', background: '#fff' }}>
+      <div style={{ position: 'relative', width: Math.round(totalW * scale), height: Math.round(H * scale) }}>
+        <div style={{ display: 'flex', position: 'absolute', left: 0, top: 0 }}>
+          {chunks.map((c, i) => <FlowChunkView key={i} chunk={c} scale={scale} />)}
+        </div>
+        <div onClick={onBgClick} style={{ position: 'absolute', left: 0, top: 0, right: 0, bottom: 0, cursor: 'copy' }}>
+          {flagged.map(i => bars[i + 1] != null && (
+            <div key={'f' + i} style={{ position: 'absolute', left: bars[i] * scale, width: (bars[i + 1] - bars[i]) * scale, top: 0, bottom: 0, background: 'rgba(255,140,0,0.25)', pointerEvents: 'none' }} />
+          ))}
+          {bars.map((b, i) => {
+            const x = drag && drag.i === i ? drag.x : b;
+            const sel = i === selIdx;
+            return (
+              <div key={i}
+                onPointerDown={e => { e.preventDefault(); e.stopPropagation(); dragRef.current = { i, startClient: e.clientX, origX: b, moved: false, x: b }; }}
+                style={{ position: 'absolute', left: x * scale - 5, width: 10, top: 0, bottom: 0, cursor: 'ew-resize' }}>
+                <div style={{ position: 'absolute', left: 4, width: sel ? 3 : 2, top: 0, bottom: 0, background: sel ? '#ff9500' : '#e02020', pointerEvents: 'none' }} />
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FlowStage2({ result, videoFile, flowDefaults }) {
+  const { chunks, totalW, H, track, stats } = result;
+  const nativeW = track.nativeW;
+  const [det, setDet] = useState(null);
+  const [detecting, setDetecting] = useState(false);
+  const [detProgress, setDetProgress] = useState(0);
+  const [bars, setBars] = useState([]);
+  const [selIdx, setSelIdx] = useState(null);
+  const [groupSizeUser, setGroupSizeUser] = useState(null);
+  const [maxBarsUser, setMaxBarsUser] = useState(null);
+  const [groupBasis, setGroupBasis] = useState('auto');
+  const [offsetSec, setOffsetSec] = useState(0);
+  const [sending, setSending] = useState(false);
+  const scrollRef = useRef(null);
+  const pvRef = useRef(null);
+  const stopAtRef = useRef(null);
+  const scale = Math.min(1, 180 / H);
+
+  async function detect() {
+    setDetecting(true); setDetProgress(0); setSelIdx(null);
+    try {
+      const r = await flowDetectBars(chunks, nativeW, f => setDetProgress(f));
+      setDet(r); setBars(r.bars);
+    } finally { setDetecting(false); }
+  }
+  useEffect(() => { detect(); }, [result]);
+
+  const videoUrl = useMemo(() => (videoFile ? URL.createObjectURL(videoFile) : null), [videoFile]);
+  useEffect(() => () => { if (videoUrl) URL.revokeObjectURL(videoUrl); }, [videoUrl]);
+
+  // ---- 시간 매핑: 스트립 x → 재생 시각 ----
+  // 스트립 좌표 s의 내용이 재생바 열 p를 지나는 시각 = X(t) − X(첫 프레임) = s − p 가 되는 t (x(t)의 역변환)
+  const playbar = useMemo(() => flowResolvePlaybar(track), [track]);
+  const Xm = useMemo(() => {
+    const out = [];
+    let m = -Infinity;
+    for (const v of track.X) { m = Math.max(m, v); out.push(m); }
+    return out;
+  }, [track]);
+  const Xf = useMemo(() => flowInterpX(track, result.tFirst != null ? result.tFirst : track.t[track.k0]), [track, result]);
+  const dur = track.t[track.t.length - 1];
+  const tOf = s => {
+    const p = playbar ? playbar.x : 0;
+    const t = flowInvX(track.t, Xm, s - p + Xf) + (playbar ? 0 : offsetSec);
+    return Math.max(0, Math.min(dur, t));
+  };
+
+  // ---- 그룹화 (기존 groupBarsByTargetWidth / groupByWidth와 같은 UI·기본값 규칙) ----
+  const quality = useMemo(() => assessBarQuality(bars, totalW, nativeW, det ? det.weak : true), [bars, totalW, nativeW, det]);
+  const measureW = useMemo(() => robustMeasureWidth(bars), [bars]);
+  const autoGroupSize = quality.medianWidth ? Math.max(2, Math.min(6, Math.round(nativeW / quality.medianWidth))) : 4;
+  const groupSize = groupSizeUser != null ? groupSizeUser : autoGroupSize;
+  const maxBarsPerGroup = Math.max(maxBarsUser != null ? maxBarsUser : groupSize + 2, groupSize);
+  const useBarGroups = bars.length >= 2 && (groupBasis === 'bar' || (groupBasis === 'auto' && !quality.low));
+  let groups = [];
+  if (det) {
+    if (useBarGroups) groups = groupBarsByTargetWidth(bars, groupSize, maxBarsPerGroup);
+    else groups = groupByWidth(totalW, groupSize, maxBarsPerGroup, measureW, nativeW, bars, det.blank, det.space);
+  }
+  const groupsMeta = groups.map((g, i) => {
+    const start = tOf(g.startX);
+    const end = i + 1 < groups.length ? tOf(groups[i + 1].startX) : tOf(g.endX);
+    return { ...g, timeRange: { start, end: Math.max(start, end) } };
+  });
+  const thumbs = useMemo(
+    () => groupsMeta.map(g => flowCropStrip(chunks, g.startX, g.endX).toDataURL('image/png')),
+    // eslint-disable-next-line
+    [chunks, JSON.stringify(groups.map(g => [g.startX, g.endX]))]
+  );
+
+  // ---- 이상치: 마디 길이(시간)가 중앙값의 ±40%를 벗어나는 마디 ----
+  const measureTimes = [];
+  for (let i = 0; i + 1 < bars.length; i++) measureTimes.push(tOf(bars[i + 1]) - tOf(bars[i]));
+  const medDur = medianOf(measureTimes);
+  const flagged = [];
+  if (measureTimes.length >= 5 && medDur > 0) measureTimes.forEach((d, i) => { if (Math.abs(d / medDur - 1) > 0.4) flagged.push(i); });
+
+  function commitBars(nb, newSel) { setBars(nb); setSelIdx(newSel != null ? newSel : null); }
+  function deleteSelected() {
+    if (selIdx == null) return;
+    setBars(bars.filter((_, i) => i !== selIdx)); setSelIdx(null);
+  }
+  function scrollToX(x) {
+    const el = scrollRef.current;
+    if (el) el.scrollTo({ left: Math.max(0, x * scale - el.clientWidth / 2), behavior: 'smooth' });
+  }
+  function playFrom(range) {
+    const v = pvRef.current;
+    if (!v) return;
+    v.muted = false;
+    v.currentTime = range.start;
+    stopAtRef.current = range.end;
+    v.play().catch(() => {});
+  }
+  function onPvTime() {
+    const v = pvRef.current;
+    if (v && stopAtRef.current != null && v.currentTime >= stopAtRef.current) { v.pause(); stopAtRef.current = null; }
+  }
+
+  async function sendToBuilder() {
+    setSending(true);
+    try {
+      const sourceId = videoFile ? ('vsrc_' + Date.now() + '_' + Math.random().toString(36).slice(2)) : null;
+      const items = groupsMeta.map((g, idx) => {
+        const c = flowCropStrip(chunks, g.startX, g.endX);
+        // 전처리를 거쳤으면(검정 잉크·흰 배경) 반전/재처리 없이 그대로, 전처리를 껐으면 어두운 배경 여부로 invert 판단
+        const processed = !!flowDefaults.removeBg;
+        const invert = !processed && computeAvgLuminanceFromCanvas(c) < 128;
+        return {
+          id: 'flow_' + Date.now() + '_' + idx,
+          type: 'image', src: c.toDataURL('image/png'),
+          invert, override: processed ? { ...MERGED_ROW_NEUTRAL_OVERRIDE } : null,
+          lyrics: { tags: [], areaHeightRatio: null },
+          playheadExcluded: [], barLayout: null,
+          stitchMeta: { source: 'flow', groupIndex: idx, barCount: g.count, byWidth: !!g.byWidth },
+          timeRange: g.timeRange,
+          videoSourceId: sourceId,
+        };
+      });
+      if (sourceId && videoFile) await dbPut(VIDEO_SOURCE_KEY_PREFIX + sourceId, { videoBlob: videoFile, onsets: [], savedAt: Date.now() });
+      await dbPut(VIDEO_IMPORT_KEY, { items, importedAt: Date.now() });
+      window.location.href = 'tab-score-builder.html';
+    } catch (err) {
+      alert('전달 중 오류가 발생했습니다: ' + err.message);
+      setSending(false);
+    }
+  }
+
+  const CIRCLED = ['①','②','③','④','⑤','⑥','⑦','⑧','⑨','⑩','⑪','⑫','⑬','⑭','⑮','⑯','⑰','⑱','⑲','⑳'];
+  return (
+    <div className="block">
+      <div className="block-head"><span>2단계 — 마디 분할 · 시간 매핑 · 악보 빌더로 넘기기</span></div>
+      {detecting && <p className="hint-text">마디선 검출 중... {Math.round(detProgress * 100)}%</p>}
+      {det && (
+        <p className="hint-text">
+          {det.staffFound ? ('마디선 ' + bars.length + '개 (마디 ' + Math.max(0, bars.length - 1) + '개) · 연속도 임계 T=' + (det.T != null ? det.T.toFixed(2) : '-')) : '보표(오선)를 찾지 못했습니다.'}
+          {det.staffFound && quality.low && <b style={{ color: '#c0392b' }}> · 마디 인식 신뢰도 낮음{det.weak ? ' (마디선 인식 약함)' : ''} — 폭 기준 그룹화로 자동 전환</b>}
+          {' · 재생 시각 기준: '}{playbar ? ('재생바 ' + (playbar.source === 'user' ? '(지정) ' : '(자동 감지) ') + Math.round(playbar.x) + 'px') : '재생바 위치 없음 — 아래 슬라이더로 보정'}
+        </p>
+      )}
+      <div className="toolbar">
+        <button className="icon-btn" onClick={detect} disabled={detecting}>마디선 다시 검출 (수동 수정 초기화)</button>
+        <button className="icon-btn" onClick={deleteSelected} disabled={selIdx == null}>선택한 마디선 삭제{selIdx != null ? ' (x=' + Math.round(bars[selIdx]) + ')' : ''}</button>
+        {!playbar && (
+          <label style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>시각 보정:
+            <input type="range" min="-3" max="3" step="0.05" value={offsetSec} onChange={e => setOffsetSec(parseFloat(e.target.value))} />
+            <span className="slider-label" style={{ margin: 0 }}>{offsetSec.toFixed(2)}초</span>
+          </label>
+        )}
+      </div>
+      <p className="hint-text" style={{ margin: '4px 0' }}>빈 곳 클릭 = 마디선 추가 · 마디선 클릭 = 선택(삭제 대상) · 드래그 = 위치 미세 조정 · 주황 음영 = 마디 길이(시간) 이상치</p>
+      {flagged.length > 0 && (
+        <div className="toolbar">
+          <b style={{ color: '#e07000' }}>이상 의심 마디 {flagged.length}개 (마디선 누락·과다 의심):</b>
+          {flagged.map((i, n) => (
+            <button key={i} className="icon-btn" style={{ color: '#e07000', borderColor: '#e07000', fontWeight: 700 }}
+              title={'마디 ' + (i + 1) + ' · ' + measureTimes[i].toFixed(2) + '초 (중앙값 ' + medDur.toFixed(2) + '초)'}
+              onClick={() => { scrollToX(bars[i]); setSelIdx(i); }}>{CIRCLED[n] || n + 1}</button>
+          ))}
+        </div>
+      )}
+      <FlowBarStrip chunks={chunks} totalW={totalW} H={H} scale={scale} bars={bars} flagged={flagged} selIdx={selIdx}
+        onSelect={i => setSelIdx(i)} onCommit={commitBars} scrollRef={scrollRef} />
+
+      <div className="hr" />
+      <div className="toolbar">
+        <label>몇 마디씩 묶기(목표): <input type="number" min="1" max="16" value={groupSize}
+          onChange={e => setGroupSizeUser(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
+        <label>그룹당 최대 마디수: <input type="number" min="1" max="20" value={maxBarsPerGroup}
+          onChange={e => setMaxBarsUser(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
+        <label>그룹 기준:
+          <select value={groupBasis} onChange={e => setGroupBasis(e.target.value)} style={{ width: 'auto', marginLeft: '6px' }}>
+            <option value="auto">자동 (신뢰도 낮으면 폭 기준)</option>
+            <option value="bar">마디선 기준</option>
+            <option value="width">폭 기준</option>
+          </select>
+        </label>
+        <span className="hint-text" style={{ margin: 0 }}>자동 기준: 화면 1장 분량{groupSizeUser == null ? ' (목표 ' + autoGroupSize + '마디, 최대 ' + (autoGroupSize + 2) + ')' : ''}</span>
+        <span className="save-msg">{useBarGroups ? (Math.max(0, bars.length - 1) + '마디 → ' + groups.length + '개 그룹') : ('폭 기준 분할 → ' + groups.length + '개 그룹')}</span>
+      </div>
+
+      {videoUrl && (
+        <video ref={pvRef} src={videoUrl} controls onTimeUpdate={onPvTime} style={{ maxWidth: '100%', maxHeight: '220px', background: '#000' }} />
+      )}
+
+      <div className="list">
+        {groupsMeta.map((g, idx) => (
+          <div key={idx} className="block">
+            <div className="block-head">
+              <span>
+                그룹 {idx + 1}: {g.byWidth ? '폭 기준 분할' : (g.count + '마디')}
+                <span className="save-msg"> · {g.timeRange.start.toFixed(2)}s ~ {g.timeRange.end.toFixed(2)}s</span>
+              </span>
+              <button className="icon-btn" onClick={() => playFrom(g.timeRange)} disabled={!videoUrl}>영상에서 확인</button>
+            </div>
+            {thumbs[idx] && <img src={thumbs[idx]} className="merge-preview-img" alt={'그룹 ' + (idx + 1)} />}
+          </div>
+        ))}
+      </div>
+
+      <div className="toolbar">
+        <button onClick={sendToBuilder} disabled={sending || !groups.length}>{sending ? '전달 중...' : 'TAB 악보 만들기로 넘기기 (' + groups.length + '개) →'}</button>
+      </div>
     </div>
   );
 }
