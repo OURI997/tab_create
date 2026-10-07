@@ -1095,9 +1095,8 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
       setRangeStart(0);
       setRangeEnd(video.duration);
       log('영상 로드됨: ' + video.duration.toFixed(2) + '초, ' + video.videoWidth + 'x' + video.videoHeight);
-      // Wakes the decoder — without this, a video that's only ever been visually hidden can fail to
-      // decode frames on first seek in some browsers (Safari in particular).
-      try { await video.play(); video.pause(); } catch (err) { /* autoplay policy — safe to ignore */ }
+      // 자동 재생을 일으키던 play()/pause() 워밍업은 제거 — seek만으로 첫 프레임을 그린다
+      await seekSafe(video, 0.001);
       await showFrameAt(0);
     };
   }
@@ -4100,7 +4099,7 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
       setRangeStart(0);
       setRangeEnd(video.duration);
       log('영상 로드됨: ' + video.duration.toFixed(2) + '초, ' + video.videoWidth + 'x' + video.videoHeight + '. TAB 영역을 드래그로 지정하세요.');
-      try { await video.play(); video.pause(); } catch (err) {}
+      await seekSafe(video, 0.001); // 워밍업 재생 없이 seek만으로 첫 프레임을 그린다
       await seekTo(video, 0);
       updatePreprocPreview();
     };
@@ -5435,6 +5434,7 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
 // 이 모드 전용 함수는 모두 flow 접두어로 독립 구현한다.
 // ================================================================================================
 
+const flowInternalPlayRef = { current: false }; // 분석 패스(rVFC)가 내부적으로 재생 중임을 알리는 플래그
 function flowRvfcSupported(video) { return typeof video.requestVideoFrameCallback === 'function'; }
 function flowYield() { return new Promise(r => setTimeout(r, 0)); }
 
@@ -5453,34 +5453,40 @@ async function flowPlayPass(video, { startT, endT, rate, minGap, onFrame, onProg
   }
   video.muted = true;
   video.playbackRate = Math.max(0.25, Math.min(3, rate || 1));
-  await seekSafe(video, startT);
+  flowInternalPlayRef.current = true; // 분석 패스의 내부 재생 — play 가드가 막지 않게 한다
   let failure = null;
-  await new Promise(resolve => {
-    let last = -Infinity, done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      video.pause();
-      video.removeEventListener('ended', finish);
-      resolve();
-    };
-    video.addEventListener('ended', finish);
-    const cb = (now, meta) => {
-      if (done) return;
-      if (abortRef && abortRef.current) { finish(); return; }
-      const t = meta.mediaTime;
-      if (t - last >= minGap) {
-        last = t;
-        try { onFrame(t); } catch (err) { failure = err; finish(); return; }
-        if (onProgress) onProgress(Math.min(1, (t - startT) / span));
-      }
-      if (t >= endT) { finish(); return; }
+  try {
+    await seekSafe(video, startT);
+    await new Promise(resolve => {
+      let last = -Infinity, done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        video.pause();
+        video.removeEventListener('ended', finish);
+        resolve();
+      };
+      video.addEventListener('ended', finish);
+      const cb = (now, meta) => {
+        if (done) return;
+        if (abortRef && abortRef.current) { finish(); return; }
+        const t = meta.mediaTime;
+        if (t - last >= minGap) {
+          last = t;
+          try { onFrame(t); } catch (err) { failure = err; finish(); return; }
+          if (onProgress) onProgress(Math.min(1, (t - startT) / span));
+        }
+        if (t >= endT) { finish(); return; }
+        video.requestVideoFrameCallback(cb);
+      };
       video.requestVideoFrameCallback(cb);
-    };
-    video.requestVideoFrameCallback(cb);
-    video.play().catch(err => { failure = err; finish(); });
-  });
-  video.playbackRate = 1;
+      video.play().catch(err => { failure = err; finish(); });
+    });
+  } finally {
+    // 정상 종료·에러·취소 모두 항상 복구
+    flowInternalPlayRef.current = false;
+    video.pause(); video.muted = true; video.playbackRate = 1;
+  }
   if (failure) throw failure;
 }
 
@@ -6067,6 +6073,14 @@ function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
   useEffect(() => { detectedRef.current = detected; if (detected && detected.band) bandRef.current = detected.band; }, [detected]);
   useEffect(() => { autoRemoveRef.current = autoRemove; }, [autoRemove]);
   useEffect(() => { runningRef.current = running; }, [running]);
+  // 'play' 가드: 사용자가 ▶/재생 확인을 눌러 playingRef가 true인 경우와 분석 패스의 내부 재생이 아니면 즉시 멈춘다
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    const guard = () => { if (!playingRef.current && !flowInternalPlayRef.current) v.pause(); };
+    v.addEventListener('play', guard);
+    return () => v.removeEventListener('play', guard);
+  }, []);
 
   // 같은 <video> 하나를 미리보기·썸네일·감지·재생 확인이 함께 쓰므로 모든 seek 작업을 한 줄로 직렬화한다
   function enqueue(fn) {
@@ -6151,7 +6165,7 @@ function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
       setSeekT(0); seekTRef.current = 0;
       setRangeStart(0); setRangeEnd(video.duration);
       setMsg('영상 로드됨: ' + video.duration.toFixed(2) + '초, ' + video.videoWidth + 'x' + video.videoHeight + '. 악보가 지나가는 영역(ROI)을 드래그로 지정하세요.');
-      try { await video.play(); video.pause(); } catch (err) {}
+      await seekSafe(video, 0.001); // 워밍업 재생 없이 seek만으로 첫 프레임을 그린다
       await seekTo(video, 0);
       requestRefresh();
     };
@@ -6161,7 +6175,7 @@ function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
   function stopPlay() {
     const v = videoRef.current;
     playingRef.current = false; setPlaying(false);
-    if (v) v.pause();
+    if (v) { v.pause(); v.muted = true; }
     requestRefresh();
   }
   function startPlay(stopAt) {
@@ -6191,9 +6205,13 @@ function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
     if (playingRef.current) stopPlay();
     enqueue(async () => {
       const v = videoRef.current;
-      await seekSafe(v, t);
-      seekTRef.current = t; setSeekT(t);
-      startPlay(t + 3);
+      try {
+        await seekSafe(v, t);
+        seekTRef.current = t; setSeekT(t);
+        startPlay(t + 3);
+      } catch (err) {
+        stopPlay();
+      }
     });
   }
 
@@ -6269,8 +6287,9 @@ function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
       setMsg('오류: ' + err.message);
     } finally {
       runningRef.current = false;
+      playingRef.current = false;
       setRunning(false);
-      video.pause(); video.playbackRate = 1;
+      video.pause(); video.muted = true; video.playbackRate = 1;
       requestRefresh();
     }
   }
