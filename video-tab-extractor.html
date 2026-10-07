@@ -5429,6 +5429,680 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
   );
 }
 
+// ================================================================================================
+// 연속 이동형(flow) 모드 — 악보가 멈춤 없이 가로로 계속 흐르는 영상 (오른쪽에서 들어와 왼쪽으로 나감)
+// 1단계: 이동량 추적 + 악보 스트립 재구성. 기존 페이지전환형/스크롤형 로직은 건드리지 않고(공용 함수는 호출만)
+// 이 모드 전용 함수는 모두 flow 접두어로 독립 구현한다.
+// ================================================================================================
+
+function flowRvfcSupported(video) { return typeof video.requestVideoFrameCallback === 'function'; }
+function flowYield() { return new Promise(r => setTimeout(r, 0)); }
+
+// 순차 재생 기반 프레임 수집 — requestVideoFrameCallback으로 프레임이 실제로 표시될 때마다 호출되며 미디어 시간
+// 간격 ≥ minGap인 프레임만 onFrame(mediaTime)으로 넘긴다(seek 금지: 시작 위치를 잡을 때 한 번만 seek).
+// 미지원 브라우저는 기존 seek 방식으로 폴백한다.
+async function flowPlayPass(video, { startT, endT, rate, minGap, onFrame, onProgress, abortRef }) {
+  const span = Math.max(0.001, endT - startT);
+  if (!flowRvfcSupported(video)) {
+    for (let t = startT; t <= endT && !(abortRef && abortRef.current); t += minGap) {
+      await seekTo(video, t);
+      onFrame(t);
+      if (onProgress) onProgress((t - startT) / span);
+    }
+    return;
+  }
+  video.muted = true;
+  video.playbackRate = Math.max(0.25, Math.min(3, rate || 1));
+  await seekSafe(video, startT);
+  let failure = null;
+  await new Promise(resolve => {
+    let last = -Infinity, done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      video.pause();
+      video.removeEventListener('ended', finish);
+      resolve();
+    };
+    video.addEventListener('ended', finish);
+    const cb = (now, meta) => {
+      if (done) return;
+      if (abortRef && abortRef.current) { finish(); return; }
+      const t = meta.mediaTime;
+      if (t - last >= minGap) {
+        last = t;
+        try { onFrame(t); } catch (err) { failure = err; finish(); return; }
+        if (onProgress) onProgress(Math.min(1, (t - startT) / span));
+      }
+      if (t >= endT) { finish(); return; }
+      video.requestVideoFrameCallback(cb);
+    };
+    video.requestVideoFrameCallback(cb);
+    video.play().catch(err => { failure = err; finish(); });
+  });
+  video.playbackRate = 1;
+  if (failure) throw failure;
+}
+
+// ---- 1패스: ROI를 저해상도 그레이로 수집 ----
+function flowMakeLowCapture(video, roi, maxW) {
+  const { rx0, ry0, rw, rh } = roiRectPx(video, roi);
+  const scale = Math.min(1, maxW / rw);
+  const w = Math.max(8, Math.round(rw * scale)), h = Math.max(4, Math.round(rh * scale));
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const ctx = cv.getContext('2d', { willReadFrequently: true });
+  return t => {
+    ctx.drawImage(video, rx0, ry0, rw, rh, 0, 0, w, h);
+    const d = ctx.getImageData(0, 0, w, h).data;
+    const gray = new Uint8Array(w * h);
+    for (let i = 0, p = 0; i < d.length; i += 4, p++) gray[p] = (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]) | 0;
+    return { t, gray, w, h };
+  };
+}
+
+// 오선 행 평균 제거(기존 scrollRemoveAxisMean과 같은 방식: 행별 평균을 빼서 오선을 없앰) — 행 단위 Float32 배열로
+function flowToZeroMeanRows(sample) {
+  const { gray, w, h } = sample;
+  const f = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    let m = 0;
+    const b = y * w;
+    for (let x = 0; x < w; x++) m += gray[b + x];
+    m /= w;
+    for (let x = 0; x < w; x++) f[b + x] = gray[b + x] - m;
+  }
+  return f;
+}
+
+// 정적 열 자동 감지 — "이웃 열은 크게 변하는데 프레임 간 거의 변하지 않는 열"(재생바, 좌우 잘림 경계, 고정 오버레이)
+function flowDetectStaticCols(samples, w, h) {
+  const mask = new Uint8Array(w);
+  const n = samples.length;
+  if (n < 6) return mask;
+  const diffs = [];
+  for (let k = 1; k < n; k++) {
+    let sum = 0;
+    const a = samples[k - 1].gray, b = samples[k].gray;
+    for (let i = 0; i < a.length; i += 4) sum += Math.abs(a[i] - b[i]);
+    diffs.push({ k, v: sum });
+  }
+  diffs.sort((p, q) => q.v - p.v);
+  const picked = [];
+  for (const d of diffs) {
+    if (picked.length >= 60) break;
+    if (picked.every(p => Math.abs(p - d.k) >= 3)) picked.push(d.k);
+  }
+  if (picked.length < 5) return mask;
+  const tc = new Float64Array(w);
+  for (const k of picked) {
+    const fa = flowToZeroMeanRows(samples[k - 1]), fb = flowToZeroMeanRows(samples[k]);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) tc[x] += Math.abs(fb[y * w + x] - fa[y * w + x]);
+  }
+  for (let x = 0; x < w; x++) tc[x] /= (picked.length * h);
+  const isStatic = new Uint8Array(w);
+  for (let x = 0; x < w; x++) {
+    let s = 0, c = 0;
+    for (let dx = -10; dx <= 10; dx++) {
+      if (Math.abs(dx) <= 2) continue;
+      const xx = x + dx;
+      if (xx >= 0 && xx < w) { s += tc[xx]; c++; }
+    }
+    const ref = c ? s / c : 0;
+    if (ref >= 2 && tc[x] < 0.25 * ref) isStatic[x] = 1;
+  }
+  for (let x = 0; x < w; x++) if (isStatic[x] || (x > 0 && isStatic[x - 1]) || (x + 1 < w && isStatic[x + 1])) mask[x] = 1;
+  return mask;
+}
+
+// B(x) = A(x + s) 관계(내용이 왼쪽으로 s만큼 이동)에서의 NCC. 마스크된 열(정적 열)은 양쪽에서 제외.
+function flowNccAt(a, b, w, h, mask, s) {
+  let num = 0, da = 0, db = 0;
+  const xe = w - s;
+  for (let y = 0; y < h; y++) {
+    const base = y * w;
+    for (let x = 0; x < xe; x++) {
+      if (mask[x] || mask[x + s]) continue;
+      const va = a[base + x + s], vb = b[base + x];
+      num += va * vb; da += va * va; db += vb * vb;
+    }
+  }
+  if (da < 1e-6 || db < 1e-6) return -1;
+  return num / Math.sqrt(da * db);
+}
+
+// 정수 shift 범위 탐색 + 포물선 보정(서브픽셀) + 신뢰도(피크 NCC, 2위 피크와의 차이)
+function flowFindShift(a, b, w, h, mask, sMin, sMax) {
+  sMin = Math.max(0, Math.floor(sMin));
+  sMax = Math.min(w - 8, Math.ceil(sMax));
+  if (sMax < sMin) sMax = sMin;
+  const lo = Math.max(0, sMin - 1), hi = Math.min(w - 8, sMax + 1);
+  const vals = [];
+  for (let s = lo; s <= hi; s++) vals.push(flowNccAt(a, b, w, h, mask, s));
+  let bi = 0;
+  for (let i = 1; i < vals.length; i++) if (vals[i] > vals[bi]) bi = i;
+  const peak = vals[bi];
+  let second = -1;
+  for (let i = 0; i < vals.length; i++) if (Math.abs(i - bi) >= 3 && vals[i] > second) second = vals[i];
+  let shift = lo + bi;
+  if (bi > 0 && bi < vals.length - 1) {
+    const l = vals[bi - 1], r = vals[bi + 1], den = l - 2 * peak + r;
+    if (Math.abs(den) > 1e-9) shift += Math.max(-0.5, Math.min(0.5, 0.5 * (l - r) / den));
+  }
+  const margin = peak - Math.max(second, 0);
+  return { shift, peak, second, margin, ok: peak >= 0.5 && margin >= 0.1 };
+}
+
+// 샘플 시각들에서 누적 이동량 x(t)(원본 해상도 px)를 구한다.
+async function flowTrackMotion(samples, nativeW, playbarFrac, abortRef, onProgress) {
+  const n = samples.length;
+  const w = samples[0].w, h = samples[0].h;
+  const scale = nativeW / w;
+  const staticLow = flowDetectStaticCols(samples, w, h);
+  const mask = new Uint8Array(staticLow);
+  let barCols = null;
+  if (playbarFrac != null) {
+    const c = Math.round(playbarFrac * w), r = Math.max(1, Math.ceil(4 / scale));
+    for (let x = Math.max(0, c - r); x <= Math.min(w - 1, c + r); x++) mask[x] = 1;
+    barCols = [(c - r) * scale, (c + r + 1) * scale];
+  }
+  const tArr = [samples[0].t], shiftNative = [0], conf = [1], interp = [false], margin = [1];
+  let vPrev = null; // 저해상도 px/s
+  let prevF = flowToZeroMeanRows(samples[0]);
+  for (let k = 1; k < n; k++) {
+    if (abortRef && abortRef.current) return null;
+    const curF = flowToZeroMeanRows(samples[k]);
+    const dt = Math.max(1e-3, samples[k].t - samples[k - 1].t);
+    let sMin, sMax;
+    if (vPrev == null) { sMin = 0; sMax = 0.2 * w; }
+    else { const e = vPrev * dt; sMin = Math.max(0, e * 0.5 - 1); sMax = e * 1.5 + Math.max(2, 0.03 * w); }
+    let r = flowFindShift(prevF, curF, w, h, mask, sMin, sMax);
+    if (!r.ok && vPrev != null) {
+      const wide = flowFindShift(prevF, curF, w, h, mask, 0, 0.3 * w); // 속도가 급변했을 수 있어 한 번 넓혀 재시도
+      if (wide.ok) r = wide;
+    }
+    let sLow, isInterp = false;
+    if (r.ok) { sLow = r.shift; vPrev = sLow / dt; }
+    else { sLow = vPrev != null ? vPrev * dt : 0; isInterp = true; } // 쉼표·내용 없음 구간: 직전 속도로 보간
+    tArr.push(samples[k].t); shiftNative.push(sLow * scale); conf.push(r.peak); margin.push(r.margin); interp.push(isInterp);
+    prevF = curF;
+    if (k % 40 === 0) { if (onProgress) onProgress(k / n); await flowYield(); }
+  }
+  const X = [0];
+  for (let k = 1; k < n; k++) X.push(X[k - 1] + shiftNative[k]);
+  // 영상 앞뒤 정지 구간(이동 0) 제외 — 신뢰할 수 있는 샘플에서 이동이 있는 첫/마지막 구간
+  const moving = k => !interp[k] && shiftNative[k] > 0.3 * scale;
+  let k0 = -1, k1 = -1;
+  for (let k = 1; k < n; k++) if (moving(k)) { k0 = k - 1; break; }
+  for (let k = n - 1; k >= 1; k--) if (moving(k)) { k1 = k; break; }
+  if (k0 < 0 || k1 <= k0) return null;
+  const staticRanges = [];
+  let sx = -1;
+  for (let x = 0; x <= w; x++) {
+    if (x < w && staticLow[x]) { if (sx < 0) sx = x; }
+    else if (sx >= 0) { staticRanges.push([sx * scale, x * scale]); sx = -1; }
+  }
+  return { t: tArr, X, shiftNative, conf, margin, interp, k0, k1, staticRanges, barCols, nativeW, scale, w0: w };
+}
+
+function flowInterpX(track, t) {
+  const T = track.t, X = track.X;
+  if (t <= T[0]) return X[0];
+  if (t >= T[T.length - 1]) return X[X.length - 1];
+  let lo = 0, hi = T.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (T[m] <= t) lo = m; else hi = m; }
+  const f = (t - T[lo]) / Math.max(1e-9, T[hi] - T[lo]);
+  return X[lo] + f * (X[hi] - X[lo]);
+}
+
+// ---- 2패스: 새로 들어온 폭만큼의 열 슬라이스를 원본 해상도로 이어 붙임 ----
+// 긴 스트립은 캔버스 최대 크기를 넘을 수 있어 폭 6000px 단위의 조각(chunk) 목록으로 만든다.
+function flowChunkBuilder(h, chunkW) {
+  const chunks = [];
+  let cur = null, curW = 0;
+  const startChunk = () => {
+    cur = document.createElement('canvas');
+    cur.width = chunkW; cur.height = h;
+    const c = cur.getContext('2d');
+    c.fillStyle = '#ffffff'; c.fillRect(0, 0, chunkW, h);
+    curW = 0;
+    chunks.push(cur);
+  };
+  return {
+    append(src, sx, sw) {
+      sw = Math.round(sw); sx = Math.round(sx);
+      while (sw > 0) {
+        if (!cur || curW >= chunkW) startChunk();
+        const take = Math.min(sw, chunkW - curW);
+        cur.getContext('2d').drawImage(src, sx, 0, take, h, curW, 0, take, h);
+        curW += take; sx += take; sw -= take;
+      }
+    },
+    pad(sw) {
+      sw = Math.round(sw);
+      while (sw > 0) {
+        if (!cur || curW >= chunkW) startChunk();
+        const take = Math.min(sw, chunkW - curW);
+        curW += take; sw -= take; // 흰색 그대로
+      }
+    },
+    finish() {
+      if (cur && curW < chunkW) {
+        const t = document.createElement('canvas');
+        t.width = Math.max(1, curW); t.height = h;
+        t.getContext('2d').drawImage(cur, 0, 0);
+        chunks[chunks.length - 1] = t;
+      }
+      return chunks;
+    },
+    total() { return (chunks.length - 1) * chunkW + curW; },
+  };
+}
+
+// 슬라이스 소스 위치(u0): 기본은 ROI 오른쪽 가장자리 직전의 깨끗한 구간(오른쪽 10~35% → 소스 [0.65W, 0.90W], u0=0.90W).
+// 재생바/정적 열과 겹치면 겹치지 않는 쪽으로 옮긴다(오른쪽으로 옮길 수 있으면 오른쪽, 아니면 왼쪽).
+function flowChooseSourceEdge(W, maxDelta, barRanges) {
+  const winW = Math.min(W * 0.35, Math.max(maxDelta, 4));
+  const hits = u0 => barRanges.some(([a, b]) => b + 2 > u0 - winW && a - 2 < u0);
+  const def = Math.round(W * 0.9);
+  if (!barRanges.length || !hits(def)) return def;
+  const right = Math.round(Math.max(...barRanges.map(r => r[1])) + 2 + winW);
+  if (right <= W && !hits(right)) return right;
+  const left = Math.round(Math.min(...barRanges.map(r => r[0])) - 2);
+  if (left >= winW && !hits(left)) return left;
+  return def;
+}
+
+async function flowRebuildStrip({ video, roi, track, medianObs, rate, abortRef, onProgress }) {
+  const { rx0, ry0, rw, rh } = roiRectPx(video, roi);
+  const W = Math.max(1, Math.round(rw)), H = Math.max(1, Math.round(rh));
+  const confShifts = [];
+  for (let k = track.k0 + 1; k <= track.k1; k++) if (!track.interp[k]) confShifts.push(track.shiftNative[k]);
+  confShifts.sort((a, b) => a - b);
+  const maxDelta = confShifts.length ? confShifts[Math.floor(confShifts.length * 0.95)] : W * 0.1;
+  const barRanges = track.staticRanges.map(r => [r[0], r[1]]);
+  if (track.barCols) barRanges.push(track.barCols);
+  const u0 = Math.max(2, Math.min(W - 1, flowChooseSourceEdge(W, maxDelta, barRanges)));
+  const builder = flowChunkBuilder(H, 6000);
+  const pool = [];
+  for (let i = 0; i < 4; i++) { const c = document.createElement('canvas'); c.width = W; c.height = H; pool.push(c); }
+  let poolIdx = 0;
+  const tStart = track.t[track.k0], tEnd = track.t[track.k1];
+  const Xref = track.X[track.k0];
+  let Gprev = null, last = null, gaps = 0, frames = 0;
+  const hist = []; // medianObs용: [{cap, G}]
+
+  const medianSlice = (prev, center, next, wj, wn) => {
+    const out = document.createElement('canvas');
+    out.width = wj; out.height = H;
+    const octx = out.getContext('2d');
+    const img = octx.createImageData(wj, H);
+    const read = (f, sx) => {
+      if (!f || sx < 0 || sx + wj > W) return null;
+      return f.cap.getContext('2d').getImageData(sx, 0, wj, H).data;
+    };
+    const cen = read(center, u0 - wj);
+    const pre = prev ? read(prev, u0) : null; // 직전 프레임은 같은 내용이 오른쪽(+wj)에 있다
+    const nxt = (next && wn >= 0) ? read(next, u0 - wj - wn) : null;
+    const srcs = [cen, pre, nxt].filter(Boolean);
+    const v = [0, 0, 0];
+    for (let i = 0; i < img.data.length; i++) {
+      if (srcs.length === 1) { img.data[i] = srcs[0][i]; continue; }
+      for (let j = 0; j < srcs.length; j++) v[j] = srcs[j][i];
+      const arr = srcs.length === 2 ? [v[0], v[1]] : [v[0], v[1], v[2]];
+      arr.sort((a, b) => a - b);
+      img.data[i] = arr[srcs.length === 2 ? 1 : 1];
+    }
+    octx.putImageData(img, 0, 0);
+    return out;
+  };
+
+  const emitMedianFor = (idx, finalFlush) => {
+    // hist[idx]를 중심으로, 이전/다음 프레임과 픽셀별 중앙값
+    const c = hist[idx];
+    const p = idx > 0 ? hist[idx - 1] : null, nx = idx + 1 < hist.length ? hist[idx + 1] : null;
+    const wj = c.G - (p ? p.G : c.G);
+    if (wj <= 0) return;
+    const w2 = Math.min(wj, u0);
+    if (wj > w2) { builder.pad(wj - w2); gaps += wj - w2; }
+    const wn = nx ? nx.G - c.G : -1;
+    builder.append(medianSlice(p, c, nx, w2, wn), 0, w2);
+  };
+
+  const onFrame = t => {
+    if (t < tStart - 1e-6 || t > tEnd + 0.25) return;
+    const cap = pool[poolIdx++ % pool.length];
+    cap.getContext('2d').drawImage(video, rx0, ry0, rw, rh, 0, 0, W, H);
+    const G = Math.round(flowInterpX(track, t) - Xref);
+    frames++;
+    last = cap;
+    if (Gprev == null) {
+      builder.append(cap, 0, u0); // 처음 화면에서 u0 왼쪽(이미 화면에 있던 부분)
+      Gprev = G;
+      if (medianObs) hist.push({ cap, G });
+      return;
+    }
+    if (medianObs) {
+      hist.push({ cap, G });
+      if (hist.length >= 3) { emitMedianFor(hist.length - 2); if (hist.length > 3) hist.shift(); }
+      Gprev = G;
+      return;
+    }
+    const w = G - Gprev;
+    if (w > 0) {
+      const w2 = Math.min(w, u0);
+      if (w > w2) { builder.pad(w - w2); gaps += w - w2; }
+      builder.append(cap, u0 - w2, w2);
+      Gprev = G; // 서브픽셀 오차는 누적 정수 위치(G)에 이월된다
+    }
+  };
+
+  await flowPlayPass(video, {
+    startT: Math.max(0, tStart - 0.05), endT: tEnd + 0.25, rate, minGap: 0.1, abortRef, onFrame,
+    onProgress: f => onProgress && onProgress(f),
+  });
+  if (abortRef && abortRef.current) return null;
+  if (!last) throw new Error('스트립 재구성 중 프레임을 얻지 못했습니다.');
+  if (medianObs && hist.length >= 2) emitMedianFor(hist.length - 1, true);
+  builder.append(last, u0, W - u0); // 마지막 화면에서 u0 오른쪽(아직 지나가지 않은 부분)
+  return { chunks: builder.finish(), totalW: builder.total(), H, u0, maxDelta, gaps, frames, barRanges };
+}
+
+// ---- 전체 파이프라인 ----
+async function flowRunPipeline({ video, roi, playbarFrac, rate, medianObs, scrollDefaults, abortRef, onProgress }) {
+  const { rw, rh } = roiRectPx(video, roi);
+  const nativeW = Math.round(rw);
+  const dur = video.duration;
+  const usedRvfc = flowRvfcSupported(video);
+  const samples = [];
+  const cap = flowMakeLowCapture(video, roi, 480);
+  const t0 = performance.now();
+  let lastPct = -1;
+  const report = (label, f, lo, hi) => {
+    const pct = Math.round((lo + (hi - lo) * Math.max(0, Math.min(1, f))) * 100);
+    if (pct !== lastPct) { lastPct = pct; onProgress(label, pct); }
+  };
+  await flowPlayPass(video, {
+    startT: 0, endT: dur, rate, minGap: 0.1, abortRef,
+    onFrame: t => samples.push(cap(t)),
+    onProgress: f => report('1/3 이동량 추적용 프레임 수집 (순차 재생)', f, 0, 0.35),
+  });
+  if (abortRef.current) return null;
+  if (samples.length < 6) throw new Error('수집된 프레임이 너무 적습니다.');
+  const track = await flowTrackMotion(samples, nativeW, playbarFrac, abortRef, f => report('2/3 이동량 계산 (NCC)', f, 0.35, 0.5));
+  if (abortRef.current) return null;
+  if (!track) throw new Error('가로 이동이 감지되지 않았습니다. ROI(영역)나 영상을 확인하세요.');
+  const strip = await flowRebuildStrip({
+    video, roi, track, medianObs, rate, abortRef,
+    onProgress: f => report('3/3 스트립 재구성 (순차 재생)', f, 0.5, 0.92),
+  });
+  if (!strip) return null;
+  // 전처리: 원본 해상도에서 조각별로 (반전 여부는 첫 조각 기준으로 전체에 동일 적용). 임계값·잡티 제거·선 복원은 기존 함수 그대로.
+  onProgress('전처리 적용 중...', 93);
+  const sd = scrollDefaults;
+  const avg = computeAvgLuminanceFromCanvas(strip.chunks[0]);
+  const opts = { ...sd, invertMode: sd.invertMode === 'auto' ? (avg < 128 ? 'on' : 'off') : sd.invertMode };
+  for (let i = 0; i < strip.chunks.length; i++) {
+    scrollApplyPreprocInPlace(strip.chunks[i], opts);
+    await flowYield();
+  }
+  onProgress('완료', 100);
+  const confCnt = track.interp.slice(track.k0 + 1, track.k1 + 1).filter(Boolean).length;
+  return {
+    track, chunks: strip.chunks, totalW: strip.totalW, H: strip.H,
+    stats: {
+      duration: dur, samples: samples.length, usedRvfc, rate, elapsed: (performance.now() - t0) / 1000,
+      motionStart: track.t[track.k0], motionEnd: track.t[track.k1],
+      lowConfCount: confCnt, moveSamples: track.k1 - track.k0,
+      u0: strip.u0, maxDelta: strip.maxDelta, gaps: strip.gaps, medianObs,
+      staticRanges: track.staticRanges, barCols: track.barCols,
+    },
+  };
+}
+
+// x(t) 그래프 — 위: 누적 이동량(px), 아래: 속도(px/s). 신뢰도 낮은(보간된) 구간은 붉은 음영, 제외된 앞/뒤 정지 구간은 회색 음영.
+function flowDrawGraph(canvas, track) {
+  const w = canvas.width = canvas.clientWidth || 800;
+  const h = canvas.height = 260;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, w, h);
+  const T = track.t, n = T.length;
+  const t0 = T[0], t1 = T[n - 1];
+  const px = t => 40 + ((t - t0) / Math.max(1e-9, t1 - t0)) * (w - 50);
+  const topY0 = 10, topY1 = 120, botY0 = 140, botY1 = 250;
+  const Xmax = Math.max(1, track.X[n - 1]);
+  const speed = track.shiftNative.map((s, k) => (k === 0 ? 0 : s / Math.max(1e-3, T[k] - T[k - 1])));
+  const Vmax = Math.max(1, ...speed) * 1.1;
+  // 음영
+  for (let k = 1; k < n; k++) {
+    const xa = px(T[k - 1]), xb = px(T[k]);
+    if (k <= track.k0 || k > track.k1) { ctx.fillStyle = 'rgba(150,150,150,0.18)'; ctx.fillRect(xa, topY0, xb - xa, botY1 - topY0); }
+    else if (track.interp[k]) { ctx.fillStyle = 'rgba(220,50,50,0.25)'; ctx.fillRect(xa, topY0, xb - xa, botY1 - topY0); }
+  }
+  ctx.strokeStyle = '#999'; ctx.lineWidth = 1;
+  ctx.strokeRect(40, topY0, w - 50, topY1 - topY0);
+  ctx.strokeRect(40, botY0, w - 50, botY1 - botY0);
+  ctx.strokeStyle = '#3c3489'; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (let k = 0; k < n; k++) {
+    const x = px(T[k]), y = topY1 - (track.X[k] / Xmax) * (topY1 - topY0);
+    if (k === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  ctx.strokeStyle = '#1e7d3c';
+  ctx.beginPath();
+  for (let k = 0; k < n; k++) {
+    const x = px(T[k]), y = botY1 - (speed[k] / Vmax) * (botY1 - botY0);
+    if (k === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  ctx.fillStyle = '#555'; ctx.font = '11px sans-serif';
+  ctx.fillText('누적 이동량 ' + Math.round(Xmax) + 'px', 44, topY0 + 12);
+  ctx.fillText('속도 (최대 ' + Math.round(Vmax) + ' px/s)', 44, botY0 + 12);
+  ctx.fillText(t0.toFixed(1) + 's', 40, h - 1);
+  ctx.fillText(t1.toFixed(1) + 's', w - 40, h - 1);
+}
+
+function FlowChunkView({ chunk, scale }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    const cv = ref.current;
+    if (!cv) return;
+    cv.width = Math.max(1, Math.round(chunk.width * scale));
+    cv.height = Math.max(1, Math.round(chunk.height * scale));
+    const ctx = cv.getContext('2d');
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(chunk, 0, 0, cv.width, cv.height);
+  }, [chunk, scale]);
+  return <canvas ref={ref} style={{ display: 'block', flex: '0 0 auto' }} />;
+}
+
+function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
+  const [videoFile, setVideoFile] = useState(null);
+  const [videoLoaded, setVideoLoaded] = useState(false);
+  const [duration, setDuration] = useState(0);
+  const [seekT, setSeekT] = useState(0);
+  const [roi, setRoi] = useState(null);
+  const [playbarFrac, setPlaybarFrac] = useState(null); // 선택 사항 — ROI 폭 대비 재생바 열 위치(0~1)
+  const [rate, setRate] = useState(2);
+  const [medianObs, setMedianObs] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [progress, setProgress] = useState({ label: '', pct: 0 });
+  const [msg, setMsg] = useState('연속 이동형 영상 파일을 선택하세요.');
+  const [result, setResult] = useState(null);
+  const abortRef = useRef(false);
+  const barCanvasRef = useRef(null);
+  const graphRef = useRef(null);
+
+  function handleFileChange(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const video = videoRef.current;
+    video.src = URL.createObjectURL(file);
+    setVideoLoaded(false); setRoi(null); setPlaybarFrac(null); setResult(null);
+    setVideoFile(file);
+    video.onloadedmetadata = async () => {
+      setVideoLoaded(true);
+      setDuration(video.duration);
+      setSeekT(0);
+      setMsg('영상 로드됨: ' + video.duration.toFixed(2) + '초, ' + video.videoWidth + 'x' + video.videoHeight + '. 악보가 지나가는 영역(ROI)을 드래그로 지정하세요.');
+      try { await video.play(); video.pause(); } catch (err) {}
+      await seekTo(video, 0);
+      drawBarPreview();
+    };
+  }
+
+  async function onSeek(e) {
+    const t = parseFloat(e.target.value);
+    setSeekT(t);
+    await seekTo(videoRef.current, t);
+    drawBarPreview();
+  }
+
+  // 재생바 위치 지정(선택) — ROI 크롭 미리보기에서 재생바가 있는 열을 클릭
+  function drawBarPreview(frac) {
+    const video = videoRef.current, cv = barCanvasRef.current;
+    if (!video || !cv || !video.videoWidth) return;
+    const { rx0, ry0, rw, rh } = roiRectPx(video, roi);
+    cv.width = Math.round(Math.min(rw, 900)); cv.height = Math.round(rh * cv.width / rw);
+    const ctx = cv.getContext('2d');
+    ctx.drawImage(video, rx0, ry0, rw, rh, 0, 0, cv.width, cv.height);
+    const f = frac !== undefined ? frac : playbarFrac;
+    if (f != null) {
+      ctx.strokeStyle = '#e03030'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(f * cv.width, 0); ctx.lineTo(f * cv.width, cv.height); ctx.stroke();
+    }
+  }
+  useEffect(() => { if (videoLoaded) drawBarPreview(); }, [roi, playbarFrac, videoLoaded]);
+  function onBarClick(e) {
+    const r = e.currentTarget.getBoundingClientRect();
+    setPlaybarFrac(Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)));
+  }
+
+  async function run() {
+    const video = videoRef.current;
+    if (!video || !videoLoaded) return;
+    abortRef.current = false;
+    setRunning(true); setResult(null); setMsg('분석 중...');
+    try {
+      const out = await flowRunPipeline({
+        video, roi, playbarFrac, rate, medianObs, scrollDefaults: flowDefaults, abortRef,
+        onProgress: (label, pct) => setProgress({ label, pct }),
+      });
+      if (out) { setResult(out); setMsg('완료'); } else setMsg('중단되었습니다.');
+    } catch (err) {
+      setMsg('오류: ' + err.message);
+    } finally {
+      setRunning(false);
+      video.pause(); video.playbackRate = 1;
+    }
+  }
+
+  useEffect(() => { if (result && graphRef.current) flowDrawGraph(graphRef.current, result.track); }, [result]);
+
+  async function downloadStrip() {
+    if (!result) return;
+    if (result.totalW <= 30000) {
+      const cv = document.createElement('canvas');
+      cv.width = result.totalW; cv.height = result.H;
+      const ctx = cv.getContext('2d');
+      let x = 0;
+      for (const c of result.chunks) { ctx.drawImage(c, x, 0); x += c.width; }
+      await downloadCanvasPng(cv, 'flow_strip.png');
+    } else {
+      // 한 장으로 만들기엔 너무 길어(브라우저 캔버스 한계) 조각별로 내려받는다
+      for (let i = 0; i < result.chunks.length; i++) {
+        await downloadCanvasPng(result.chunks[i], 'flow_strip_part' + (i + 1) + '.png');
+        await new Promise(r => setTimeout(r, 300));
+      }
+    }
+  }
+
+  const st = result && result.stats;
+  const viewScale = result ? Math.min(1, 180 / result.H) : 1;
+  return (
+    <div>
+      <div className="block">
+        <div className="block-head"><span>연속 이동형 — 영역 지정 · 이동량 추적 · 스트립 재구성</span></div>
+        <p className="hint-text">
+          악보가 멈춤 없이 가로로 계속 흐르는 영상용입니다(오른쪽에서 들어와 왼쪽으로 나감). 영상을 고르고 악보가 지나가는 영역을
+          드래그로 지정한 뒤 시작하면, 영상을 순차 재생하며 프레임 간 이동량을 추적해 악보 전체를 하나의 긴 스트립으로 이어 붙입니다.
+          이 단계에서는 마디선·그룹화·악보 빌더 전달 없이 이동량이 맞는지 먼저 확인합니다.
+        </p>
+        <div className="controls">
+          <label>영상 파일: <input type="file" accept="video/*" onChange={handleFileChange} disabled={running} /></label>
+          <label>재생 속도:
+            <select value={rate} onChange={e => setRate(parseFloat(e.target.value))} disabled={running} style={{ width: 'auto', marginLeft: '6px' }}>
+              <option value="1">1배</option><option value="2">2배</option><option value="3">3배 (최대)</option>
+            </select>
+          </label>
+          <label><input type="checkbox" checked={medianObs} onChange={e => setMedianObs(e.target.checked)} disabled={running} /> 현재 음표 강조 번짐 보정(여러 프레임 중앙값)</label>
+        </div>
+        <ScrollRoiPicker videoRef={videoRef} videoLoaded={videoLoaded} roi={roi} setRoi={setRoi} />
+        <div className="toolbar">
+          <label style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
+            영상 상태 확인:
+            <input type="range" min="0" max={duration || 0} step="0.1" value={seekT} disabled={!videoLoaded || running} style={{ flex: 1 }} onChange={onSeek} />
+            <span className="slider-label" style={{ margin: 0 }}>{seekT.toFixed(1)}s / {duration.toFixed(1)}s</span>
+          </label>
+        </div>
+        {videoLoaded && (
+          <div>
+            <div className="slider-label">
+              재생바 위치 (선택 사항) — 화면에 고정된 재생바가 보이면 그 열을 클릭하세요. 지정하지 않아도 정적 열은 자동으로 감지해 제외합니다.
+              {playbarFrac != null ? ' (지정됨: ROI 폭의 ' + (playbarFrac * 100).toFixed(1) + '%)' : ''}
+            </div>
+            <canvas ref={barCanvasRef} onClick={onBarClick} style={{ maxWidth: '100%', cursor: 'crosshair', border: '1px solid var(--border-strong)' }} />
+            <div className="toolbar"><button className="icon-btn" onClick={() => setPlaybarFrac(null)} disabled={playbarFrac == null}>재생바 지정 해제</button></div>
+          </div>
+        )}
+      </div>
+
+      <ScrollPreprocPanel scrollDefaults={flowDefaults} setScrollDefaults={setFlowDefaults} />
+
+      <div className="toolbar">
+        <button className="icon-btn" onClick={onModeBack} disabled={running}>← 모드</button>
+        <button onClick={run} disabled={!videoLoaded || running}>{running ? '진행 중...' : '이동량 추적 + 스트립 재구성 시작'}</button>
+        {running && <button className="icon-btn" onClick={() => { abortRef.current = true; }}>중단</button>}
+        <span className="save-msg">{running ? (progress.label + ' — ' + progress.pct + '%') : msg}</span>
+      </div>
+      {running && (
+        <div style={{ height: '8px', background: 'var(--border)', borderRadius: '4px', overflow: 'hidden' }}>
+          <div style={{ width: progress.pct + '%', height: '100%', background: 'var(--accent)' }} />
+        </div>
+      )}
+
+      {result && (
+        <div className="block">
+          <div className="block-head"><span>결과 확인 — 이동량 x(t)와 재구성 스트립</span></div>
+          <p className="hint-text">
+            이동 구간 {st.motionStart.toFixed(2)}s ~ {st.motionEnd.toFixed(2)}s (앞뒤 정지 구간 제외) · 샘플 {st.samples}개 · 신뢰도 낮아 보간된 구간 {st.lowConfCount}/{st.moveSamples}개 ·
+            평균 속도 {Math.round((result.track.X[result.track.k1] - result.track.X[result.track.k0]) / Math.max(1e-6, st.motionEnd - st.motionStart))}px/s ·
+            스트립 {result.totalW}×{result.H}px · 처리 {st.elapsed.toFixed(1)}초 ({st.usedRvfc ? '순차 재생' : 'seek 폴백'}, {st.rate}배)
+          </p>
+          <p className="hint-text">
+            슬라이스 소스 위치: ROI 폭의 {Math.round(st.u0 / (result.track.nativeW) * 100)}% 지점 직전 · 최대 프레임당 이동 {Math.round(st.maxDelta)}px ·
+            자동 감지된 정적 열 {st.staticRanges.length}곳{st.staticRanges.length ? ' (' + st.staticRanges.map(r => Math.round(r[0]) + '~' + Math.round(r[1])).join(', ') + 'px)' : ''}
+            {st.barCols ? ' · 지정한 재생바 ' + Math.round(st.barCols[0]) + '~' + Math.round(st.barCols[1]) + 'px' : ''}
+            {st.gaps ? <b style={{ color: '#c0392b' }}> · 한 프레임 이동량이 슬라이스 소스보다 커서 빈 구간 {st.gaps}px 발생 (재생 속도를 낮춰 다시 시도하세요)</b> : ''}
+          </p>
+          <canvas ref={graphRef} style={{ width: '100%', height: '260px', border: '1px solid var(--border-strong)', background: '#fff' }} />
+          <p className="hint-text">회색 음영 = 제외된 앞/뒤 정지 구간 · 붉은 음영 = 신뢰도가 낮아 직전 속도로 보간한 구간</p>
+          <div style={{ overflowX: 'auto', border: '1px solid var(--border-strong)', background: '#fff' }}>
+            <div style={{ display: 'flex', width: 'max-content' }}>
+              {result.chunks.map((c, i) => <FlowChunkView key={i} chunk={c} scale={viewScale} />)}
+            </div>
+          </div>
+          <div className="toolbar">
+            <button onClick={downloadStrip}>스트립 PNG 다운로드{result.totalW > 30000 ? ' (너무 길어 ' + result.chunks.length + '개 조각으로 분할)' : ''}</button>
+            <button className="icon-btn" onClick={() => setResult(null)}>결과 닫기</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function App() {
   // 1단계: 모드 선택. 'page'(페이지 전환형, 기존 로직 그대로) | 'scroll'(스크롤형, 새 모드) | null(선택 전).
   const [mode, setMode] = useState(null);
@@ -5445,6 +6119,9 @@ function App() {
 
   // 스크롤형 전용 상태 — 페이지 전환형의 videoRef/frames/items 등과 완전히 분리된 별도 트리.
   const scrollVideoRef = useRef(null);
+  // 연속 이동형 전용 — 별도 <video>와 전처리 설정(스크롤형 설정과 독립)
+  const flowVideoRef = useRef(null);
+  const [flowDefaults, setFlowDefaults] = useState(SCROLL_DEFAULTS_INIT);
   const [scrollPhase, setScrollPhase] = useState('capture'); // 'capture' (2단계 수동 부분) | 'result' (4~5단계)
   const [scrollDefaults, setScrollDefaults] = useState(SCROLL_DEFAULTS_INIT);
   const [scrollCapture, setScrollCapture] = useState(null); // ScrollCaptureStep의 onDone 결과
@@ -5484,6 +6161,7 @@ function App() {
           other's — harmless to keep both mounted since only one mode is ever actually driven. */}
       <video ref={videoRef} muted className="hidden-video" />
       <video ref={scrollVideoRef} muted className="hidden-video" />
+      <video ref={flowVideoRef} muted playsInline className="hidden-video" />
 
       <div className="titlebar">
         <h1>영상에서 TAB 추출</h1>
@@ -5510,6 +6188,10 @@ function App() {
             <button className="mode-card" onClick={() => setMode('scroll')}>
               <div className="mode-card-title">스크롤형</div>
               <div className="mode-card-desc">화면이 멈추지 않고 계속 옆/위로 흘러가듯 넘어가는 영상</div>
+            </button>
+            <button className="mode-card" onClick={() => setMode('flow')}>
+              <div className="mode-card-title">연속 이동형</div>
+              <div className="mode-card-desc">악보가 멈춤 없이 계속 흐르는 영상</div>
             </button>
           </div>
         </div>
@@ -5564,6 +6246,16 @@ function App() {
                 onBack={() => setScrollPhase('capture')} onModeBack={() => setMode(null)} />
             </div>
           )}
+        </React.Fragment>
+      )}
+
+      {mode === 'flow' && (
+        <React.Fragment>
+          <div className="step-nav">
+            <button className="icon-btn" onClick={() => setMode(null)} style={{ marginRight: '4px' }}>← 모드</button>
+            <span className="step active">연속 이동형 1단계 · 이동량 추적 + 스트립 재구성</span>
+          </div>
+          <FlowStep videoRef={flowVideoRef} flowDefaults={flowDefaults} setFlowDefaults={setFlowDefaults} onModeBack={() => setMode(null)} />
         </React.Fragment>
       )}
     </div>
