@@ -3880,7 +3880,7 @@ async function runMiniStitchForRange(video, roi, startT, endT, diffThreshold, sc
 
 // ---- ROI 드래그 선택 UI — CaptureStep과 같은 패턴(별도 컴포넌트로 분리해 스크롤/페이지 두
 // 플로우가 각자의 캔버스 ref를 갖게 함, 상태 공유 없음) ----
-function ScrollRoiPicker({ videoRef, videoLoaded, roi, setRoi }) {
+function ScrollRoiPicker({ videoRef, videoLoaded, roi, setRoi, suppressRef }) {
   const roiCanvasRef = useRef(null);
   const roiBoxRef = useRef(null);
   const dragStartRef = useRef(null);
@@ -3905,6 +3905,7 @@ function ScrollRoiPicker({ videoRef, videoLoaded, roi, setRoi }) {
   }, []);
 
   function redrawFrame() {
+    if (suppressRef && suppressRef.current) return; // 백그라운드 seek 중에는 그 프레임을 그리지 않는다 (선택 prop)
     const video = videoRef.current, canvas = roiCanvasRef.current;
     if (!video || !canvas || !video.videoWidth) return;
     canvas.width = video.videoWidth; canvas.height = video.videoHeight;
@@ -6072,6 +6073,7 @@ function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
   const detectedRef = useRef(null), autoRemoveRef = useRef(true), bandRef = useRef(null);
   const playingRef = useRef(false), runningRef = useRef(false);
   const queueRef = useRef(Promise.resolve());
+  const bgSeekRef = useRef(false); // 사용자가 시크바를 움직이지 않았는데 일어나는 백그라운드 seek 중 — 위 영상 캔버스 갱신 억제
   const jobRef = useRef({ pending: false, again: false });
   const detTokenRef = useRef(0);
   const ppRawRef = useRef(null), ppProcRef = useRef(null), thumbStartRef = useRef(null), thumbEndRef = useRef(null);
@@ -6097,6 +6099,24 @@ function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
     const p = queueRef.current.then(fn);
     queueRef.current = p.catch(() => {});
     return p;
+  }
+
+  // 백그라운드 seek 작업(썸네일·재생바 감지 등): 작업 중에는 영상 캔버스가 중간 프레임을 그리지 않게 억제하고,
+  // 끝나면 항상 현재 시크 위치로 되돌려 한 번 그린다.
+  function bgEnqueue(fn) {
+    return enqueue(async () => {
+      bgSeekRef.current = true;
+      try {
+        await fn();
+      } finally {
+        bgSeekRef.current = false;
+        const v = videoRef.current;
+        if (v && v.videoWidth && !playingRef.current && !runningRef.current) {
+          await seekSafe(v, seekTRef.current);
+          v.dispatchEvent(new Event('seeked')); // 시크바 위치 프레임으로 캔버스를 한 번 다시 그린다
+        }
+      }
+    });
   }
 
   // 지금 적용될 재생바 제거 설정 (수동 지정이 있으면 그 열, 아니면 자동 감지된 열)
@@ -6229,7 +6249,7 @@ function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
   useEffect(() => {
     if (!videoLoaded || running || playing) return;
     const id = setTimeout(() => {
-      enqueue(async () => {
+      bgEnqueue(async () => {
         const v = videoRef.current;
         for (const [cvRef, t] of [[thumbStartRef, rangeRef.current.s], [thumbEndRef, rangeRef.current.e]]) {
           if (!v || !cvRef.current) continue;
@@ -6250,10 +6270,10 @@ function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
 
   // 재생바 자동 감지 — ROI/추출 구간이 바뀐 뒤 잠시 기다렸다가 ~20개 시각 샘플링(진행 표시)
   useEffect(() => {
-    if (!videoLoaded || running || playing || rangeEnd - rangeStart < 0.5) return;
+    if (!videoLoaded || !roi || running || playing || rangeEnd - rangeStart < 0.5) return; // ROI 지정 전에는 감지하지 않는다
     const token = ++detTokenRef.current;
     const id = setTimeout(() => {
-      enqueue(async () => {
+      bgEnqueue(async () => {
         if (token !== detTokenRef.current) return;
         setDetectMsg('재생바 감지 중... 0%');
         const res = await flowDetectPlaybar(
@@ -6347,7 +6367,7 @@ function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
         </div>
 
         <div className="slider-label" style={{ marginTop: '8px' }}>① 영상 확인 · 영역(ROI) 지정 — 영상 위에서 드래그</div>
-        <ScrollRoiPicker videoRef={videoRef} videoLoaded={videoLoaded} roi={roi} setRoi={setRoi} />
+        <ScrollRoiPicker videoRef={videoRef} videoLoaded={videoLoaded} roi={roi} setRoi={setRoi} suppressRef={bgSeekRef} />
         <div className="toolbar">
           <button className="icon-btn" disabled={!videoLoaded || disabledAll} onClick={() => (playing ? stopPlay() : startPlay(null))}>{playing ? '❚❚ 일시정지' : '▶ 재생'}</button>
           <label style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
