@@ -6026,6 +6026,16 @@ function flowRemovePlaybarCanvas(canvas, cols, band) {
   ctx.putImageData(img, 0, 0);
 }
 
+// 추출 구간 썸네일 — ROI가 있으면 ROI 사각형만 잘라(비율 유지, 가로 400px) 그리고 박스는 그리지 않는다. ROI가 없으면 전체 프레임.
+function flowDrawRoiThumb(canvasEl, video, roi) {
+  if (!roi) { drawVideoFrameWithRoi(canvasEl, video, null); return; }
+  const { rx0, ry0, rw, rh } = roiRectPx(video, roi);
+  if (!(rw > 0 && rh > 0)) return;
+  canvasEl.width = 400;
+  canvasEl.height = Math.max(1, Math.round(400 * rh / rw));
+  canvasEl.getContext('2d').drawImage(video, rx0, ry0, rw, rh, 0, 0, canvasEl.width, canvasEl.height);
+}
+
 function flowCaptureCurrent(video, roi) {
   const { rx0, ry0, rw, rh } = roiRectPx(video, roi);
   const c = document.createElement('canvas');
@@ -6224,7 +6234,7 @@ function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
         for (const [cvRef, t] of [[thumbStartRef, rangeRef.current.s], [thumbEndRef, rangeRef.current.e]]) {
           if (!v || !cvRef.current) continue;
           await seekSafe(v, t);
-          drawVideoFrameWithRoi(cvRef.current, v, roiRef.current);
+          flowDrawRoiThumb(cvRef.current, v, roiRef.current);
         }
       }).then(() => requestRefresh());
     }, 350);
@@ -6349,15 +6359,15 @@ function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
         <div className="slider-label" style={{ marginTop: '8px' }}>② 추출 구간 — {rangeStart.toFixed(2)}s ~ {rangeEnd.toFixed(2)}s (분석은 이 구간만 사용)</div>
         {videoLoaded && <MiniRangeTimeline duration={duration} start={rangeStart} end={rangeEnd} onChange={(a, b) => { if (!running) { setRangeStart(a); setRangeEnd(b); } }} />}
         {videoLoaded && (
-          <div className="row" style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+          <div className="row" style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
             <div>
               <div className="slider-label">시작 지점 ({rangeStart.toFixed(2)}s)</div>
-              <canvas ref={thumbStartRef} style={{ maxWidth: '260px', border: '1px solid var(--border-strong)' }} />
+              <canvas ref={thumbStartRef} style={{ maxWidth: '100%', border: '1px solid var(--border-strong)' }} />
               <div><button className="icon-btn" disabled={disabledAll} onClick={() => playCheck(rangeStart)}>여기서 재생 확인</button></div>
             </div>
             <div>
               <div className="slider-label">끝 지점 ({rangeEnd.toFixed(2)}s)</div>
-              <canvas ref={thumbEndRef} style={{ maxWidth: '260px', border: '1px solid var(--border-strong)' }} />
+              <canvas ref={thumbEndRef} style={{ maxWidth: '100%', border: '1px solid var(--border-strong)' }} />
               <div><button className="icon-btn" disabled={disabledAll} onClick={() => playCheck(Math.max(rangeStart, rangeEnd - 3))}>끝 3초 재생 확인</button></div>
             </div>
           </div>
