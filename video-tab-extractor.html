@@ -4527,8 +4527,8 @@ function MiniRangeTimeline({ duration, start, end, onChange }) {
       const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
       const L = latestRef.current;
       const t = frac * L.duration;
-      if (which === 'start') L.onChange(Math.min(t, L.end - 0.1), L.end);
-      else L.onChange(L.start, Math.max(t, L.start + 0.1));
+      if (which === 'start') L.onChange(Math.min(t, L.end - 0.1), L.end, 'start');
+      else L.onChange(L.start, Math.max(t, L.start + 0.1), 'end');
     }
     function onUp() { dragRef.current = null; }
     window.addEventListener('pointermove', onMove);
@@ -6073,6 +6073,7 @@ function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
   const detectedRef = useRef(null), autoRemoveRef = useRef(true), bandRef = useRef(null);
   const playingRef = useRef(false), runningRef = useRef(false);
   const queueRef = useRef(Promise.resolve());
+  const userSeekGen = useRef(0); // 사용자가 직접 seek한 횟수 — 백그라운드 작업 도중 사용자가 움직였는지 판단
   const bgSeekRef = useRef(false); // 사용자가 시크바를 움직이지 않았는데 일어나는 백그라운드 seek 중 — 위 영상 캔버스 갱신 억제
   const jobRef = useRef({ pending: false, again: false });
   const detTokenRef = useRef(0);
@@ -6101,17 +6102,27 @@ function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
     return p;
   }
 
+  // 사용자 조작으로 시크 위치를 옮기는 공통 경로 (시크바, 구간 핸들, 구간 초기화, 재생 확인) — 백그라운드 억제와 무관하게
+  // 캔버스가 그 시각의 프레임으로 갱신된다.
+  function userSeek(t) {
+    userSeekGen.current++;
+    seekTRef.current = t;
+    setSeekT(t);
+    requestRefresh();
+  }
+
   // 백그라운드 seek 작업(썸네일·재생바 감지 등): 작업 중에는 영상 캔버스가 중간 프레임을 그리지 않게 억제하고,
-  // 끝나면 항상 현재 시크 위치로 되돌려 한 번 그린다.
+  // 끝나면 그 시점의 최신 시크 위치로 되돌려 한 번 그린다. 작업 도중 사용자가 seek했다면 복구 seek은 건너뛴다.
   function bgEnqueue(fn) {
     return enqueue(async () => {
+      const gen0 = userSeekGen.current;
       bgSeekRef.current = true;
       try {
         await fn();
       } finally {
         bgSeekRef.current = false;
         const v = videoRef.current;
-        if (v && v.videoWidth && !playingRef.current && !runningRef.current) {
+        if (userSeekGen.current === gen0 && v && v.videoWidth && !playingRef.current && !runningRef.current) {
           await seekSafe(v, seekTRef.current);
           v.dispatchEvent(new Event('seeked')); // 시크바 위치 프레임으로 캔버스를 한 번 다시 그린다
         }
@@ -6227,12 +6238,13 @@ function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
   async function onSeek(e) {
     const t = parseFloat(e.target.value);
     if (playingRef.current) stopPlay();
-    setSeekT(t); seekTRef.current = t;
-    requestRefresh();
+    userSeek(t);
   }
   // (c) 해당 지점 재생 확인: 그 지점으로 이동해 3초 재생
   function playCheck(t) {
     if (playingRef.current) stopPlay();
+    userSeekGen.current++; // 사용자 조작 — 진행 중인 백그라운드 작업의 복구 seek이 덮어쓰지 않게 한다
+    seekTRef.current = t; setSeekT(t);
     enqueue(async () => {
       const v = videoRef.current;
       try {
@@ -6377,7 +6389,12 @@ function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
         </div>
 
         <div className="slider-label" style={{ marginTop: '8px' }}>② 추출 구간 — {rangeStart.toFixed(2)}s ~ {rangeEnd.toFixed(2)}s (분석은 이 구간만 사용)</div>
-        {videoLoaded && <MiniRangeTimeline duration={duration} start={rangeStart} end={rangeEnd} onChange={(a, b) => { if (!running) { setRangeStart(a); setRangeEnd(b); } }} />}
+        {videoLoaded && <MiniRangeTimeline duration={duration} start={rangeStart} end={rangeEnd} onChange={(a, b, which) => {
+          if (running) return;
+          if (playingRef.current) stopPlay();
+          setRangeStart(a); setRangeEnd(b);
+          userSeek(which === 'end' ? b : a); // 움직인 핸들의 시각으로 위쪽 영상을 이동
+        }} />}
         {videoLoaded && (
           <div className="row" style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
             <div>
@@ -6392,7 +6409,7 @@ function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
             </div>
           </div>
         )}
-        <div className="toolbar"><button className="icon-btn" disabled={!videoLoaded || disabledAll} onClick={() => { setRangeStart(0); setRangeEnd(duration); }}>구간 초기화(전체)</button>
+        <div className="toolbar"><button className="icon-btn" disabled={!videoLoaded || disabledAll} onClick={() => { if (playingRef.current) stopPlay(); setRangeStart(0); setRangeEnd(duration); userSeek(0); }}>구간 초기화(전체)</button>
           <button className="icon-btn" disabled={!roi || disabledAll} onClick={() => setRoi(null)}>영역 초기화</button></div>
       </div>
 
