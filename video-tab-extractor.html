@@ -7212,6 +7212,11 @@ function UniStep({ videoRef, onModeBack }) {
   const [msg, setMsg] = useState('영상 파일을 선택하세요.');
   const [uniDefaults, setUniDefaults] = useState(SCROLL_DEFAULTS_INIT); // 통합 모드 전용 전처리 설정
   const [autoRemove, setAutoRemove] = useState(true);                      // 재생바 자동 제거
+  const [removeMode, setRemoveMode] = useState('median');                   // 재생바 제거 방식: median(기본) / column(고정 열, flow용) / protrusion(돌출)
+  const [manualFrac, setManualFrac] = useState(null);                       // 수동 지정한 재생바 열 (ROI 폭 대비 0~1)
+  const ppRawRef = useRef(null), ppProcRef = useRef(null);
+  const defaultsRef = useRef(null), autoRemoveRef = useRef(true), removeModeRef = useRef('median'), manualRef = useRef(null);
+  const previewPendingRef = useRef(false), previewAgainRef = useRef(false);
   const [analysis, setAnalysis] = useState(null); // { recs, thr, scale, nativeW, ... }
   const [segs, setSegs] = useState([]);
   const [selIdx, setSelIdx] = useState(null);
@@ -7224,6 +7229,53 @@ function UniStep({ videoRef, onModeBack }) {
   useEffect(() => { roiRef.current = roi; }, [roi]);
   useEffect(() => { analysisRef.current = analysis; }, [analysis]);
   useEffect(() => { runningRef.current = running; }, [running]);
+  useEffect(() => { defaultsRef.current = uniDefaults; }, [uniDefaults]);
+  useEffect(() => { autoRemoveRef.current = autoRemove; }, [autoRemove]);
+  useEffect(() => { removeModeRef.current = removeMode; }, [removeMode]);
+  useEffect(() => { manualRef.current = manualFrac; }, [manualFrac]);
+
+  // 전처리 미리보기(원본 ROI 크롭 / 전처리 후) — 추출과 같은 함수(uniRemovePlaybar, uniDecideOpts, scrollApplyPreprocInPlace)를
+  // 원본 해상도로 적용한 뒤 표시용으로만 축소한다. 분석·추출 중에는 갱신하지 않는다.
+  function uniPreviewNow() {
+    const video = videoRef.current, raw = ppRawRef.current, proc = ppProcRef.current;
+    if (!video || !video.videoWidth || !raw || !proc) return;
+    const full = flowCaptureCurrent(video, roiRef.current);
+    const work = cloneCanvas(full);
+    let cols = [];
+    if (autoRemoveRef.current || manualRef.current != null) {
+      // 한 프레임만 보는 미리보기에서는 '고정 열' 방식을 쓸 수 없어 프레임별 돌출 감지로 대신 보여 준다
+      cols = uniRemovePlaybar(work, { mode: removeModeRef.current === 'column' ? 'protrusion' : removeModeRef.current, manualFrac: manualRef.current, defaults: defaultsRef.current, globalRemoval: null }).cols;
+    }
+    scrollApplyPreprocInPlace(work, uniDecideOpts(work, defaultsRef.current));
+    drawDownscaledStaged(full, raw, 800);
+    drawDownscaledStaged(work, proc, 800);
+    const k = proc.width / full.width;
+    for (const cv of [raw, proc]) {
+      const ctx = cv.getContext('2d');
+      ctx.setLineDash([4, 3]); ctx.lineWidth = 1.5; ctx.strokeStyle = '#e03030';
+      for (const [a, b] of cols) for (const x of [a * k, (b + 1) * k]) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, cv.height); ctx.stroke(); }
+      ctx.setLineDash([]);
+    }
+  }
+  async function previewJob() {
+    if (previewPendingRef.current) { previewAgainRef.current = true; return; }
+    previewPendingRef.current = true;
+    try {
+      do {
+        previewAgainRef.current = false;
+        const v = videoRef.current;
+        if (!v || !v.videoWidth || runningRef.current || playingRef.current) break;
+        bgSeekRef.current = true; // 미리보기용 seek이 위쪽 영상 캔버스에 비치지 않게
+        try { await seekSafe(v, seekTRef.current); uniPreviewNow(); }
+        finally { bgSeekRef.current = false; v.dispatchEvent(new Event('seeked')); } // 시크 위치 프레임으로 한 번 다시 그림
+      } while (previewAgainRef.current);
+    } finally { previewPendingRef.current = false; }
+  }
+  useEffect(() => {
+    if (!videoLoaded) return;
+    const id = setTimeout(previewJob, 100); // 설정이 바뀌면 100ms 디바운스로 즉시 갱신
+    return () => clearTimeout(id);
+  }, [roi, uniDefaults, autoRemove, removeMode, manualFrac, videoLoaded, seekT, running]);
 
   // 'play' 가드: 사용자가 ▶를 눌렀거나 분석 패스(flowInternalPlayRef)가 재생 중일 때만 허용
   useEffect(() => {
@@ -7239,7 +7291,7 @@ function UniStep({ videoRef, onModeBack }) {
     if (!file) return;
     const video = videoRef.current;
     video.src = URL.createObjectURL(file);
-    setVideoLoaded(false); setRoi(null); setAnalysis(null); setSegs([]); setSelIdx(null);
+    setVideoLoaded(false); setRoi(null); setAnalysis(null); setSegs([]); setSelIdx(null); setManualFrac(null);
     setVideoFile(file);
     video.onloadedmetadata = async () => {
       setVideoLoaded(true);
@@ -7400,7 +7452,34 @@ function UniStep({ videoRef, onModeBack }) {
 
       <ScrollPreprocPanel scrollDefaults={uniDefaults} setScrollDefaults={setUniDefaults} />
       <div className="toolbar">
-        <label><input type="checkbox" checked={autoRemove} onChange={e => setAutoRemove(e.target.checked)} disabled={running} /> 재생바 자동 제거 (추출 시 감지해 page 대표 프레임·flow 구간에 적용)</label>
+        <label><input type="checkbox" checked={autoRemove} onChange={e => setAutoRemove(e.target.checked)} disabled={running} /> 재생바 자동 제거</label>
+        <label>제거 방식:
+          <select value={removeMode} onChange={e => setRemoveMode(e.target.value)} disabled={running} style={{ width: 'auto', marginLeft: '6px' }}>
+            <option value="median">시간 중앙값 (기본)</option>
+            <option value="protrusion">프레임별 돌출 감지</option>
+            <option value="column">고정 열 감지 (flow용)</option>
+          </select>
+        </label>
+        <button className="icon-btn" onClick={() => setManualFrac(null)} disabled={manualFrac == null || running}>수동 지정 해제</button>
+        <span className="save-msg">{manualFrac != null ? '수동 지정: ROI 폭의 ' + (manualFrac * 100).toFixed(1) + '%' : ''}</span>
+      </div>
+      <div className="block">
+        <div className="block-head"><span>전처리 미리보기 (현재 시크 위치 · 선택한 ROI)</span></div>
+        <p className="hint-text" style={{ margin: '4px 0' }}>
+          빨간 점선 = 재생바로 감지/지정된 열(제거 대상). 감지가 틀렸으면 "전처리 후" 이미지에서 재생바 열을 클릭해 수동 지정하세요(다시 누르면 위치 변경, 위 버튼으로 해제).
+          page 구간은 시간 중앙값(구간 안 최대 15프레임)이 기본이라 이 미리보기는 한 프레임만의 돌출 감지 결과입니다. 분석·추출 중에는 갱신을 멈춥니다.
+        </p>
+        <div className="row" style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+          <div style={{ maxWidth: '100%' }}>
+            <div className="slider-label">원본 (ROI 크롭)</div>
+            <canvas ref={ppRawRef} style={{ maxWidth: '100%', height: 'auto', border: '1px solid var(--border-strong)' }} />
+          </div>
+          <div style={{ maxWidth: '100%' }}>
+            <div className="slider-label">전처리 후 (클릭 = 재생바 열 지정)</div>
+            <canvas ref={ppProcRef} onClick={e => { const r = e.currentTarget.getBoundingClientRect(); setManualFrac(Math.max(0, Math.min(1, (e.clientX - r.left) / r.width))); }}
+              style={{ maxWidth: '100%', height: 'auto', border: '1px solid var(--border-strong)', cursor: 'crosshair' }} />
+          </div>
+        </div>
       </div>
 
       <div className="toolbar">
@@ -7463,7 +7542,7 @@ function UniStep({ videoRef, onModeBack }) {
 
       {analysis && segs.length > 0 && (
         <UniExtract videoRef={videoRef} videoFile={videoFile} roi={roi} rangeStart={rangeStart} rangeEnd={rangeEnd} rate={rate}
-          segs={segs} analysis={analysis} uniDefaults={uniDefaults} autoRemove={autoRemove}
+          segs={segs} analysis={analysis} uniDefaults={uniDefaults} autoRemove={autoRemove} removeMode={removeMode} manualFrac={manualFrac}
           bgSeekRef={bgSeekRef} seekTRef={seekTRef} onBusy={v => { runningRef.current = v; setRunning(v); }} />
       )}
     </div>
@@ -7491,11 +7570,85 @@ function uniZeroShiftNcc(sa, sb) {
   if (sa.w !== sb.w || sa.h !== sb.h) return 0;
   return flowNccAt(flowToZeroMeanRows(sa), flowToZeroMeanRows(sb), sa.w, sa.h, new Uint8Array(sa.w), 0);
 }
-function uniDrawThumb(canvasEl, raw, defaults) {
+function uniDrawThumb(canvasEl, raw, defaults, cols) {
   if (!canvasEl || !raw) return;
   const c = cloneCanvas(raw);
   scrollApplyPreprocInPlace(c, uniDecideOpts(c, defaults));
   drawDownscaledStaged(c, canvasEl, 420);
+  if (cols && cols.length) { // 감지/지정한 재생바 열을 점선으로 표시
+    const k = canvasEl.width / raw.width, ctx = canvasEl.getContext('2d');
+    ctx.setLineDash([4, 3]); ctx.lineWidth = 1.5; ctx.strokeStyle = '#e03030';
+    for (const [a, b] of cols) for (const x of [a * k, (b + 1) * k]) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvasEl.height); ctx.stroke(); }
+    ctx.setLineDash([]);
+  }
+}
+
+// ---- 재생바 제거 (page 구간: 재생바가 움직이므로 고정 열 감지가 통하지 않는다) ----
+// 오선 밴드(top/bottom/space) — 원본 캡처를 임시로 이진화해 찾는다
+function uniFindBand(canvas, defaults) {
+  const probe = cloneCanvas(canvas);
+  scrollApplyPreprocInPlace(probe, { ...uniDecideOpts(probe, defaults), removeBg: true });
+  const sys = detectStaffSystem(scrollGetFullGrayData(probe), 0.3, 140);
+  return sys ? { top: sys.main.top, bottom: sys.main.bottom, space: sys.space } : null;
+}
+// 돌출 감지: 이진화 전 원본 밝기가 배경과 일정 이상(35) 다른 열 중, 밴드 안을 거의 끊김 없이(≥90%) 덮고 밴드 바깥으로
+// 0.6·space 이상 이어지는 좁은(≤10px) 세로 열. 회색(밝기 ~170)처럼 연한 재생바도 배경 대비 차이로 잡는다.
+// (줄기·마디선은 밴드 전체를 덮지 않거나 밴드 밖으로 나가지 않아 제외된다.)
+function uniDetectProtrusion(canvas, defaults) {
+  const band = uniFindBand(canvas, defaults);
+  if (!band) return { cols: [], band: null };
+  const g = scrollGetFullGrayData(canvas);
+  const W = g.w;
+  const samp = [];
+  for (let i = 0; i < g.gray.length; i += 7) samp.push(g.gray[i]);
+  samp.sort((a, b) => a - b);
+  const bg = samp[samp.length >> 1];
+  const thr = 35, lim = Math.max(2, Math.round(band.space * 2)), need = band.space * 0.6;
+  const bandH = band.bottom - band.top + 1;
+  const diffAt = (x, y) => Math.abs(g.gray[y * W + x] - bg) >= thr;
+  const ok = new Uint8Array(W);
+  for (let x = 0; x < W; x++) {
+    let cov = 0;
+    for (let y = band.top; y <= band.bottom; y++) if (diffAt(x, y)) cov++;
+    if (cov / bandH < 0.9) continue;
+    let up = 0, gap = 0;
+    for (let k = 1; k <= lim; k++) { const y = band.top - k; if (y < 0) break; if (diffAt(x, y)) { up = k; gap = 0; } else if (++gap > 1) break; }
+    let down = 0; gap = 0;
+    for (let k = 1; k <= lim; k++) { const y = band.bottom + k; if (y >= g.h) break; if (diffAt(x, y)) { down = k; gap = 0; } else if (++gap > 1) break; }
+    if (Math.max(up, down) >= need) ok[x] = 1;
+  }
+  const cols = [];
+  let sx = -1;
+  for (let x = 0; x <= W; x++) {
+    if (x < W && ok[x]) { if (sx < 0) sx = x; }
+    else if (sx >= 0) { if (x - sx <= 10) cols.push([sx, x - 1]); sx = -1; }
+  }
+  return { cols, band };
+}
+// 선택한 방식으로 재생바를 지운다(제자리 수정). 수동 지정 열이 있으면 그것이 우선.
+//  mode 'column' = 고정 열 감지(flow용: globalRemoval), 그 외(median/protrusion) = 프레임별 돌출 감지
+function uniRemovePlaybar(canvas, { mode, manualFrac, defaults, globalRemoval }) {
+  let cols = [], band = null;
+  if (manualFrac != null) {
+    band = uniFindBand(canvas, defaults);
+    if (band) cols = [[manualFrac * canvas.width - 2, manualFrac * canvas.width + 2]];
+  } else if (mode === 'column') {
+    if (globalRemoval) { cols = globalRemoval.cols; band = globalRemoval.band; }
+  } else {
+    const d = uniDetectProtrusion(canvas, defaults);
+    cols = d.cols; band = d.band;
+  }
+  if (cols.length && band) flowRemovePlaybarCanvas(canvas, cols, band);
+  return { cols: band ? cols : [], band };
+}
+// 시간 중앙값: page 구간의 [start+0.05, end-0.05]에서 최대 15프레임을 균등 샘플해 픽셀별 중앙값 (dx=0이라 정렬 불필요)
+async function uniMedianCapture(video, roi, seg, maxN) {
+  const a = seg.start + 0.05, b = seg.end - 0.05;
+  if (b - a < 0.1) return captureRepCanvas(video, roi, (seg.start + seg.end) / 2);
+  const n = Math.max(1, Math.min(maxN, Math.floor((b - a) / 0.1) + 1));
+  const caps = [];
+  for (let i = 0; i < n; i++) caps.push(await captureRepCanvas(video, roi, n === 1 ? (a + b) / 2 : a + (b - a) * i / (n - 1)));
+  return caps.length >= 3 ? medianOfCanvases(caps) : caps[0];
 }
 
 // 조각 꼬리/머리 — 오른쪽/왼쪽 정렬한 ROI 폭(W)짜리 캔버스. 이음 탐지(findSeamOverlap)는 같은 폭의 타일 두 장을 입력으로 받는다.
@@ -7640,7 +7793,7 @@ async function uniCompose({ segs, include, products, uniDefaults, nativeW }) {
   return { pieces, joins: joined.joins, offsets: joined.offsets, segJoin, synth, H };
 }
 
-function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs, analysis, uniDefaults, autoRemove, bgSeekRef, seekTRef, onBusy }) {
+function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs, analysis, uniDefaults, autoRemove, removeMode, manualFrac, bgSeekRef, seekTRef, onBusy }) {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState({ label: '', pct: 0 });
   const [msg, setMsg] = useState('');
@@ -7683,9 +7836,10 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
     const list = segs.filter(s => s.kind === 'page' || s.kind === 'flow').map(s => ({ ...s }));
     const report = (label, f) => setProgress({ label, pct: Math.round(Math.max(0, Math.min(1, f)) * 100) });
     try {
-      const prod = { page: {}, flow: {}, removal: null };
+      const prod = { page: {}, flow: {}, removal: null, band: null };
       prodRef.current = prod;
-      if (autoRemove) {
+      // 고정 열 감지(flowDetectPlaybar)는 flow 구간과 '고정 열' 방식의 page에 필요하다 — 중앙값/돌출 방식의 page는 프레임에서 직접 찾는다
+      if (autoRemove && (removeMode === 'column' || list.some(s => s.kind === 'flow'))) {
         report('재생바 감지 중...', 0);
         const det = await flowDetectPlaybar(video, roi, rangeStart, rangeEnd, uniDefaults, f => report('재생바 감지 중...', f * 0.1), () => true);
         if (det && det.cols.length && det.band) prod.removal = { cols: det.cols, band: det.band };
@@ -7695,11 +7849,15 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
         if (abortRef.current) { setMsg('중단되었습니다.'); return; }
         const seg = pages[i];
         const t = seg.repT != null ? seg.repT : (seg.start + seg.end) / 2; // 대표 프레임 후보(diff가 가장 작은 지점)
-        const raw = await captureRepCanvas(video, roi, t);
-        if (prod.removal) flowRemovePlaybarCanvas(raw, prod.removal.cols, prod.removal.band);
-        prod.page[seg.id] = { raw, t };
+        // 기본(시간 중앙값): 구간 [start+0.05, end-0.05]의 최대 15프레임 픽셀별 중앙값 — 재생바가 한 위치에 머무는 시간이 절반 미만이면 사라진다
+        const raw = removeMode === 'median' ? await uniMedianCapture(video, roi, seg, 15) : await captureRepCanvas(video, roi, t);
+        const rr = (autoRemove || manualFrac != null) ? uniRemovePlaybar(raw, { mode: removeMode, manualFrac, defaults: uniDefaults, globalRemoval: prod.removal }) : { cols: [] };
+        prod.page[seg.id] = { raw, t, cols: rr.cols };
+        if (rr.band && !prod.band) prod.band = rr.band;
         report('page 대표 프레임 캡처 ' + (i + 1) + '/' + pages.length, 0.1 + 0.2 * ((i + 1) / pages.length));
       }
+      // 수동 지정 열은 flow 구간에도 적용(밴드는 page에서 찾은 것 사용)
+      if (manualFrac != null && prod.band) prod.removal = { cols: [[manualFrac * analysis.nativeW - 2, manualFrac * analysis.nativeW + 2]], band: prod.band };
       const flows = list.filter(s => s.kind === 'flow');
       const ferr = {};
       for (let i = 0; i < flows.length; i++) {
@@ -7763,7 +7921,7 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
   useEffect(() => {
     for (const seg of exSegs) if (seg.kind === 'page') {
       const pr = prodRef.current.page[seg.id];
-      if (pr) uniDrawThumb(thumbRefs.current[seg.id], pr.raw, uniDefaults);
+      if (pr) uniDrawThumb(thumbRefs.current[seg.id], pr.raw, uniDefaults, pr.cols);
     }
   }, [exSegs, version, uniDefaults]);
 
@@ -7774,10 +7932,9 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
       enqueueBg(async () => {
         const video = videoRef.current;
         const raw = await captureRepCanvas(video, roi, t);
-        const rem = prodRef.current.removal;
-        if (rem) flowRemovePlaybarCanvas(raw, rem.cols, rem.band);
-        prodRef.current.page[seg.id] = { raw, t };
-        uniDrawThumb(thumbRefs.current[seg.id], raw, uniDefaults); // 썸네일 즉시 갱신
+        const rr = (autoRemove || manualFrac != null) ? uniRemovePlaybar(raw, { mode: removeMode, manualFrac, defaults: uniDefaults, globalRemoval: prodRef.current.removal }) : { cols: [] };
+        prodRef.current.page[seg.id] = { raw, t, cols: rr.cols };
+        uniDrawThumb(thumbRefs.current[seg.id], raw, uniDefaults, rr.cols); // 썸네일 즉시 갱신
         setVersion(v => v + 1);
       });
     }, 150);
@@ -7847,6 +8004,7 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
                         <div>
                           <canvas ref={el => { if (el) thumbRefs.current[seg.id] = el; }} style={{ maxWidth: '260px', border: '1px solid var(--border-strong)', display: 'block' }} />
                           <input type="range" min={seg.start} max={seg.end} step="0.05" value={repT[seg.id] != null ? repT[seg.id] : seg.start} style={{ width: '260px' }}
+                            disabled={removeMode === 'median'} title={removeMode === 'median' ? '시간 중앙값 방식에서는 구간 전체의 중앙값을 쓰므로 대표 프레임을 고르지 않습니다' : ''}
                             onChange={e => changeRep(seg, parseFloat(e.target.value))} />
                           <span className="slider-label" style={{ margin: 0 }}> {(repT[seg.id] != null ? repT[seg.id] : seg.start).toFixed(2)}s</span>
                         </div>
