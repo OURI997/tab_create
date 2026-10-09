@@ -7878,7 +7878,7 @@ function uniStripWarnings(chunks, bars, space, ranges) {
 
 // 마디선 오버레이 + 수동 보정 (FlowBarStrip 기반) + 마디 더블클릭 편집 모드: 편집 중인 마디의 좌우 가장자리 핸들을 끌면 원본 픽셀을
 // 더 가져오거나(바깥으로) 줄인다(안쪽으로). 빈 곳 한 번 클릭 = 마디선 추가(더블클릭과 구분하려고 250ms 지연).
-function UniBarStrip({ chunks, totalW, H, scale, bars, flagged, warnIdx, selIdx, editIdx, seams, onSeamDouble, onSelect, onCommit, onEdit, onExtend, scrollRef }) {
+function UniBarStrip({ chunks, totalW, H, scale, bars, flagged, warnIdx, selIdx, editIdx, highlight, seams, onSeamDouble, onSelect, onCommit, onEdit, onExtend, scrollRef }) {
   const [drag, setDrag] = useState(null);
   const [edgeDrag, setEdgeDrag] = useState(null);
   const dragRef = useRef(null), edgeRef = useRef(null), clickTimer = useRef(null);
@@ -7918,9 +7918,13 @@ function UniBarStrip({ chunks, totalW, H, scale, bars, flagged, warnIdx, selIdx,
       edgeRef.current = null;
       if (g) { setEdgeDrag(null); if (Math.abs(g.dx || 0) >= 1) L.onExtend(g.edge, g.xEdge, Math.round(g.dx)); }
     }
+    function onKey(e) { // 드래그 중 Esc = 취소 (상태를 바꾸지 않았으므로 미리보기만 지운다)
+      if (e.key === 'Escape' && edgeRef.current) { edgeRef.current = null; setEdgeDrag(null); }
+    }
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
-    return () => { window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp); };
+    window.addEventListener('keydown', onKey);
+    return () => { window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp); window.removeEventListener('keydown', onKey); };
   }, []);
   function xAt(e) { const r = e.currentTarget.getBoundingClientRect(); return (e.clientX - r.left) / scale; }
   function onBgClick(e) {
@@ -7967,6 +7971,27 @@ function UniBarStrip({ chunks, totalW, H, scale, bars, flagged, warnIdx, selIdx,
               </div>
             );
           })}
+          {highlight && (
+            <div style={{ position: 'absolute', left: highlight.x0 * scale, width: Math.max(2, (highlight.x1 - highlight.x0) * scale), top: 0, bottom: 0, background: 'rgba(30,200,80,0.45)', pointerEvents: 'none', zIndex: 4 }} />
+          )}
+          {edgeDrag && editIdx != null && bars[editIdx + 1] != null && (() => {
+            // 드래그 미리보기(상태는 바꾸지 않음): 가져올 원본 영역(반투명 초록, 안쪽이면 빨강) + "+N px"/"-N px" + 밀리는 마디 위치(점선)
+            const xEdge = edgeDrag.edge === 'left' ? eL : eR;
+            const amount = Math.round(Math.abs(edgeDrag.dx));
+            const outward = (edgeDrag.edge === 'right' && edgeDrag.dx > 0) || (edgeDrag.edge === 'left' && edgeDrag.dx < 0);
+            const a0 = Math.min(xEdge, xEdge + edgeDrag.dx), a1 = Math.max(xEdge, xEdge + edgeDrag.dx);
+            const shift = outward ? amount : -amount;
+            return (
+              <React.Fragment>
+                <div style={{ position: 'absolute', left: a0 * scale, width: Math.max(1, (a1 - a0) * scale), top: 0, bottom: 0, background: outward ? 'rgba(30,200,80,0.35)' : 'rgba(224,48,48,0.28)', pointerEvents: 'none', zIndex: 4 }}>
+                  <span style={{ position: 'absolute', top: 2, left: 2, background: '#fff', color: outward ? '#1e7d3c' : '#c0392b', fontSize: 12, fontWeight: 700, padding: '0 3px', whiteSpace: 'nowrap' }}>{(outward ? '+' : '-') + amount + ' px'}</span>
+                </div>
+                {bars.filter(b => (edgeDrag.edge === 'right' ? b > xEdge + 1 : b >= xEdge - 1)).map((b, k) => (
+                  <div key={'sh' + k} style={{ position: 'absolute', left: (b + shift) * scale, top: 0, bottom: 0, borderLeft: '2px dotted #1565c0', pointerEvents: 'none', zIndex: 4 }} />
+                ))}
+              </React.Fragment>
+            );
+          })()}
           {(seams || []).map(sm => (
             <div key={'seam' + sm.j} title={sm.tip}
               onClick={e => e.stopPropagation()} onPointerDown={e => e.stopPropagation()}
@@ -7998,6 +8023,7 @@ let uniGroupSeq = 0;
 async function uniCompose({ segs, include, products, uniDefaults, nativeW }) {
   const pieces = [];
   const segJoinPage = {};
+  const segContrib = {}; // 합성 기여: { px(새로 추가), dropped(앞 조각과 동일해 전부 제거), removed(이음새에서 제거된 폭) }
   let group = [];
   const flush = async () => {
     if (!group.length) return;
@@ -8017,6 +8043,10 @@ async function uniCompose({ segs, include, products, uniDefaults, nativeW }) {
       // 원본 보존 + 이음새 편집 가능화: page 묶음을 (중복이 아닌) 타일 하나당 조각 하나로 나눈다. 각 조각은 실제로 쓰인 구간
       // [srcX, srcX+len)만 chunks로 갖고, 쓰이지 않은(이음새에서 잘린) 양옆 타일 픽셀은 leftExtra/rightExtra로 보관한다.
       // 타일 사이 이음새는 buildCutFrames가 이미 결정한 겹침/중복 제거를 그대로 internalJoin으로 기록한다(재분석 안 함).
+      built.frames.forEach((f, k) => {
+        const o = f.ovl;
+        segContrib[ids[k]] = f.dup ? { px: 0, dropped: true, removed: 0 } : { px: f.len, dropped: false, removed: (o && o.kind === 'overlap' ? o.px : 0) + (f.dupFixed || 0) };
+      });
       const gid = ++uniGroupSeq;
       let groupExpect = 0;
       for (const f of built.frames) {
@@ -8063,6 +8093,7 @@ async function uniCompose({ segs, include, products, uniDefaults, nativeW }) {
     } else if (seg.kind === 'flow') {
       await flush();
       const fp = products.flow[seg.id];
+      if (fp && fp.res) segContrib[seg.id] = { px: fp.res.totalW, dropped: false, removed: 0 };
       if (fp && fp.res) pieces.push({ type: 'flow', segIds: [seg.id], chunks: fp.res.chunks, totalW: fp.res.totalW, track: fp.res.track, tFirst: fp.res.tFirst, leftExtra: null, rightExtra: null, expect: 0 });
     }
   }
@@ -8070,7 +8101,7 @@ async function uniCompose({ segs, include, products, uniDefaults, nativeW }) {
   if (!pieces.length) return null;
   const H = pieces[0].chunks[0].height;
   const joinsAuto = uniAnalyzeJoins(pieces, nativeW, H);
-  return { pieces, joinsAuto, segJoinPage, H };
+  return { pieces, joinsAuto, segJoinPage, segContrib, H };
 }
 
 
@@ -8260,11 +8291,12 @@ function UniStage2({ result, videoFile, flowDefaults, editCtx }) {
           {editIdx != null ? ('편집 중: 마디 ' + (editIdx + 1) + ' — 초록 핸들을 끌면 이음새에서 잘린 구간 → 인접 조각 원본 가장자리 순으로 원본 픽셀을 가져오거나(바깥), 더 잘라 냅니다(안쪽)') : '마디를 더블클릭하면 편집 모드로 들어갑니다'}
         </span>
         {editIdx != null && <button className="icon-btn" onClick={() => setEditIdx(null)}>편집 종료</button>}
-        <button className="icon-btn" onClick={() => ctx2.onUndo && ctx2.onUndo()} disabled={!ctx2.canUndo}>되돌리기</button>
+        <button className="icon-btn" onClick={() => ctx2.onUndo && ctx2.onUndo()} disabled={!ctx2.canUndo}>← 되돌리기</button>
+        <button className="icon-btn" onClick={() => ctx2.onRedo && ctx2.onRedo()} disabled={!ctx2.canRedo}>다시 실행 →</button>
         {ctx2.msg && <span className="save-msg">{ctx2.msg}</span>}
       </div>
       <UniBarStrip chunks={chunks} totalW={totalW} H={H} scale={scale} bars={bars} flagged={flagged} warnIdx={warnings.map(w => w.measureIdx)} selIdx={selIdx} editIdx={editIdx}
-        seams={ctx2.seams || []} onSeamDouble={j => ctx2.onSeamReset && ctx2.onSeamReset(j)}
+        highlight={ctx2.highlight || null} seams={ctx2.seams || []} onSeamDouble={j => ctx2.onSeamReset && ctx2.onSeamReset(j)}
         onSelect={i => setSelIdx(i)} onCommit={commitBars}
         onEdit={i => { setEditIdx(i); setSelIdx(null); if (ctx2.onEditEnter) ctx2.onEditEnter(i, bars[i], bars[i + 1]); }}
         onExtend={(edge, xEdge, d) => ctx2.onExtend && ctx2.onExtend(edge, xEdge, d, editIdx != null && bars[editIdx + 1] != null ? { left: bars[editIdx], right: bars[editIdx + 1] } : null)} scrollRef={scrollRef} />
@@ -8312,22 +8344,93 @@ function UniStage2({ result, videoFile, flowDefaults, editCtx }) {
   );
 }
 
+// 마디 단위 비교용 서명: 마디선 사이 구간(양끝 마디는 잘렸을 수 있어 제외)을 96×48 그레이로 줄인 샘플
+function uniMeasureSigs(canvas, bars) {
+  const sigs = [];
+  const H = canvas.height;
+  for (let i = 0; i + 1 < bars.length; i++) {
+    const x0 = bars[i], x1 = bars[i + 1];
+    if (x1 - x0 < 24) continue;
+    const crop = flowCropStrip([canvas], x0, x1);
+    const t = document.createElement('canvas');
+    t.width = 96; t.height = 48;
+    t.getContext('2d').drawImage(crop, 0, 0, crop.width, H, 0, 0, 96, 48);
+    sigs.push(flowLowFromCanvas(t, 96, 0));
+  }
+  return sigs;
+}
+function uniSigMatch(a, b) {
+  if (a.w !== b.w || a.h !== b.h) return 0;
+  return flowNccAt(flowToZeroMeanRows(a), flowToZeroMeanRows(b), a.w, a.h, new Uint8Array(a.w), 0);
+}
+
 function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs, analysis, uniDefaults, autoRemove, removeMode, manualFrac, bgSeekRef, seekTRef, onBusy }) {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState({ label: '', pct: 0 });
   const [msg, setMsg] = useState('');
   const [exSegs, setExSegs] = useState([]);
-  const [include, setInclude] = useState({});
   const [repT, setRepT] = useState({});
   const [dupPage, setDupPage] = useState({});
   const [flowErr, setFlowErr] = useState({});
   const [version, setVersion] = useState(0);
   const [merged, setMerged] = useState(null);
   const [composing, setComposing] = useState(false);
-  const [adj, setAdj] = useState({});       // 이음새 수동 보정 { 조각idx: {trim, tail} }
-  const [hist, setHist] = useState([]);       // 되돌리기 스택
+  // 편집 상태 전체(이음새 trim/꼬리/슬라이더 {adj}, 조각 포함 토글 {include})를 하나의 undo/redo 스택(최대 100단계)으로 관리한다.
+  const [edit, setEditState] = useState({ adj: {}, include: {} });
+  const editRef = useRef(edit); editRef.current = edit;
+  const pastRef = useRef([]), futureRef = useRef([]);
+  const [, setStackVer] = useState(0);
+  const lastGestureRef = useRef(0);
+  const { adj, include } = edit;
+  const sig = JSON.stringify(include);
   const [editMsg, setEditMsg] = useState('');
-  const final = useMemo(() => (merged ? uniFinalize(merged, adj, analysis.nativeW) : null), [merged, adj]);
+  const [hl, setHl] = useState(null);           // 적용 직후 새로 들어온 구간 하이라이트 {j, dTrim, dTail}
+  const [nccMap, setNccMap] = useState({});     // page 구간별 앞 page와의 영점 이동 NCC
+  const [candPage, setCandPage] = useState({}); // duplicatePage지만 합성 스트립에 없는 마디가 있는 구간 → 포함 후보
+  const hlTimer = useRef(null);
+  const final = useMemo(
+    () => (merged ? uniFinalize(merged, merged.sig === sig ? adj : {}, analysis.nativeW) : null),
+    // eslint-disable-next-line
+    [merged, adj, sig]
+  );
+  function pushPast() { pastRef.current = [...pastRef.current.slice(-99), editRef.current]; futureRef.current = []; setStackVer(v => v + 1); }
+  function commit(next) { pushPast(); setEditState(next); }               // 한 번의 조작 = 한 단계
+  function coalesced(next) {                                                 // 슬라이더 같은 연속 조작: 600ms 안의 변화는 한 단계로 묶는다
+    const now = Date.now();
+    if (now - lastGestureRef.current > 600) pushPast();
+    lastGestureRef.current = now;
+    setEditState(next);
+  }
+  function undo() {
+    if (!pastRef.current.length) return;
+    futureRef.current = [editRef.current, ...futureRef.current];
+    const prev = pastRef.current[pastRef.current.length - 1];
+    pastRef.current = pastRef.current.slice(0, -1);
+    setEditState(prev); setStackVer(v => v + 1); setEditMsg('되돌렸습니다.');
+  }
+  function redo() {
+    if (!futureRef.current.length) return;
+    pastRef.current = [...pastRef.current, editRef.current];
+    const nxt = futureRef.current[0];
+    futureRef.current = futureRef.current.slice(1);
+    setEditState(nxt); setStackVer(v => v + 1); setEditMsg('다시 실행했습니다.');
+  }
+  const undoRef = useRef(null), redoRef = useRef(null);
+  undoRef.current = undo; redoRef.current = redo;
+  useEffect(() => {
+    function onKey(e) {
+      const el = document.activeElement, tag = el && el.tagName;
+      const typing = el && (tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable ||
+        (tag === 'INPUT' && !['range', 'checkbox', 'radio', 'button'].includes(el.type)));
+      if (typing) return; // 입력창에 포커스가 있으면 동작하지 않는다
+      if (!(e.metaKey || e.ctrlKey)) return;
+      const k = e.key.toLowerCase();
+      if (k === 'z' && !e.shiftKey) { e.preventDefault(); undoRef.current(); }
+      else if ((k === 'z' && e.shiftKey) || (k === 'y' && e.ctrlKey)) { e.preventDefault(); redoRef.current(); }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
   const prodRef = useRef({ page: {}, flow: {}, removal: null });
   const abortRef = useRef(false);
   const queueRef = useRef(Promise.resolve());
@@ -8400,17 +8503,22 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
         }
       }
       // 연속한 page 구간 둘의 대표 프레임(전처리 후) 영점 이동 NCC ≥ 0.98이면 duplicatePage — 뒤쪽을 기본 제외(토글로 복구)
-      const dup = {};
+      const dup = {}, ncc = {};
       let prev = null;
       for (const seg of list) {
         if (seg.kind === 'flow') { prev = null; continue; }
         const low = uniProcessedLow(prod.page[seg.id].raw, uniDefaults);
-        if (prev && uniZeroShiftNcc(prev.low, low) >= 0.98) dup[seg.id] = true;
-        else prev = { low };
+        if (prev) {
+          const v = uniZeroShiftNcc(prev.low, low);
+          ncc[seg.id] = v;
+          if (v >= 0.98) dup[seg.id] = true; else prev = { low };
+        } else prev = { low };
       }
       const inc = {};
       for (const seg of list) inc[seg.id] = seg.kind === 'page' ? !dup[seg.id] : !!(prod.flow[seg.id] && prod.flow[seg.id].res);
-      setExSegs(list); setInclude(inc); setDupPage(dup); setFlowErr(ferr);
+      pastRef.current = []; futureRef.current = []; setStackVer(v => v + 1);
+      setEditState({ adj: {}, include: inc });
+      setExSegs(list); setDupPage(dup); setNccMap(ncc); setCandPage({}); setFlowErr(ferr);
       setRepT(Object.fromEntries(Object.entries(prod.page).map(([id, v]) => [id, v.t])));
       setVersion(v => v + 1);
       setMsg('추출 완료 — 아래에서 조각 포함 여부와 page 대표 프레임을 조정할 수 있습니다.');
@@ -8432,13 +8540,14 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
       setComposing(true);
       try {
         const res = await uniCompose({ segs: exSegs, include, products: prodRef.current, uniDefaults, nativeW: analysis.nativeW });
-        if (tok === composeTokenRef.current) { setMerged(res); setAdj({}); setHist([]); setEditMsg(''); }
+        if (res) res.sig = sig; // 이 합성이 어떤 포함 상태에서 만들어졌는지 — 이음새 보정(adj)은 같은 포함 상태에서만 적용된다
+        if (tok === composeTokenRef.current) setMerged(res);
       } catch (err) {
         setMsg('합치기 오류: ' + err.message);
       } finally { setComposing(false); }
-    }, 500);
+    }, 30); // 포함 토글·되돌리기는 즉시 전체를 다시 합성한다
     return () => clearTimeout(id);
-  }, [exSegs, include, version]);
+  }, [exSegs, sig, version]);
 
   // 썸네일: 추출 직후와 대표 프레임/전처리 설정이 바뀔 때 갱신
   useEffect(() => {
@@ -8464,11 +8573,6 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
   }
 
   // ---- 마디 가장자리 확장(편집 모드): 가장 가까운 이음새의 trim/꼬리를 조정 — 잘린 구간 → 인접 조각 원본 가장자리 순으로 복원 ----
-  function pushAdj(next) { setHist(h => [...h, adj]); setAdj(next); }
-  function undo() {
-    setHist(h => { if (!h.length) return h; setAdj(h[h.length - 1]); return h.slice(0, -1); });
-    setEditMsg('되돌렸습니다.');
-  }
   // 편집 모드 진입 로그 — 마디 [left,right], 모든 이음새의 stripX·trim·조각 id, 잘린 구간 매핑 개수
   function onEditEnter(i, left, right) {
     if (!final || !merged) return;
@@ -8512,11 +8616,61 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
       }
     } else if (edge === 'right') trim = Math.min(analysis.nativeW - 2, B.totalW - 1, trim + amount);
     else tail = Math.max(-Math.min(analysis.nativeW, A.totalW - 1), tail - amount);
-    pushAdj({ ...adj, [j]: { ...(adj[j] || {}), trim, tail } });
+    commit({ ...edit, adj: { ...adj, [j]: { ...(adj[j] || {}), trim, tail } } });
+    if (outward) {
+      setHl({ j, dTrim: Math.max(0, e.trim - trim), dTail: Math.max(0, tail - e.tail) }); // 적용 직후 새로 들어온 구간을 약 2초간 초록으로
+      clearTimeout(hlTimer.current); hlTimer.current = setTimeout(() => setHl(null), 2000);
+    }
     setEditMsg(outward
       ? ('이음새 ' + j + ': 잘린 구간 ' + fromCut + 'px + 조각 원본 가장자리 ' + fromEdge + 'px 복원 (이후 마디 ' + (fromCut + fromEdge) + 'px 밀림)')
       : ('이음새 ' + j + ': ' + amount + 'px 더 잘라 냄'));
   }
+  // 조각 점검: 구간별 [조각 id, 포함 여부, zero-shift NCC, 합성 스트립에 이미 포함된 비율, 이음새에서 제거된 폭]을 console.log로 남기고,
+  // duplicatePage로 제외된 조각은 마디 단위로 비교해 합성 스트립에 없는 마디가 있으면 '포함 후보'로 표시한다.
+  const finalRef = useRef(null); finalRef.current = final;
+  useEffect(() => {
+    if (!merged || !finalRef.current || !exSegs.length) return;
+    let cancelled = false;
+    (async () => {
+      const f0 = finalRef.current;
+      const needed = exSegs.filter(sg => sg.kind === 'page' && dupPage[sg.id] && !include[sg.id]);
+      let stripSigs = null;
+      if (needed.length) {
+        const det = await flowDetectBars(f0.chunks, analysis.nativeW, () => {});
+        stripSigs = [];
+        const xs = det.bars;
+        for (let i = 0; i + 1 < xs.length; i++) if (xs[i + 1] - xs[i] >= 24) stripSigs.push(...uniMeasureSigs(flowCropStrip(f0.chunks, xs[i], xs[i + 1]), [0, xs[i + 1] - xs[i]]));
+      }
+      const cand = {};
+      const rows = [];
+      for (const sg of exSegs) {
+        if (sg.kind !== 'page') continue;
+        let ratio = null;
+        if (stripSigs && dupPage[sg.id] && !include[sg.id]) {
+          const pr = prodRef.current.page[sg.id];
+          const c = cloneCanvas(pr.raw);
+          scrollApplyPreprocInPlace(c, uniDecideOpts(c, uniDefaults));
+          const inf = tileInfoOf(c);
+          if (inf.sys) {
+            const bx = detectBarsThroughSystem(inf.g, inf.sys, 0.8, inf.xL, 140, null, 0).bars.map(b => b.x);
+            const mySigs = uniMeasureSigs(c, bx);
+            let matched = 0;
+            for (const ms of mySigs) if (stripSigs.some(ss => uniSigMatch(ms, ss) >= 0.9)) matched++;
+            ratio = mySigs.length ? matched / mySigs.length : null;
+            if (mySigs.length && matched < mySigs.length) cand[sg.id] = { missing: mySigs.length - matched, total: mySigs.length };
+          }
+        }
+        const cb = merged.segContrib && merged.segContrib[sg.id];
+        rows.push({ segId: sg.id, included: !!include[sg.id], zeroShiftNcc: nccMap[sg.id] != null ? +nccMap[sg.id].toFixed(3) : null, alreadyIncludedRatio: ratio, removedPx: cb ? cb.removed : null, contributionPx: cb ? cb.px : 0, droppedAsDuplicate: cb ? cb.dropped : null });
+      }
+      // eslint-disable-next-line no-console
+      console.log('[uni 조각 점검] [조각 id, 포함 여부, zero-shift NCC, 합성 스트립에 이미 포함된 비율, 이음새 제거 폭]', rows);
+      if (!cancelled) setCandPage(cand);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line
+  }, [merged]);
+
   // 이음새 마커 더블클릭: 그 이음새의 겹침/중복 제거를 0으로 되돌린다(원본 복원)
   function onSeamReset(j) {
     if (!final || !merged) return;
@@ -8524,7 +8678,7 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
     if (!sm) return;
     const B = merged.pieces[j];
     const trim = sm.internal ? -Math.min(sm.cut, B.leftExtra ? B.leftExtra.width : 0) : 0; // 타일 사이 이음새는 이미 적용된 제거분만큼 원본 왼쪽을 되살린다
-    pushAdj({ ...adj, [j]: { trim, tail: 0 } });
+    commit({ ...edit, adj: { ...adj, [j]: { trim, tail: 0 } } });
     setEditMsg('이음새 ' + j + ': 겹침/중복 제거 0으로 되돌림 (원본 복원' + (sm.cut ? ', 잘린 구간 ' + sm.cut + 'px' : ', 잘린 구간이 0이었음') + ')');
   }
   const pieceIdxOf = {};
@@ -8581,11 +8735,19 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
                 {exSegs.map(seg => (
                   <tr key={seg.id} style={{ borderBottom: '1px solid var(--border)', verticalAlign: 'top', opacity: include[seg.id] ? 1 : 0.55 }}>
                     <td><input type="checkbox" checked={!!include[seg.id]} disabled={seg.kind === 'flow' && !(prodRef.current.flow[seg.id] && prodRef.current.flow[seg.id].res)}
-                      onChange={e => setInclude(p => ({ ...p, [seg.id]: e.target.checked }))} /></td>
+                      onChange={e => commit({ adj: {}, include: { ...include, [seg.id]: e.target.checked } })} /></td>
                     <td><span style={{ color: UNI_KIND_COLOR[seg.kind] }}>■ </span>{UNI_KIND_LABEL[seg.kind]}{dupPage[seg.id] ? ' · duplicatePage (앞 페이지와 동일)' : ''}</td>
                     <td>{seg.start.toFixed(2)} ~ {seg.end.toFixed(2)}</td>
                     <td>{seg.score.toFixed(2)}</td>
                     <td>
+                      {merged && merged.segContrib && merged.segContrib[seg.id] && include[seg.id] && (
+                        <div style={{ color: merged.segContrib[seg.id].dropped ? '#c0392b' : '#1e7d3c' }}>
+                          합성 기여: {merged.segContrib[seg.id].dropped
+                            ? '앞 조각과 동일해 전부 제거됨 (영향 없음)'
+                            : '새로 추가 ' + merged.segContrib[seg.id].px + ' px' + (merged.segContrib[seg.id].removed ? ' (이음새에서 ' + merged.segContrib[seg.id].removed + 'px 제거)' : '')}
+                        </div>
+                      )}
+                      {candPage[seg.id] && <div style={{ color: '#8e24aa', fontWeight: 700 }}>포함 후보: 합성 스트립에 없는 마디 {candPage[seg.id].missing}/{candPage[seg.id].total}개</div>}
                       {flowErr[seg.id] ? <span style={{ color: '#c0392b' }}>flow 추출 실패: {flowErr[seg.id]}</span>
                         : ((final && final.segJoin[seg.id]) || (include[seg.id] ? '' : '제외'))}
                       {final && pieceIdxOf[seg.id] > 0 && (() => {
@@ -8596,8 +8758,8 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
                             {merged.joinsAuto[j].seamSuspect && <b style={{ color: '#c0392b' }}>이음새 의심 </b>}
                             <label style={{ fontSize: '11px' }}>겹침/중복 제거 폭
                               <input type="range" min={mn} max={mx} step="1" value={final.eff[j].trim} style={{ width: '180px' }}
-                                onPointerDown={() => setHist(h => [...h, adj])}
-                                onChange={e => setAdj({ ...adj, [j]: { ...(adj[j] || {}), trim: parseInt(e.target.value) } })} /> {final.eff[j].trim}px
+                                onPointerDown={() => { lastGestureRef.current = 0; }}
+                                onChange={e => coalesced({ ...edit, adj: { ...adj, [j]: { ...(adj[j] || {}), trim: parseInt(e.target.value) } } })} /> {final.eff[j].trim}px
                             </label>
                           </div>
                         );
@@ -8634,7 +8796,8 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
           {/* 마디 감지 · 묶기 · 빌더 전송은 연속 이동형 2단계(FlowStage2) 로직을 복사한 UniStage2 — 마디 더블클릭 편집·누락 경고 추가. 합쳐진 스트립(청크) + 스트립좌표→시각 트랙을 넘긴다 */}
           <UniStage2 result={final.synth} videoFile={videoFile} flowDefaults={uniDefaults}
             editCtx={{
-              pieceRanges: final.ranges, onExtend, onEditEnter, onSeamReset, canUndo: hist.length > 0, onUndo: undo, msg: editMsg,
+              pieceRanges: final.ranges, onExtend, onEditEnter, onSeamReset, canUndo: pastRef.current.length > 0, onUndo: undo, canRedo: futureRef.current.length > 0, onRedo: redo, msg: editMsg,
+              highlight: hl && final && final.offsets[hl.j] != null ? { x0: final.offsets[hl.j] - hl.dTail, x1: final.offsets[hl.j] + hl.dTrim } : null,
               seams: final.seamInfo.map(sm => ({
                 ...sm,
                 tip: '잘린 구간 ' + sm.cut + ' px (겹침 ' + sm.overlap + ', 중복 ' + sm.dup + ')' + (sm.suspect ? ' · 이음새 의심(제안 ' + sm.suggest + 'px 미적용)' : '') + (sm.manual ? ' · 수동 조절됨(trim ' + sm.trim + 'px)' : '') + ' — 더블클릭하면 겹침/중복 제거를 0으로 되돌립니다',
