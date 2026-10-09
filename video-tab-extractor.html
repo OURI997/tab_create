@@ -6875,11 +6875,11 @@ function FlowStage2({ result, videoFile, flowDefaults }) {
 // ScrollRoiPicker, MiniRangeTimeline)는 호출만 하고 이 모드 전용 함수는 모두 uni 접두어로 독립 구현한다.
 // ================================================================================================
 
-const UNI_KIND_LABEL = { static: '정지', flow: '연속 이동', cut: '컷 전환' };
-const UNI_KIND_COLOR = { static: '#b5b5b5', flow: '#4a7bd0', cut: '#d03030' };
+const UNI_KIND_LABEL = { static: '완전정지', page: '페이지(고정)', flow: '연속 이동', cut: '컷', dissolve: '디졸브', slide: '슬라이드' };
+const UNI_KIND_COLOR = { static: '#b5b5b5', page: '#a8dcae', flow: '#4a7bd0', cut: '#b71c1c', dissolve: '#e53935', slide: '#ef9a9a' };
+const uniIsTrans = k => k === 'cut' || k === 'dissolve' || k === 'slide';
 function uniClamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 function uniQuantile(sortedArr, p) { return sortedArr.length ? sortedArr[Math.floor(p * (sortedArr.length - 1))] : 0; }
-
 // ---- 프레임 쌍별 측정: diff, dx(가로 이동량), 신뢰도(NCC 피크 / 2번째 피크 / 차이) ----
 async function uniAnalyze({ video, roi, startT, endT, rate, abortRef, onProgress }) {
   const samples = [];
@@ -6906,9 +6906,11 @@ async function uniAnalyze({ video, roi, startT, endT, rate, abortRef, onProgress
     const diff = sum / a.length;
     const curF = flowToZeroMeanRows(samples[k]);
     const dt = Math.max(1e-3, samples[k].t - samples[k - 1].t);
+    // dx=0 위치의 상관(고정된 페이지 위에서 재생바만 움직이는 구간 판별용)
+    const peak0 = flowNccAt(prevF, curF, w, h, mask, 0);
     let r;
     if (diff < 0.5) {
-      r = { shift: 0, peak: 1, second: 0, margin: 1 };
+      r = { shift: 0, peak: peak0, second: 0, margin: 1 };
       vPrev = null;
     } else {
       if (vPrev == null) r = flowFindShift(prevF, curF, w, h, mask, 0, 0.3 * w);
@@ -6924,7 +6926,7 @@ async function uniAnalyze({ video, roi, startT, endT, rate, abortRef, onProgress
     }
     recs.push({
       t0: samples[k - 1].t, t: samples[k].t, dt, diff, dxLow: r.shift, dxNative: r.shift * scale,
-      speed: (r.shift * scale) / dt, peak: r.peak, second: r.second, margin: r.margin,
+      speed: (r.shift * scale) / dt, peak: r.peak, second: r.second, margin: r.margin, peak0,
     });
     prevF = curF;
     if (k % 40 === 0) { onProgress('2/2 구간 분류용 이동량 계산', 0.5 + 0.5 * (k / samples.length)); await flowYield(); }
@@ -6933,41 +6935,77 @@ async function uniAnalyze({ video, roi, startT, endT, rate, abortRef, onProgress
 }
 
 // ---- 임계값 자동 보정 + 프레임 쌍별 라벨/점수 ----
+// 쌍 라벨: page(고정 페이지: dx=0, dx=0 위치 상관 ≥0.9, diff < 컷 임계) / static(완전정지: 내용 상관이 없는 빈 화면 등) /
+// flow(이동 증거) / trans(전환 후보: diff 큼 또는 이동 신뢰도 낮음). 구간 단계에서 flow 인정 조건을 다시 검증한다.
 function uniLabelPairs(recs) {
   const sorted = recs.map(r => r.diff).sort((a, b) => a - b);
   const med = uniQuantile(sorted, 0.5), p10 = uniQuantile(sorted, 0.1);
-  const staticThr = uniClamp(2 * p10, 0.5, 4);            // 정지: diff가 영상 분포의 하위값(노이즈 수준) 근처
+  const staticThr = uniClamp(2 * p10, 0.5, 4);
   const nonStatic = recs.filter(r => r.diff >= staticThr).map(r => r.peak).sort((a, b) => a - b);
-  const confThr = nonStatic.length ? uniClamp(uniQuantile(nonStatic, 0.25), 0.35, 0.6) : 0.5; // 신뢰도 기준은 분포 기반
+  const confThr = nonStatic.length ? uniClamp(uniQuantile(nonStatic, 0.25), 0.35, 0.6) : 0.5;
   const cutThr = Math.max(staticThr * 2, med * 0.5);
-  const minDx = 0.8; // 저해상도 px — 이보다 작은 이동은 이동으로 보지 않는다
+  const minDx = 0.8; // 저해상도 px
   for (const r of recs) {
+    const zeroBest = r.peak0 >= 0.9 && (r.dxLow < minDx || r.peak < r.peak0 - 0.02);
+    if (zeroBest && r.diff < cutThr) {
+      // 페이지가 고정 — 점수는 margin이 아니라 diff와 peak로 계산 (재생바만 움직이는 구간이 '확인 필요'로 뜨지 않게)
+      r.label = 'page';
+      r.score = uniClamp(0.5 * r.peak0 + 0.5 * (1 - r.diff / cutThr), 0.3, 1);
+      r.sub = r.diff < staticThr ? 'hold' : 'playhead';
+      continue;
+    }
     if (r.diff < staticThr) { r.label = 'static'; r.score = uniClamp(1 - r.diff / staticThr, 0.3, 1); continue; }
     const ok = r.peak >= confThr && r.margin >= 0.08;
     if (ok && r.dxLow >= minDx) { r.label = 'flow'; r.score = uniClamp(Math.min(r.peak, 0.5 + r.margin), 0, 1); }
-    else if (!ok && r.diff >= cutThr) { r.label = 'cut'; r.score = uniClamp((1 - Math.max(0, r.peak)) * Math.min(1, r.diff / (cutThr * 1.5)), 0.2, 1); }
-    else { r.label = 'static'; r.score = 0.3; } // 변화는 있는데 이동도 컷도 아닌 애매한 쌍
+    else if (!ok || r.diff >= cutThr) { r.label = 'trans'; r.score = uniClamp((1 - Math.max(0, r.peak)) * Math.min(1, r.diff / (cutThr * 1.5)) + 0.2, 0.2, 1); }
+    else { r.label = 'static'; r.score = 0.3; }
   }
   return { med, p10, staticThr, confThr, cutThr, minDx };
 }
 
-// 구간 안 쌍들의 통계: 평균 이동 속도(flow 쌍), 점수(라벨 일치 쌍은 자기 점수, 불일치 쌍은 0.2)
-function uniSegStats(recs, start, end, kind) {
-  const inRange = recs.filter(r => r.t > start + 1e-6 && r.t0 < end - 1e-6);
-  if (!inRange.length) return { speed: 0, score: 0.3, speedVar: 0 };
-  const flowSp = inRange.filter(r => r.label === 'flow').map(r => r.speed);
-  const speed = flowSp.length ? flowSp.reduce((s, v) => s + v, 0) / flowSp.length : 0;
-  let varc = 0;
-  if (flowSp.length > 2 && speed > 0) {
-    const sd = Math.sqrt(flowSp.reduce((s, v) => s + (v - speed) * (v - speed), 0) / flowSp.length);
-    varc = sd / speed;
-  }
-  const score = inRange.reduce((s, r) => s + (r.label === kind ? r.score : 0.2), 0) / inRange.length;
-  return { speed, score, speedVar: varc };
+function uniSegPairs(recs, start, end) { return recs.filter(r => r.t > start + 1e-6 && r.t0 < end - 1e-6); }
+function uniMatchScore(label, kind, score) {
+  if (label === kind || (label === 'trans' && uniIsTrans(kind))) return score;
+  if (uniIsTrans(kind) && label === 'flow') return 0.6; // 크로스페이드 등이 이동처럼 잡힌 쌍
+  return 0.2;
 }
 
-// 구간 만들기: 라벨 런 → 최소 길이(0.4초) 미만 구간은 인접 구간에 흡수(컷은 순간 사건이라 제외) → 같은 종류 병합
-function uniBuildSegments(recs, minLen) {
+// flow 인정 조건: 길이 ≥1초, 속도 변동계수 CV < 0.5, 상관 peak ≥0.85인 쌍이 대부분(≥70%), 총 이동량 ≥ ROI 폭의 20%
+function uniFlowEvidence(pairs, start, end, nativeW) {
+  const flowPairs = pairs.filter(p => p.label === 'flow');
+  const speeds = flowPairs.map(p => p.speed);
+  const mean = speeds.length ? speeds.reduce((s, v) => s + v, 0) / speeds.length : 0;
+  const sd = speeds.length > 1 ? Math.sqrt(speeds.reduce((s, v) => s + (v - mean) * (v - mean), 0) / speeds.length) : 0;
+  const cv = mean > 0 ? sd / mean : 9;
+  const total = flowPairs.reduce((s, p) => s + p.dxNative, 0);
+  const peakFrac = pairs.length ? pairs.filter(p => p.peak >= 0.85).length / pairs.length : 0;
+  const meanDiff = pairs.length ? pairs.reduce((s, p) => s + p.diff, 0) / pairs.length : 0;
+  const len = end - start;
+  const ok = len >= 1.0 && cv < 0.5 && peakFrac >= 0.7 && total >= 0.2 * nativeW && flowPairs.length >= 2;
+  return { ok, cv, total, peakFrac, meanDiff, speed: mean, len };
+}
+
+// 전환 세분: slide(속도 일관 + 총 이동량이 ROI 폭에 가까움) / cut(1~2개 간격에서 diff 급증) / dissolve(나머지: 속도 불일치·peak 낮음)
+function uniClassifyTransition(pairs, nativeW, thr) {
+  const n = pairs.length;
+  const mv = pairs.filter(p => p.dxLow >= (thr.minDx || 0.8) && p.peak >= 0.5);
+  const sp = mv.map(p => p.speed);
+  const mean = sp.length ? sp.reduce((s, v) => s + v, 0) / sp.length : 0;
+  const sd = sp.length > 1 ? Math.sqrt(sp.reduce((s, v) => s + (v - mean) * (v - mean), 0) / sp.length) : 0;
+  const cv = mean > 0 ? sd / mean : 9;
+  const total = mv.reduce((s, p) => s + p.dxNative, 0);
+  if (n >= 3 && mv.length >= n * 0.6 && cv < 0.5 && total >= 0.7 * nativeW) return 'slide';
+  if (n <= 1) return 'cut';
+  if (n === 2) {
+    const d = pairs.map(p => p.diff);
+    if (Math.max(...d) / Math.max(1e-6, Math.min(...d)) >= 2 || Math.max(...d) >= thr.cutThr * 1.5) return 'cut';
+  }
+  return 'dissolve';
+}
+
+// 구간 만들기: 쌍 라벨 런 → 최소 길이(0.4초) 미만은 인접 구간에 흡수(전환은 순간 사건이라 제외) → flow 인정 조건 검증
+// (미달 + diff 큼 = 전환으로 재분류) → 전환 세분 → 같은 종류 병합
+function uniBuildSegments(recs, minLen, ctx) {
   let runs = [];
   for (const r of recs) {
     const last = runs[runs.length - 1];
@@ -6982,19 +7020,19 @@ function uniBuildSegments(recs, minLen) {
     }
     runs = out;
   };
-  for (let guard = 0; guard < 200; guard++) {
+  for (let guard = 0; guard < 300; guard++) {
     let idx = -1, best = Infinity;
     runs.forEach((r, i) => {
-      if (r.kind === 'cut' || runs.length < 2) return;
+      if (r.kind === 'trans' || runs.length < 2) return;
       const len = r.end - r.start;
       if (len < minLen && len < best) {
         const prev = runs[i - 1], next = runs[i + 1];
-        if ((prev && prev.kind !== 'cut') || (next && next.kind !== 'cut')) { idx = i; best = len; }
+        if ((prev && prev.kind !== 'trans') || (next && next.kind !== 'trans')) { idx = i; best = len; }
       }
     });
     if (idx < 0) break;
     const prev = runs[idx - 1], next = runs[idx + 1];
-    const okPrev = prev && prev.kind !== 'cut', okNext = next && next.kind !== 'cut';
+    const okPrev = prev && prev.kind !== 'trans', okNext = next && next.kind !== 'trans';
     let target;
     if (okPrev && okNext) target = (prev.kind === next.kind || (prev.end - prev.start) >= (next.end - next.start)) ? 'prev' : 'next';
     else target = okPrev ? 'prev' : 'next';
@@ -7004,22 +7042,50 @@ function uniBuildSegments(recs, minLen) {
   }
   mergeSame();
   const segs = runs.map((r, i) => ({ id: i + 1, kind: r.kind, start: r.start, end: r.end, manual: false }));
-  uniAnnotateSegments(recs, segs);
-  return segs;
+  for (const sg of segs) {
+    const pairs = uniSegPairs(recs, sg.start, sg.end);
+    if (sg.kind === 'trans') sg.kind = uniClassifyTransition(pairs, ctx.nativeW, ctx.thr);
+    else if (sg.kind === 'flow') {
+      const ev = uniFlowEvidence(pairs, sg.start, sg.end, ctx.nativeW);
+      if (!ev.ok) {
+        if (ev.meanDiff >= ctx.thr.cutThr * 0.6) sg.kind = uniClassifyTransition(pairs, ctx.nativeW, ctx.thr); // 조건 미달 + diff 큼 → 전환
+        else sg.weakFlow = true; // 이동 증거는 약하지만 diff도 작음 — 확인 필요로 남긴다
+      }
+    }
+  }
+  // 같은 종류(정지·페이지·이동) 병합 — 전환은 사건이라 병합하지 않는다
+  const out = [];
+  for (const sg of segs) {
+    const last = out[out.length - 1];
+    if (last && last.kind === sg.kind && !uniIsTrans(sg.kind)) { last.end = sg.end; last.weakFlow = last.weakFlow || sg.weakFlow; }
+    else out.push(sg);
+  }
+  out.forEach((sg, i) => { sg.id = i + 1; });
+  uniAnnotateSegments(recs, out, ctx);
+  return out;
 }
 
-// 통계(속도·점수), 정지의 종류(flow 안의 정지 / cut 직후의 정지), '확인 필요' 표시
-function uniAnnotateSegments(recs, segs) {
+// 통계(속도·변동계수·총 이동량·점수), page의 세부(hold/playhead)·대표 프레임 후보, 정지/페이지의 앞뒤 맥락, '확인 필요'
+function uniAnnotateSegments(recs, segs, ctx) {
   segs.forEach((s, i) => {
-    const st = uniSegStats(recs, s.start, s.end, s.kind);
-    s.speed = st.speed; s.score = st.score;
-    if (s.kind === 'static') {
+    const pairs = uniSegPairs(recs, s.start, s.end);
+    const ev = uniFlowEvidence(pairs, s.start, s.end, ctx.nativeW);
+    s.speed = ev.speed; s.cv = ev.cv === 9 ? 0 : ev.cv; s.total = ev.total;
+    s.score = pairs.length ? pairs.reduce((a, p) => a + uniMatchScore(p.label, s.kind, p.score), 0) / pairs.length : 0.3;
+    s.subKind = null; s.repT = null;
+    if (s.kind === 'page' && pairs.length) {
+      const meanDiff = pairs.reduce((a, p) => a + p.diff, 0) / pairs.length;
+      s.subKind = meanDiff < ctx.thr.staticThr ? 'hold' : 'playhead';
+      const best = pairs.reduce((m, p) => (!m || p.diff < m.diff ? p : m), null);
+      s.repT = best ? (best.t0 + best.t) / 2 : null; // 대표 프레임 후보 시각: diff가 가장 작은 지점
+    }
+    if (s.kind === 'page' || s.kind === 'static') {
       const prev = segs[i - 1], next = segs[i + 1];
-      if (prev && prev.kind === 'cut') s.staticKind = 'cut 직후 정지';
-      else if ((prev && prev.kind === 'flow') || (next && next.kind === 'flow')) s.staticKind = 'flow 안의 정지';
-      else s.staticKind = '단독 정지';
-    } else s.staticKind = null;
-    s.flagged = !s.manual && (st.score < 0.6 || (s.kind === 'flow' && st.speedVar > 0.4));
+      if (prev && uniIsTrans(prev.kind)) s.ctxKind = '전환 직후';
+      else if ((prev && prev.kind === 'flow') || (next && next.kind === 'flow')) s.ctxKind = 'flow 안';
+      else s.ctxKind = '단독';
+    } else s.ctxKind = null;
+    s.flagged = !s.manual && (s.score < 0.6 || !!s.weakFlow || (s.kind === 'flow' && s.cv > 0.5));
   });
 }
 
@@ -7061,9 +7127,9 @@ function UniTimeline({ segs, duration, seekT, selIdx, onSelect, onSeek, onBounda
             onClick={e => { e.stopPropagation(); onSelect(i); onSeek(timeAt(e)); }}
             style={{
               position: 'absolute', left: pct(s.start), width: pct(s.end - s.start), top: 0, bottom: 0,
-              background: UNI_KIND_COLOR[s.kind], opacity: s.kind === 'cut' ? 1 : 0.85,
+              background: UNI_KIND_COLOR[s.kind], opacity: uniIsTrans(s.kind) ? 1 : 0.85,
               outline: s.flagged ? '2px dashed #ff9500' : (i === selIdx ? '2px solid #111' : 'none'), outlineOffset: '-2px',
-              minWidth: s.kind === 'cut' ? '3px' : undefined,
+              minWidth: uniIsTrans(s.kind) ? '3px' : undefined,
             }} />
         ))}
         {segs.slice(0, -1).map((s, i) => (
@@ -7080,7 +7146,9 @@ function UniTimeline({ segs, duration, seekT, selIdx, onSelect, onSeek, onBounda
         <span>0s</span><span>{(D / 2).toFixed(1)}s</span><span>{D.toFixed(1)}s</span>
       </div>
       <div className="slider-label" style={{ margin: 0 }}>
-        <span style={{ color: UNI_KIND_COLOR.flow }}>■</span> 연속 이동 · <span style={{ color: UNI_KIND_COLOR.static }}>■</span> 정지 · <span style={{ color: UNI_KIND_COLOR.cut }}>■</span> 컷 전환 · <span style={{ color: '#ff9500' }}>┅</span> 확인 필요(주황 점선) · 빗금 = 분석하지 않은 구간 · 경계를 드래그하면 조정
+        <span style={{ color: UNI_KIND_COLOR.page }}>■</span> 페이지(고정) · <span style={{ color: UNI_KIND_COLOR.flow }}>■</span> 연속 이동 · <span style={{ color: UNI_KIND_COLOR.static }}>■</span> 완전정지 ·
+        전환: <span style={{ color: UNI_KIND_COLOR.cut }}>■</span> 컷 <span style={{ color: UNI_KIND_COLOR.dissolve }}>■</span> 디졸브 <span style={{ color: UNI_KIND_COLOR.slide }}>■</span> 슬라이드 ·
+        <span style={{ color: '#ff9500' }}>┅</span> 확인 필요(주황 점선) · 빗금 = 분석하지 않은 구간 · 경계를 드래그하면 조정
       </div>
     </div>
   );
@@ -7193,7 +7261,7 @@ function UniStep({ videoRef, onModeBack }) {
       });
       if (out) {
         const thr = uniLabelPairs(out.recs);
-        const built = uniBuildSegments(out.recs, 0.4);
+        const built = uniBuildSegments(out.recs, 0.4, { nativeW: out.nativeW, thr });
         setAnalysis({ ...out, thr });
         setSegs(built);
         setMsg('완료: 구간 ' + built.length + '개 (확인 필요 ' + built.filter(s => s.flagged).length + '개)');
@@ -7215,7 +7283,7 @@ function UniStep({ videoRef, onModeBack }) {
     const A = analysisRef.current;
     setSegs(prev => {
       const next = prev.map((s, k) => (k === i ? { ...s, kind, manual: true } : s));
-      if (A) uniAnnotateSegments(A.recs, next);
+      if (A) uniAnnotateSegments(A.recs, next, { nativeW: A.nativeW, thr: A.thr });
       return next;
     });
   }
@@ -7225,7 +7293,7 @@ function UniStep({ videoRef, onModeBack }) {
       const next = prev.map(s => ({ ...s }));
       next[i].end = t; next[i + 1].start = t;
       next[i].manual = true; next[i + 1].manual = true;
-      if (A) uniAnnotateSegments(A.recs, next);
+      if (A) uniAnnotateSegments(A.recs, next, { nativeW: A.nativeW, thr: A.thr });
       return next;
     });
   }
@@ -7235,9 +7303,12 @@ function UniStep({ videoRef, onModeBack }) {
       params: { roi, startT: rangeStart, endT: rangeEnd, rate, nativeW: analysis.nativeW, lowW: analysis.w, scale: analysis.scale, thresholds: analysis.thr },
       frames: analysis.recs.map(r => ({
         t0: r.t0, t: r.t, diff: r.diff, dxLow: r.dxLow, dxNative: r.dxNative, speedPxPerSec: r.speed,
-        peak: r.peak, second: r.second, margin: r.margin, label: r.label, score: r.score,
+        peak: r.peak, second: r.second, margin: r.margin, peak0: r.peak0, label: r.label, sub: r.sub || null, score: r.score,
       })),
-      segments: segs.map(s => ({ start: s.start, end: s.end, kind: s.kind, staticKind: s.staticKind, score: s.score, speed: s.speed, flagged: !!s.flagged, manual: !!s.manual })),
+      segments: segs.map(s => ({
+        start: s.start, end: s.end, kind: s.kind, subKind: s.subKind, context: s.ctxKind, score: s.score, speed: s.speed,
+        speedCV: s.cv, totalMovePx: s.total, repFrameCandidate: s.repT, flagged: !!s.flagged, manual: !!s.manual,
+      })),
     };
     downloadBlobFile(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }), 'uni_frames_debug.json');
   }
@@ -7297,8 +7368,8 @@ function UniStep({ videoRef, onModeBack }) {
         <div className="block">
           <div className="block-head"><span>구간 분류 결과</span></div>
           <p className="hint-text">
-            프레임 쌍 {analysis.recs.length}개 · 자동 임계값: 정지 diff &lt; {analysis.thr.staticThr.toFixed(2)}, 이동 신뢰도(NCC 피크) ≥ {analysis.thr.confThr.toFixed(2)}, 컷 diff ≥ {analysis.thr.cutThr.toFixed(2)}
-            (diff 중앙값 {analysis.thr.med.toFixed(2)}) · 최소 구간 0.4초(그보다 짧은 구간은 인접 구간에 흡수, 컷은 제외)
+            프레임 쌍 {analysis.recs.length}개 · 자동 임계값: 완전정지 diff &lt; {analysis.thr.staticThr.toFixed(2)}, 이동 신뢰도(NCC 피크) ≥ {analysis.thr.confThr.toFixed(2)}, 전환 diff ≥ {analysis.thr.cutThr.toFixed(2)} (페이지 판정: dx=0 상관 ≥ 0.90)
+            (diff 중앙값 {analysis.thr.med.toFixed(2)}) · 최소 구간 0.4초(그보다 짧은 구간은 인접 구간에 흡수, 전환은 제외) · 연속 이동 인정: 길이 ≥1초 · 속도 CV &lt; 0.5 · peak ≥ 0.85가 대부분 · 총 이동 ≥ ROI 폭 20%
           </p>
           <UniTimeline segs={segs} duration={duration} seekT={seekT} selIdx={selIdx}
             onSelect={i => setSelIdx(i)} onSeek={t => { if (playingRef.current) stopPlay(); userSeek(t); }} onBoundary={moveBoundary} />
@@ -7309,7 +7380,7 @@ function UniStep({ videoRef, onModeBack }) {
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
               <thead>
                 <tr style={{ textAlign: 'left', borderBottom: '1px solid var(--border-strong)' }}>
-                  <th>#</th><th>시작~끝(s)</th><th>길이</th><th>종류 (클릭해 변경)</th><th>세부</th><th>신뢰도</th><th>평균 이동 속도</th><th>확인 필요</th>
+                  <th>#</th><th>시작~끝(s)</th><th>길이</th><th>종류 (클릭해 변경)</th><th>세부(subKind)</th><th>신뢰도</th><th>이동 속도 · CV · 총 이동</th><th>대표 프레임 후보</th><th>확인 필요</th>
                 </tr>
               </thead>
               <tbody>
@@ -7322,13 +7393,14 @@ function UniStep({ videoRef, onModeBack }) {
                     <td onClick={e => e.stopPropagation()}>
                       <span style={{ color: UNI_KIND_COLOR[s.kind] }}>■ </span>
                       <select value={s.kind} onChange={e => changeKind(i, e.target.value)} style={{ width: 'auto' }}>
-                        <option value="flow">연속 이동</option><option value="static">정지</option><option value="cut">컷 전환</option>
+                        {Object.keys(UNI_KIND_LABEL).map(k => <option key={k} value={k}>{UNI_KIND_LABEL[k]}</option>)}
                       </select>
                       {s.manual ? ' (수동)' : ''}
                     </td>
-                    <td>{s.staticKind || ''}</td>
+                    <td>{[s.subKind, s.ctxKind].filter(Boolean).join(' · ')}</td>
                     <td>{s.score.toFixed(2)}</td>
-                    <td>{s.kind === 'flow' ? Math.round(s.speed) + ' px/s' : '-'}</td>
+                    <td>{(s.kind === 'flow' || s.kind === 'slide') ? (Math.round(s.speed) + ' px/s · CV ' + s.cv.toFixed(2) + ' · ' + Math.round(s.total) + 'px') : '-'}</td>
+                    <td>{s.repT != null ? s.repT.toFixed(2) + 's' : ''}</td>
                     <td style={{ color: '#e07000', fontWeight: 700 }}>{s.flagged ? '확인 필요' : ''}</td>
                   </tr>
                 ))}
