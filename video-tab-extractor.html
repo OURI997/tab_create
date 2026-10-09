@@ -7666,13 +7666,14 @@ function uniHead(piece, W, H) {
   return c;
 }
 
-// 조각 목록(순서대로)을 하나의 스트립으로 합친다. 조각 경계마다: 겹침 확정이면 뒤 조각의 왼쪽을 겹친 만큼 trim,
-// 겹침 없음/판단 불가면 butt join + '누락 의심', 이어서 남은 중복 마디(detectSeamDuplicate)가 있으면 더 trim.
-function uniJoinPieces(pieces, W, H) {
+// 조각 경계 분석(자동 결정은 보수적): 겹침 제거 폭이 ROI 폭의 30%를 넘거나 1·2위 후보의 IoU 격차(margin)가 작으면(<0.15) 자동으로
+// 지우지 않고 '이음새 의심'으로 플래그한다(제안 폭은 suggestTrim에 남겨 슬라이더로 적용할 수 있게). 잘려 나갈 픽셀은 버리지 않고
+// 조각 원본을 그대로 보관하므로(uniFinalize가 매번 다시 합성), trim은 언제든 되돌릴 수 있다.
+function uniAnalyzeJoins(pieces, W, H) {
   const joins = [{ state: 'first', trim: 0 }];
   for (let i = 1; i < pieces.length; i++) {
     const A = pieces[i - 1], B = pieces[i];
-    const join = { state: 'butt', suspect: true, trim: 0, ovl: null, dupFixed: 0 };
+    const join = { state: 'butt', suspect: true, seamSuspect: false, trim: 0, suggestTrim: 0, ovl: null, dupFixed: 0, suggestDup: 0, margin: null };
     const tailA = uniTail(A, W, H), headB = uniHead(B, W, H);
     const iA = tileInfoOf(tailA), iB = tileInfoOf(headB);
     if (iA.sys || iB.sys) {
@@ -7681,35 +7682,105 @@ function uniJoinPieces(pieces, W, H) {
       const space = (iA.sys || iB.sys).space;
       const ov = findSeamOverlap(iA, iB, tailA, headB, mask, space);
       join.ovl = { status: ov.status, px: ov.px || 0, iou: ov.iou != null ? ov.iou : null, why: ov.why || null, cands: ov.cands };
-      if (ov.status === 'overlap') { join.trim = Math.max(0, Math.min(W - 2, iA.xR + 1 - ov.s)); join.state = 'overlap'; join.suspect = false; }
-      else join.state = ov.status === 'unverifiable' ? 'butt-unverifiable' : 'butt';
+      if (ov.status === 'overlap') {
+        const t = Math.max(0, Math.min(W - 2, iA.xR + 1 - ov.s));
+        const sorted = (ov.cands || []).slice().sort((p, q) => q.iou - p.iou);
+        const second = sorted.find(c => Math.abs(c.s - ov.s) > 4);
+        join.margin = second ? ov.iou - second.iou : 1;
+        join.suggestTrim = t;
+        if (t > 0.3 * W || join.margin < 0.15) { join.state = 'seam-suspect'; join.seamSuspect = true; } // 자동 제거하지 않는다
+        else { join.trim = t; join.state = 'overlap'; join.suspect = false; }
+      } else join.state = ov.status === 'unverifiable' ? 'butt-unverifiable' : 'butt';
       const bEnd = Math.min(W - 1, iB.xR);
       if (join.trim < bEnd - 10) {
         const dd = detectSeamDuplicate(iA, iB, iA.xR, join.trim, bEnd, mask, space, W);
-        if (dd.status === 'dup' && join.trim + dd.d < W - 5) { join.trim += dd.d; join.dupFixed = dd.d; join.suspect = false; }
+        if (dd.status === 'dup' && join.trim + dd.d < W - 5) {
+          if (dd.d > 0.3 * W) { join.suggestDup = dd.d; join.seamSuspect = true; join.state = 'seam-suspect'; }
+          else { join.trim += dd.d; join.dupFixed = dd.d; join.suspect = false; }
+        }
       }
     } else join.state = 'butt-unverifiable';
     joins.push(join);
   }
-  const builder = flowChunkBuilder(H, 6000);
-  const offsets = [];
-  pieces.forEach((p, i) => {
-    offsets.push(builder.total());
-    let base = 0;
-    const trim = joins[i].trim;
-    for (const c of p.chunks) {
-      const cs = base, ce = base + c.width;
-      const a = Math.max(trim, cs);
-      if (ce > a) builder.append(c, a - cs, ce - a);
-      base = ce;
-    }
-  });
-  return { chunks: builder.finish(), totalW: builder.total(), joins, offsets };
+  return joins;
 }
 
-// 시간 매핑: 조각마다 로컬 좌표 → 시각 (flow: x(t) 역변환, page: 프레임별 [start,end] 구간 안에서 폭 비례 — 추정) 을 이어
-// 스트립 좌표 s → 시각 piecewise 점열로 만든다. FlowStage2가 쓰는 "x(t) 트랙" 형태(t[], X[]=스트립 좌표)로 돌려준다.
-function uniBuildTimeTrack(pieces, joins, offsets, totalW) {
+function uniPasteStrip(chunks, canvas, x0) {
+  let base = 0;
+  for (const c of chunks) {
+    const cs = base, ce = base + c.width;
+    const a = Math.max(x0, cs), b = Math.min(x0 + canvas.width, ce);
+    if (b > a) c.getContext('2d').drawImage(canvas, a - x0, 0, b - a, c.height, a - cs, 0, b - a, c.height);
+    base = ce;
+  }
+}
+// 편집한 이음새 주변의 오선을 이어 준다: 이진 이미지에서 오선 행을 다시 찾고(planStaffRestore → detectStaffRowsFromGray)
+// 이음새를 가로지르는 줄을 paintStaffRestore로 그린다.
+function uniRepairStaff(chunks, x, W, totalW) {
+  const x0 = Math.max(0, Math.round(x - W * 0.5)), x1 = Math.min(totalW, Math.round(x + W * 0.5));
+  if (x1 - x0 < 20) return;
+  const c = flowCropStrip(chunks, x0, x1);
+  const ctx = c.getContext('2d');
+  const img = ctx.getImageData(0, 0, c.width, c.height);
+  const plan = planStaffRestore(img.data, c.width, c.height, false);
+  if (!plan.length) return;
+  paintStaffRestore(img, c.width, plan);
+  ctx.putImageData(img, 0, 0);
+  uniPasteStrip(chunks, c, x0);
+}
+
+// 조각 목록 + 이음새 설정(자동 + 수동 보정 adj)으로 하나의 스트립을 합성하고 시간 매핑을 만든다.
+//  adj[i] = { trim?: 뒤 조각(i)의 앞쪽 trim(px, 음수면 그 조각 원본 왼쪽 가장자리에서 더 가져옴), tail?: 앞 조각(i-1)의 꼬리
+//            (px, 양수면 그 조각 원본 오른쪽 가장자리에서 더 가져오고, 음수면 꼬리를 더 자름) }
+function uniFinalize(merged, adj, nativeW) {
+  const { pieces, joinsAuto, H } = merged;
+  const eff = joinsAuto.map((j, i) => {
+    const a = adj[i] || {};
+    return { ...j, trim: a.trim != null ? a.trim : j.trim, tail: a.tail != null ? a.tail : 0, manual: a.trim != null || a.tail != null };
+  });
+  const builder = flowChunkBuilder(H, 6000);
+  const offsets = [], ranges = [], map = [], trimmed = [], effTrim = [], effTail = [];
+  pieces.forEach((p, i) => {
+    const trim = i === 0 ? 0 : eff[i].trim;
+    const tail = i + 1 < pieces.length ? eff[i + 1].tail : 0;
+    const startS = builder.total();
+    offsets.push(startS);
+    let tr = trim;
+    if (trim < 0) {
+      const k = p.leftExtra ? Math.min(-trim, p.leftExtra.width) : 0;
+      if (k > 0) { builder.append(p.leftExtra, p.leftExtra.width - k, k); map.push({ s0: startS, s1: startS + k, pieceIdx: i, type: 'left-extra', x0: -k, x1: 0 }); }
+      tr = -k;
+    }
+    const a = Math.max(0, tr);
+    let cut = 0;
+    if (tail < 0) cut = Math.min(-tail, Math.max(0, p.totalW - 1 - a));
+    const b = p.totalW - cut;
+    const midS = builder.total();
+    let base = 0;
+    for (const c of p.chunks) {
+      const cs = base, ce = base + c.width;
+      const lo = Math.max(a, cs), hi = Math.min(b, ce);
+      if (hi > lo) builder.append(c, lo - cs, hi - lo);
+      base = ce;
+    }
+    map.push({ s0: midS, s1: builder.total(), pieceIdx: i, type: 'piece', x0: a, x1: b });
+    if (a > 0) trimmed.push({ pieceIdx: i, joinIdx: i, x0: 0, x1: a, kind: '이음새에서 잘린 앞부분' });
+    if (cut > 0) trimmed.push({ pieceIdx: i, joinIdx: i + 1, x0: b, x1: p.totalW, kind: '이음새에서 잘린 꼬리' });
+    let ta = 0;
+    if (tail > 0 && p.rightExtra) {
+      ta = Math.min(tail, p.rightExtra.width);
+      const s0 = builder.total();
+      builder.append(p.rightExtra, 0, ta);
+      map.push({ s0, s1: s0 + ta, pieceIdx: i, type: 'right-extra', x0: p.totalW, x1: p.totalW + ta });
+    }
+    effTrim.push(tr); effTail.push(ta > 0 ? ta : -cut);
+    ranges.push({ type: p.type, s0: startS, s1: builder.total(), expect: p.expect || 0, pieceIdx: i });
+  });
+  const chunks = builder.finish();
+  const totalW = builder.total();
+  eff.forEach((j, i) => { if (i > 0 && j.manual) uniRepairStaff(chunks, offsets[i], nativeW, totalW); });
+
+  // 시간 매핑: 조각 로컬 좌표 → 시각 (flow: x(t) 역변환, page: 프레임별 [start,end] 구간 안에서 폭 비례 — 추정). 확장/잘림은 가장자리 값으로 고정.
   const T = [], S = [];
   const push = (s, t) => {
     const k = T.length - 1;
@@ -7717,7 +7788,6 @@ function uniBuildTimeTrack(pieces, joins, offsets, totalW) {
     T.push(t); S.push(s);
   };
   pieces.forEach((p, i) => {
-    const trim = joins[i].trim, len = p.totalW - trim, off = offsets[i];
     let tAt;
     if (p.type === 'flow') {
       const tr = p.track;
@@ -7730,16 +7800,176 @@ function uniBuildTimeTrack(pieces, joins, offsets, totalW) {
     } else {
       tAt = xl => { const t = timeForXByFrames(p.placed, xl); return t != null ? t : p.fallbackT; };
     }
-    for (let x = 0; x < len; x += 40) push(off + x, tAt(trim + x));
-    push(off + len, tAt(p.totalW));
+    const x0 = effTrim[i];
+    const x1 = p.totalW + (effTail[i] > 0 ? effTail[i] : effTail[i]);
+    const len = Math.max(1, x1 - x0);
+    for (let x = 0; x < len; x += 40) push(offsets[i] + x, tAt(x0 + x));
+    push(offsets[i] + len, tAt(x1));
   });
-  return { t: T, X: S, k0: 0, k1: T.length - 1, totalW };
+  const track = { t: T, X: S, k0: 0, k1: T.length - 1, totalW, nativeW, barCols: [0, 0], staticRanges: [] };
+  const synth = { chunks, totalW, H, stats: {}, tFirst: T[0], track }; // 스트립 좌표 s ↔ 시각 t (x(t) 역변환 형태)
+
+  const segJoin = { ...merged.segJoinPage };
+  pieces.forEach((p, i) => {
+    if (i === 0) return;
+    const j = eff[i];
+    let txt;
+    if (j.manual) txt = '수동 조절: 앞 trim ' + effTrim[i] + 'px' + (effTail[i] ? ', 앞 조각 꼬리 ' + (effTail[i] > 0 ? '+' : '') + effTail[i] + 'px' : '');
+    else if (j.state === 'overlap') txt = '겹침 ' + j.trim + 'px 제거' + (j.dupFixed ? ' · 중복 ' + j.dupFixed + 'px 제거' : '');
+    else if (j.state === 'seam-suspect') txt = '이음새 의심 — 겹침 제안 ' + j.suggestTrim + 'px' + (j.suggestDup ? ' / 중복 제안 ' + j.suggestDup + 'px' : '') + '(자동 제거 안 함, 슬라이더로 조절)';
+    else txt = j.state === 'butt' ? 'butt join (누락 의심)' : 'butt join (누락 의심 · 판단 불가)';
+    segJoin[p.segIds[0]] = '앞 조각과: ' + txt;
+  });
+  return { chunks, totalW, H, offsets, ranges, map, trimmed, eff, segJoin, synth };
 }
 
-// 포함된 구간들로 조각(page 묶음 / flow)을 만들어 합친다
+// 합친 악보의 누락 점검: 마지막 마디가 겹세로줄(굵은 선 또는 가는 선 둘)로 끝나는지
+function uniEndsWithDoubleBar(chunks, space) {
+  const total = chunks.reduce((s, c) => s + c.width, 0);
+  const w = Math.min(total, Math.max(60, Math.round(space * 10)));
+  const g = scrollGetFullGrayData(flowCropStrip(chunks, total - w, total));
+  const sys = detectStaffSystem(g, 0.3, 140);
+  if (!sys) return null;
+  const cover = computeBarCoverage(g, sys.main.top, sys.main.bottom, 140);
+  const cl = [];
+  let cur = null;
+  for (let x = 0; x < cover.length; x++) {
+    if (cover[x] >= 0.8) { if (cur && x - cur.x1 <= 1) cur.x1 = x; else { if (cur) cl.push(cur); cur = { x0: x, x1: x }; } }
+  }
+  if (cur) cl.push(cur);
+  if (!cl.length) return false;
+  const last = cl[cl.length - 1];
+  if (last.x1 - last.x0 + 1 > space * 0.6) return true; // 굵은 선
+  const prev = cl[cl.length - 2];
+  return !!(prev && last.x0 - prev.x1 <= space * 2.5);
+}
+// 경고 목록: { measureIdx, text }  (경고가 뜬 마디에는 편집 모드 진입 안내를 같이 표시)
+function uniStripWarnings(chunks, bars, space, ranges) {
+  const out = [];
+  if (bars.length >= 2) {
+    const e = uniEndsWithDoubleBar(chunks, space || 10);
+    if (e === false) out.push({ measureIdx: bars.length - 2, text: '마지막 마디가 겹세로줄로 끝나지 않습니다 — 끝이 잘렸을 수 있음' });
+  }
+  for (const r of ranges) {
+    if (r.type !== 'page' || !r.expect) continue;
+    let count = 0, lastI = -1;
+    for (let i = 0; i + 1 < bars.length; i++) if (bars[i] >= r.s0 - 8 && bars[i + 1] <= r.s1 + 8) { count++; lastI = i; }
+    if (count < r.expect) out.push({ measureIdx: Math.max(0, lastI >= 0 ? lastI : 0), text: '조각 ' + (r.pieceIdx + 1) + ': 대표 프레임의 마디 수 ' + r.expect + '개 > 합성 스트립 ' + count + '개 — 누락 의심' });
+  }
+  return out;
+}
+
+// 마디선 오버레이 + 수동 보정 (FlowBarStrip 기반) + 마디 더블클릭 편집 모드: 편집 중인 마디의 좌우 가장자리 핸들을 끌면 원본 픽셀을
+// 더 가져오거나(바깥으로) 줄인다(안쪽으로). 빈 곳 한 번 클릭 = 마디선 추가(더블클릭과 구분하려고 250ms 지연).
+function UniBarStrip({ chunks, totalW, H, scale, bars, flagged, warnIdx, selIdx, editIdx, onSelect, onCommit, onEdit, onExtend, scrollRef }) {
+  const [drag, setDrag] = useState(null);
+  const [edgeDrag, setEdgeDrag] = useState(null);
+  const dragRef = useRef(null), edgeRef = useRef(null), clickTimer = useRef(null);
+  const latest = useRef({});
+  latest.current = { bars, onCommit, onSelect, onExtend, scale, totalW };
+  useEffect(() => {
+    function onMove(e) {
+      const L = latest.current;
+      const d = dragRef.current;
+      if (d) {
+        const dx = e.clientX - d.startClient;
+        if (!d.moved && Math.abs(dx) < 3) return;
+        d.moved = true;
+        d.x = Math.max(0, Math.min(L.totalW - 1, d.origX + dx / L.scale));
+        setDrag({ i: d.i, x: d.x });
+      }
+      const g = edgeRef.current;
+      if (g) {
+        g.dx = (e.clientX - g.startClient) / L.scale;
+        setEdgeDrag({ edge: g.edge, dx: g.dx });
+      }
+    }
+    function onUp() {
+      const L = latest.current;
+      const d = dragRef.current;
+      dragRef.current = null;
+      if (d) {
+        setDrag(null);
+        if (d.moved) {
+          const nb = L.bars.slice();
+          nb[d.i] = Math.round(d.x);
+          nb.sort((a, b) => a - b);
+          L.onCommit(nb, nb.indexOf(Math.round(d.x)));
+        } else L.onSelect(d.i);
+      }
+      const g = edgeRef.current;
+      edgeRef.current = null;
+      if (g) { setEdgeDrag(null); if (Math.abs(g.dx || 0) >= 1) L.onExtend(g.edge, g.xEdge, Math.round(g.dx)); }
+    }
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    return () => { window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp); };
+  }, []);
+  function xAt(e) { const r = e.currentTarget.getBoundingClientRect(); return (e.clientX - r.left) / scale; }
+  function onBgClick(e) {
+    if (e.target !== e.currentTarget) return;
+    const x = Math.round(xAt(e));
+    clearTimeout(clickTimer.current);
+    clickTimer.current = setTimeout(() => {
+      const nb = [...bars, x].sort((a, b) => a - b);
+      onCommit(nb, nb.indexOf(x));
+    }, 250);
+  }
+  function onBgDouble(e) {
+    clearTimeout(clickTimer.current); // 더블클릭이면 마디선 추가 취소
+    const x = xAt(e);
+    for (let i = 0; i + 1 < bars.length; i++) if (x >= bars[i] && x < bars[i + 1]) { onEdit(i); return; }
+  }
+  const eL = editIdx != null ? bars[editIdx] : null, eR = editIdx != null ? bars[editIdx + 1] : null;
+  return (
+    <div ref={scrollRef} style={{ overflowX: 'auto', border: '1px solid var(--border-strong)', background: '#fff' }}>
+      <div style={{ position: 'relative', width: Math.round(totalW * scale), height: Math.round(H * scale) }}>
+        <div style={{ display: 'flex', position: 'absolute', left: 0, top: 0 }}>
+          {chunks.map((c, i) => <FlowChunkView key={i} chunk={c} scale={scale} />)}
+        </div>
+        <div onClick={onBgClick} onDoubleClick={onBgDouble} style={{ position: 'absolute', left: 0, top: 0, right: 0, bottom: 0, cursor: 'copy' }}>
+          {flagged.map(i => bars[i + 1] != null && (
+            <div key={'f' + i} style={{ position: 'absolute', left: bars[i] * scale, width: (bars[i + 1] - bars[i]) * scale, top: 0, bottom: 0, background: 'rgba(255,140,0,0.25)', pointerEvents: 'none' }} />
+          ))}
+          {warnIdx.map(i => bars[i + 1] != null && (
+            <div key={'w' + i} style={{ position: 'absolute', left: bars[i] * scale, width: (bars[i + 1] - bars[i]) * scale, top: 0, bottom: 0, outline: '2px dashed #8e24aa', outlineOffset: '-2px', background: 'rgba(142,36,170,0.10)', pointerEvents: 'none' }}>
+              <span style={{ position: 'absolute', top: 0, left: 2, fontSize: 10, color: '#8e24aa', background: '#fff', padding: '0 2px' }}>더블클릭=편집</span>
+            </div>
+          ))}
+          {editIdx != null && bars[editIdx + 1] != null && (
+            <div style={{ position: 'absolute', left: eL * scale, width: (eR - eL) * scale, top: 0, bottom: 0, background: 'rgba(30,125,60,0.12)', outline: '2px solid #1e7d3c', outlineOffset: '-2px', pointerEvents: 'none' }} />
+          )}
+          {bars.map((b, i) => {
+            const x = drag && drag.i === i ? drag.x : b;
+            const sel = i === selIdx;
+            return (
+              <div key={i}
+                onPointerDown={e => { e.preventDefault(); e.stopPropagation(); dragRef.current = { i, startClient: e.clientX, origX: b, moved: false, x: b }; }}
+                style={{ position: 'absolute', left: x * scale - 5, width: 10, top: 0, bottom: 0, cursor: 'ew-resize' }}>
+                <div style={{ position: 'absolute', left: 4, width: sel ? 3 : 2, top: 0, bottom: 0, background: sel ? '#ff9500' : '#e02020', pointerEvents: 'none' }} />
+              </div>
+            );
+          })}
+          {editIdx != null && bars[editIdx + 1] != null && ['left', 'right'].map(edge => {
+            const xEdge = edge === 'left' ? eL : eR;
+            const dx = edgeDrag && edgeDrag.edge === edge ? edgeDrag.dx : 0;
+            return (
+              <div key={edge}
+                onPointerDown={e => { e.preventDefault(); e.stopPropagation(); edgeRef.current = { edge, xEdge, startClient: e.clientX, dx: 0 }; }}
+                title={edge === 'left' ? '왼쪽으로 끌면 이음새에서 잘린/인접 조각의 원본 픽셀을 더 가져옵니다' : '오른쪽으로 끌면 이음새에서 잘린/인접 조각의 원본 픽셀을 더 가져옵니다'}
+                style={{ position: 'absolute', left: (xEdge + dx) * scale - 8, width: 16, top: '30%', bottom: '30%', background: '#1e7d3c', borderRadius: 4, cursor: 'ew-resize', zIndex: 5, opacity: 0.9 }} />
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 포함된 구간들로 조각(page 묶음 / flow)을 만든다 (합성은 uniFinalize — 이음새 보정을 바꿀 때마다 원본 조각으로 다시 한다)
 async function uniCompose({ segs, include, products, uniDefaults, nativeW }) {
   const pieces = [];
-  const segJoin = {};
+  const segJoinPage = {};
   let group = [];
   const flush = async () => {
     if (!group.length) return;
@@ -7754,11 +7984,27 @@ async function uniCompose({ segs, include, products, uniDefaults, nativeW }) {
           : (o && o.kind === 'overlap' ? '겹침 ' + o.px + 'px 제거' : 'butt join (누락 의심' + (o && o.kind === 'unverifiable' ? ' · 판단 불가' : '') + ')'));
         if (f.dupFixed) txt += ' · 중복 ' + f.dupFixed + 'px 제거';
         if (f.dupSuspect) txt += ' · 중복 의심';
-        segJoin[ids[k]] = txt;
+        segJoinPage[ids[k]] = txt;
       });
+      // 원본 보존: 조각 양끝 바깥의 (전처리 후) 타일 가장자리 픽셀 — 이음새 보정 때 더 가져올 수 있다
+      const real = built.frames.filter(f => !f.dup);
+      let leftExtra = null, rightExtra = null, expect = 0;
+      if (real.length) {
+        const f0 = real[0], fL = real[real.length - 1];
+        const lw = Math.min(f0.srcX, 400), rw = Math.min(fL.canvas.width - (fL.srcX + fL.len), 400);
+        if (lw > 0) { leftExtra = document.createElement('canvas'); leftExtra.width = lw; leftExtra.height = f0.canvas.height; leftExtra.getContext('2d').drawImage(f0.canvas, f0.srcX - lw, 0, lw, f0.canvas.height, 0, 0, lw, f0.canvas.height); }
+        if (rw > 0) { rightExtra = document.createElement('canvas'); rightExtra.width = rw; rightExtra.height = fL.canvas.height; rightExtra.getContext('2d').drawImage(fL.canvas, fL.srcX + fL.len, 0, rw, fL.canvas.height, 0, 0, rw, fL.canvas.height); }
+        // 누락 점검용: 대표 프레임(타일)에서 센 마디 수의 최댓값
+        for (const f of real) {
+          const inf = tileInfoOf(f.canvas);
+          if (!inf.sys) continue;
+          const bs = detectBarsThroughSystem(inf.g, inf.sys, 0.8, inf.xL, 140, null, 0).bars.filter(b => b.x >= inf.xL && b.x <= inf.xR);
+          expect = Math.max(expect, Math.max(0, bs.length - 1));
+        }
+      }
       pieces.push({
         type: 'page', segIds: ids, chunks: [lay.canvas], totalW: lay.canvas.width, placed: lay.placed, seams: lay.seams,
-        fallbackT: group[0].seg.start,
+        fallbackT: group[0].seg.start, leftExtra, rightExtra, expect,
       });
     }
     group = [];
@@ -7771,26 +8017,251 @@ async function uniCompose({ segs, include, products, uniDefaults, nativeW }) {
     } else if (seg.kind === 'flow') {
       await flush();
       const fp = products.flow[seg.id];
-      if (fp && fp.res) pieces.push({ type: 'flow', segIds: [seg.id], chunks: fp.res.chunks, totalW: fp.res.totalW, track: fp.res.track, tFirst: fp.res.tFirst });
+      if (fp && fp.res) pieces.push({ type: 'flow', segIds: [seg.id], chunks: fp.res.chunks, totalW: fp.res.totalW, track: fp.res.track, tFirst: fp.res.tFirst, leftExtra: null, rightExtra: null, expect: 0 });
     }
   }
   await flush();
   if (!pieces.length) return null;
   const H = pieces[0].chunks[0].height;
-  const joined = uniJoinPieces(pieces, nativeW, H);
-  pieces.forEach((p, i) => {
-    if (i > 0) {
-      const j = joined.joins[i];
-      const label = j.state === 'overlap' ? '겹침 ' + (j.ovl ? j.ovl.px : 0) + 'px 제거' : (j.state === 'butt' ? 'butt join (누락 의심)' : 'butt join (누락 의심 · 판단 불가)');
-      segJoin[p.segIds[0]] = '앞 조각과: ' + label + (j.dupFixed ? ' · 중복 ' + j.dupFixed + 'px 제거' : '');
-    }
-  });
-  const timeTrack = uniBuildTimeTrack(pieces, joined.joins, joined.offsets, joined.totalW);
-  const synth = {
-    chunks: joined.chunks, totalW: joined.totalW, H, stats: {}, tFirst: timeTrack.t[0],
-    track: { ...timeTrack, nativeW, barCols: [0, 0], staticRanges: [] }, // 스트립 좌표 s ↔ 시각 t (FlowStage2의 x(t) 역변환에 그대로 쓰인다)
+  const joinsAuto = uniAnalyzeJoins(pieces, nativeW, H);
+  return { pieces, joinsAuto, segJoinPage, H };
+}
+
+
+// 통합 모드용 2단계 — FlowStage2(수정 금지)를 복사해 마디 더블클릭 편집·누락 경고를 더한 것. 마디 감지·그룹화·시간 매핑·빌더 전송 로직은 같다.
+function UniStage2({ result, videoFile, flowDefaults, editCtx }) {
+  const { chunks, totalW, H, track, stats } = result;
+  const nativeW = track.nativeW;
+  const [det, setDet] = useState(null);
+  const [detecting, setDetecting] = useState(false);
+  const [detProgress, setDetProgress] = useState(0);
+  const [bars, setBars] = useState([]);
+  const [selIdx, setSelIdx] = useState(null);
+  const [groupSizeUser, setGroupSizeUser] = useState(null);
+  const [maxBarsUser, setMaxBarsUser] = useState(null);
+  const [groupBasis, setGroupBasis] = useState('auto');
+  const [offsetSec, setOffsetSec] = useState(0);
+  const [sending, setSending] = useState(false);
+  const scrollRef = useRef(null);
+  const pvRef = useRef(null);
+  const stopAtRef = useRef(null);
+  const scale = Math.min(1, 180 / H);
+  const [editIdx, setEditIdx] = useState(null);
+  const ctx2 = editCtx || {};
+
+  async function detect() {
+    setDetecting(true); setDetProgress(0); setSelIdx(null); setEditIdx(null);
+    try {
+      const r = await flowDetectBars(chunks, nativeW, f => setDetProgress(f));
+      setDet(r); setBars(r.bars);
+    } finally { setDetecting(false); }
+  }
+  useEffect(() => { detect(); }, [result]);
+
+  const videoUrl = useMemo(() => (videoFile ? URL.createObjectURL(videoFile) : null), [videoFile]);
+  useEffect(() => () => { if (videoUrl) URL.revokeObjectURL(videoUrl); }, [videoUrl]);
+
+  // ---- 시간 매핑: 스트립 x → 재생 시각 ----
+  // 스트립 좌표 s의 내용이 재생바 열 p를 지나는 시각 = X(t) − X(첫 프레임) = s − p 가 되는 t (x(t)의 역변환)
+  const playbar = useMemo(() => flowResolvePlaybar(track), [track]);
+  const Xm = useMemo(() => {
+    const out = [];
+    let m = -Infinity;
+    for (const v of track.X) { m = Math.max(m, v); out.push(m); }
+    return out;
+  }, [track]);
+  const Xf = useMemo(() => flowInterpX(track, result.tFirst != null ? result.tFirst : track.t[track.k0]), [track, result]);
+  const dur = track.t[track.t.length - 1];
+  const tOf = s => {
+    const p = playbar ? playbar.x : 0;
+    const t = flowInvX(track.t, Xm, s - p + Xf) + (playbar ? 0 : offsetSec);
+    return Math.max(0, Math.min(dur, t));
   };
-  return { pieces, joins: joined.joins, offsets: joined.offsets, segJoin, synth, H };
+
+  // ---- 그룹화 (기존 groupBarsByTargetWidth / groupByWidth와 같은 UI·기본값 규칙) ----
+  const quality = useMemo(() => assessBarQuality(bars, totalW, nativeW, det ? det.weak : true), [bars, totalW, nativeW, det]);
+  const measureW = useMemo(() => robustMeasureWidth(bars), [bars]);
+  const autoGroupSize = quality.medianWidth ? Math.max(2, Math.min(6, Math.round(nativeW / quality.medianWidth))) : 4;
+  const groupSize = groupSizeUser != null ? groupSizeUser : autoGroupSize;
+  const maxBarsPerGroup = Math.max(maxBarsUser != null ? maxBarsUser : groupSize + 2, groupSize);
+  const useBarGroups = bars.length >= 2 && (groupBasis === 'bar' || (groupBasis === 'auto' && !quality.low));
+  let groups = [];
+  if (det) {
+    if (useBarGroups) groups = groupBarsByTargetWidth(bars, groupSize, maxBarsPerGroup);
+    else groups = groupByWidth(totalW, groupSize, maxBarsPerGroup, measureW, nativeW, bars, det.blank, det.space);
+  }
+  const groupsMeta = groups.map((g, i) => {
+    const start = tOf(g.startX);
+    const end = i + 1 < groups.length ? tOf(groups[i + 1].startX) : tOf(g.endX);
+    return { ...g, timeRange: { start, end: Math.max(start, end) } };
+  });
+  const thumbs = useMemo(
+    () => groupsMeta.map(g => flowCropStrip(chunks, g.startX, g.endX).toDataURL('image/png')),
+    // eslint-disable-next-line
+    [chunks, JSON.stringify(groups.map(g => [g.startX, g.endX]))]
+  );
+
+  // ---- 이상치: 마디 길이(시간)가 중앙값의 ±40%를 벗어나는 마디 ----
+  const measureTimes = [];
+  for (let i = 0; i + 1 < bars.length; i++) measureTimes.push(tOf(bars[i + 1]) - tOf(bars[i]));
+  const medDur = medianOf(measureTimes);
+  const flagged = [];
+  if (measureTimes.length >= 5 && medDur > 0) measureTimes.forEach((d, i) => { if (Math.abs(d / medDur - 1) > 0.4) flagged.push(i); });
+
+  const warnings = useMemo(
+    () => (det && det.staffFound ? uniStripWarnings(chunks, bars, det.space, ctx2.pieceRanges || []) : []),
+    // eslint-disable-next-line
+    [chunks, bars, det, ctx2.pieceRanges]
+  );
+
+  function commitBars(nb, newSel) { setBars(nb); setSelIdx(newSel != null ? newSel : null); }
+  function deleteSelected() {
+    if (selIdx == null) return;
+    setBars(bars.filter((_, i) => i !== selIdx)); setSelIdx(null);
+  }
+  function scrollToX(x) {
+    const el = scrollRef.current;
+    if (el) el.scrollTo({ left: Math.max(0, x * scale - el.clientWidth / 2), behavior: 'smooth' });
+  }
+  function playFrom(range) {
+    const v = pvRef.current;
+    if (!v) return;
+    v.muted = false;
+    v.currentTime = range.start;
+    stopAtRef.current = range.end;
+    v.play().catch(() => {});
+  }
+  function onPvTime() {
+    const v = pvRef.current;
+    if (v && stopAtRef.current != null && v.currentTime >= stopAtRef.current) { v.pause(); stopAtRef.current = null; }
+  }
+
+  async function sendToBuilder() {
+    setSending(true);
+    try {
+      const sourceId = videoFile ? ('vsrc_' + Date.now() + '_' + Math.random().toString(36).slice(2)) : null;
+      const items = groupsMeta.map((g, idx) => {
+        const c = flowCropStrip(chunks, g.startX, g.endX);
+        // 전처리를 거쳤으면(검정 잉크·흰 배경) 반전/재처리 없이 그대로, 전처리를 껐으면 어두운 배경 여부로 invert 판단
+        const processed = !!flowDefaults.removeBg;
+        const invert = !processed && computeAvgLuminanceFromCanvas(c) < 128;
+        return {
+          id: 'uni_' + Date.now() + '_' + idx,
+          type: 'image', src: c.toDataURL('image/png'),
+          invert, override: processed ? { ...MERGED_ROW_NEUTRAL_OVERRIDE } : null,
+          lyrics: { tags: [], areaHeightRatio: null },
+          playheadExcluded: [], barLayout: null,
+          stitchMeta: { source: 'uni', groupIndex: idx, barCount: g.count, byWidth: !!g.byWidth },
+          timeRange: g.timeRange,
+          videoSourceId: sourceId,
+        };
+      });
+      if (sourceId && videoFile) await dbPut(VIDEO_SOURCE_KEY_PREFIX + sourceId, { videoBlob: videoFile, onsets: [], savedAt: Date.now() });
+      await dbPut(VIDEO_IMPORT_KEY, { items, importedAt: Date.now() });
+      window.location.href = 'tab-score-builder.html';
+    } catch (err) {
+      alert('전달 중 오류가 발생했습니다: ' + err.message);
+      setSending(false);
+    }
+  }
+
+  const CIRCLED = ['①','②','③','④','⑤','⑥','⑦','⑧','⑨','⑩','⑪','⑫','⑬','⑭','⑮','⑯','⑰','⑱','⑲','⑳'];
+  return (
+    <div className="block">
+      <div className="block-head"><span>2단계 — 마디 분할 · 시간 매핑 · 악보 빌더로 넘기기</span></div>
+      {detecting && <p className="hint-text">마디선 검출 중... {Math.round(detProgress * 100)}%</p>}
+      {det && (
+        <p className="hint-text">
+          {det.staffFound ? ('마디선 ' + bars.length + '개 (마디 ' + Math.max(0, bars.length - 1) + '개) · 연속도 임계 T=' + (det.T != null ? det.T.toFixed(2) : '-')) : '보표(오선)를 찾지 못했습니다.'}
+          {det.staffFound && quality.low && <b style={{ color: '#c0392b' }}> · 마디 인식 신뢰도 낮음{det.weak ? ' (마디선 인식 약함)' : ''} — 폭 기준 그룹화로 자동 전환</b>}
+          {' · 재생 시각 기준: '}{playbar ? ('재생바 ' + (playbar.source === 'user' ? '(지정) ' : '(자동 감지) ') + Math.round(playbar.x) + 'px') : '재생바 위치 없음 — 아래 슬라이더로 보정'}
+        </p>
+      )}
+      <div className="toolbar">
+        <button className="icon-btn" onClick={detect} disabled={detecting}>마디선 다시 검출 (수동 수정 초기화)</button>
+        <button className="icon-btn" onClick={deleteSelected} disabled={selIdx == null}>선택한 마디선 삭제{selIdx != null ? ' (x=' + Math.round(bars[selIdx]) + ')' : ''}</button>
+        {!playbar && (
+          <label style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>시각 보정:
+            <input type="range" min="-3" max="3" step="0.05" value={offsetSec} onChange={e => setOffsetSec(parseFloat(e.target.value))} />
+            <span className="slider-label" style={{ margin: 0 }}>{offsetSec.toFixed(2)}초</span>
+          </label>
+        )}
+      </div>
+      <p className="hint-text" style={{ margin: '4px 0' }}>빈 곳 클릭 = 마디선 추가 · 마디선 클릭 = 선택(삭제 대상) · 드래그 = 위치 미세 조정 · 주황 음영 = 마디 길이(시간) 이상치</p>
+      {flagged.length > 0 && (
+        <div className="toolbar">
+          <b style={{ color: '#e07000' }}>이상 의심 마디 {flagged.length}개 (마디선 누락·과다 의심):</b>
+          {flagged.map((i, n) => (
+            <button key={i} className="icon-btn" style={{ color: '#e07000', borderColor: '#e07000', fontWeight: 700 }}
+              title={'마디 ' + (i + 1) + ' · ' + measureTimes[i].toFixed(2) + '초 (중앙값 ' + medDur.toFixed(2) + '초)'}
+              onClick={() => { scrollToX(bars[i]); setSelIdx(i); }}>{CIRCLED[n] || n + 1}</button>
+          ))}
+        </div>
+      )}
+      {warnings.length > 0 && (
+        <div className="toolbar">
+          <b style={{ color: '#8e24aa' }}>누락 점검 경고 {warnings.length}개:</b>
+          {warnings.map((w, n) => (
+            <button key={n} className="icon-btn" style={{ color: '#8e24aa', borderColor: '#8e24aa' }} title={w.text}
+              onClick={() => { scrollToX(bars[w.measureIdx]); setEditIdx(w.measureIdx); setSelIdx(null); }}>
+              마디 {w.measureIdx + 1} — {w.text} (이 마디를 더블클릭해 편집)
+            </button>
+          ))}
+        </div>
+      )}
+      <div className="toolbar">
+        <span className="hint-text" style={{ margin: 0 }}>
+          {editIdx != null ? ('편집 중: 마디 ' + (editIdx + 1) + ' — 초록 핸들을 끌면 이음새에서 잘린 구간 → 인접 조각 원본 가장자리 순으로 원본 픽셀을 가져오거나(바깥), 더 잘라 냅니다(안쪽)') : '마디를 더블클릭하면 편집 모드로 들어갑니다'}
+        </span>
+        {editIdx != null && <button className="icon-btn" onClick={() => setEditIdx(null)}>편집 종료</button>}
+        <button className="icon-btn" onClick={() => ctx2.onUndo && ctx2.onUndo()} disabled={!ctx2.canUndo}>되돌리기</button>
+        {ctx2.msg && <span className="save-msg">{ctx2.msg}</span>}
+      </div>
+      <UniBarStrip chunks={chunks} totalW={totalW} H={H} scale={scale} bars={bars} flagged={flagged} warnIdx={warnings.map(w => w.measureIdx)} selIdx={selIdx} editIdx={editIdx}
+        onSelect={i => setSelIdx(i)} onCommit={commitBars} onEdit={i => { setEditIdx(i); setSelIdx(null); }}
+        onExtend={(edge, xEdge, d) => ctx2.onExtend && ctx2.onExtend(edge, xEdge, d)} scrollRef={scrollRef} />
+
+      <div className="hr" />
+      <div className="toolbar">
+        <label>몇 마디씩 묶기(목표): <input type="number" min="1" max="16" value={groupSize}
+          onChange={e => setGroupSizeUser(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
+        <label>그룹당 최대 마디수: <input type="number" min="1" max="20" value={maxBarsPerGroup}
+          onChange={e => setMaxBarsUser(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
+        <label>그룹 기준:
+          <select value={groupBasis} onChange={e => setGroupBasis(e.target.value)} style={{ width: 'auto', marginLeft: '6px' }}>
+            <option value="auto">자동 (신뢰도 낮으면 폭 기준)</option>
+            <option value="bar">마디선 기준</option>
+            <option value="width">폭 기준</option>
+          </select>
+        </label>
+        <span className="hint-text" style={{ margin: 0 }}>자동 기준: 화면 1장 분량{groupSizeUser == null ? ' (목표 ' + autoGroupSize + '마디, 최대 ' + (autoGroupSize + 2) + ')' : ''}</span>
+        <span className="save-msg">{useBarGroups ? (Math.max(0, bars.length - 1) + '마디 → ' + groups.length + '개 그룹') : ('폭 기준 분할 → ' + groups.length + '개 그룹')}</span>
+      </div>
+
+      {videoUrl && (
+        <video ref={pvRef} src={videoUrl} controls onTimeUpdate={onPvTime} style={{ maxWidth: '100%', maxHeight: '220px', background: '#000' }} />
+      )}
+
+      <div className="list">
+        {groupsMeta.map((g, idx) => (
+          <div key={idx} className="block">
+            <div className="block-head">
+              <span>
+                그룹 {idx + 1}: {g.byWidth ? '폭 기준 분할' : (g.count + '마디')}
+                <span className="save-msg"> · {g.timeRange.start.toFixed(2)}s ~ {g.timeRange.end.toFixed(2)}s</span>
+              </span>
+              <button className="icon-btn" onClick={() => playFrom(g.timeRange)} disabled={!videoUrl}>영상에서 확인</button>
+            </div>
+            {thumbs[idx] && <img src={thumbs[idx]} className="merge-preview-img" alt={'그룹 ' + (idx + 1)} />}
+          </div>
+        ))}
+      </div>
+
+      <div className="toolbar">
+        <button onClick={sendToBuilder} disabled={sending || !groups.length}>{sending ? '전달 중...' : 'TAB 악보 만들기로 넘기기 (' + groups.length + '개) →'}</button>
+      </div>
+    </div>
+  );
 }
 
 function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs, analysis, uniDefaults, autoRemove, removeMode, manualFrac, bgSeekRef, seekTRef, onBusy }) {
@@ -7805,6 +8276,10 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
   const [version, setVersion] = useState(0);
   const [merged, setMerged] = useState(null);
   const [composing, setComposing] = useState(false);
+  const [adj, setAdj] = useState({});       // 이음새 수동 보정 { 조각idx: {trim, tail} }
+  const [hist, setHist] = useState([]);       // 되돌리기 스택
+  const [editMsg, setEditMsg] = useState('');
+  const final = useMemo(() => (merged ? uniFinalize(merged, adj, analysis.nativeW) : null), [merged, adj]);
   const prodRef = useRef({ page: {}, flow: {}, removal: null });
   const abortRef = useRef(false);
   const queueRef = useRef(Promise.resolve());
@@ -7909,7 +8384,7 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
       setComposing(true);
       try {
         const res = await uniCompose({ segs: exSegs, include, products: prodRef.current, uniDefaults, nativeW: analysis.nativeW });
-        if (tok === composeTokenRef.current) setMerged(res);
+        if (tok === composeTokenRef.current) { setMerged(res); setAdj({}); setHist([]); setEditMsg(''); }
       } catch (err) {
         setMsg('합치기 오류: ' + err.message);
       } finally { setComposing(false); }
@@ -7940,19 +8415,55 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
     }, 150);
   }
 
+  // ---- 마디 가장자리 확장(편집 모드): 가장 가까운 이음새의 trim/꼬리를 조정 — 잘린 구간 → 인접 조각 원본 가장자리 순으로 복원 ----
+  function pushAdj(next) { setHist(h => [...h, adj]); setAdj(next); }
+  function undo() {
+    setHist(h => { if (!h.length) return h; setAdj(h[h.length - 1]); return h.slice(0, -1); });
+    setEditMsg('되돌렸습니다.');
+  }
+  function onExtend(edge, xEdge, d) {
+    if (!final || !merged) return;
+    let best = -1, bd = Infinity;
+    for (let j = 1; j < final.offsets.length; j++) {
+      const dist = Math.abs(final.offsets[j] - xEdge);
+      if (dist < bd) { bd = dist; best = j; }
+    }
+    if (best < 0 || bd > 120) { setEditMsg('이 가장자리 근처(±120px)에 이음새가 없어 가져올 원본 픽셀이 없습니다.'); return; }
+    const j = best, P = merged.pieces, e = final.eff[j];
+    if (edge === 'right') {
+      const B = P[j];
+      const minTrim = -(B.leftExtra ? B.leftExtra.width : 0), maxTrim = Math.min(analysis.nativeW - 2, B.totalW - 1);
+      const nt = uniClamp(e.trim - d, minTrim, maxTrim);
+      if (nt === e.trim) { setEditMsg('더 가져올(또는 줄일) 원본이 없습니다.'); return; }
+      pushAdj({ ...adj, [j]: { ...(adj[j] || {}), trim: nt } });
+      setEditMsg('이음새 ' + j + ': 뒤 조각 앞 trim ' + e.trim + ' → ' + nt + 'px (' + (nt < e.trim ? (nt < 0 ? '잘린 구간 + 조각 원본 가장자리 복원' : '이음새에서 잘린 구간 복원') : '더 잘라 냄') + ')');
+    } else {
+      const A = P[j - 1];
+      const maxTail = A.rightExtra ? A.rightExtra.width : 0, minTail = -Math.min(analysis.nativeW, A.totalW - 1);
+      const nt = uniClamp(e.tail - d, minTail, maxTail);
+      if (nt === e.tail) { setEditMsg('더 가져올(또는 줄일) 원본이 없습니다.'); return; }
+      pushAdj({ ...adj, [j]: { ...(adj[j] || {}), tail: nt } });
+      setEditMsg('이음새 ' + j + ': 앞 조각 꼬리 ' + e.tail + ' → ' + nt + 'px (' + (nt > e.tail ? (e.tail < 0 ? '잘린 꼬리 복원' : '조각 원본 가장자리 추가') : '꼬리를 더 자름') + ')');
+    }
+  }
+  const pieceIdxOf = {};
+  if (merged) merged.pieces.forEach((p, i) => { pieceIdxOf[p.segIds[0]] = i; });
+
   function exportDebug() {
-    if (!merged) return;
-    const sp = merged.synth;
+    if (!merged || !final) return;
+    const sp = final.synth;
     const data = {
+      sourceMap: final.map, trimmedRanges: final.trimmed, adjustments: adj,
       pieces: merged.pieces.map((p, i) => ({
-        type: p.type, segIds: p.segIds, offset: merged.offsets[i], totalW: p.totalW,
+        type: p.type, segIds: p.segIds, offset: final.offsets[i], totalW: p.totalW, hasLeftExtra: !!p.leftExtra, hasRightExtra: !!p.rightExtra, expectedMeasures: p.expect,
         join: i === 0 ? null : {
-          state: merged.joins[i].state, trimLeftPx: merged.joins[i].trim, dupFixedPx: merged.joins[i].dupFixed, suspectMissing: !!merged.joins[i].suspect,
-          overlap: merged.joins[i].ovl,
+          auto: { state: merged.joinsAuto[i].state, trimLeftPx: merged.joinsAuto[i].trim, dupFixedPx: merged.joinsAuto[i].dupFixed, suspectMissing: !!merged.joinsAuto[i].suspect,
+            seamSuspect: !!merged.joinsAuto[i].seamSuspect, suggestTrim: merged.joinsAuto[i].suggestTrim, margin: merged.joinsAuto[i].margin, overlap: merged.joinsAuto[i].ovl },
+          effective: { trim: final.eff[i].trim, tail: final.eff[i].tail, manual: final.eff[i].manual },
         },
         pageSeams: p.type === 'page' ? p.seams.map(s => ({ i: s.i, pos: s.pos, score: s.score, ovl: s.ovl, dupSuspect: s.dupSuspect, dupFixed: s.dupFixed })) : null,
       })),
-      segJoin: merged.segJoin,
+      segJoin: final.segJoin,
       timeMapping: sp.track.X.map((x, k) => ({ stripX: x, timeSec: sp.track.t[k] })), // 최종 시간 매핑 표 (스트립 x → 시각)
       timeMappingNote: 'flow 조각은 x(t) 역변환, page 조각은 구간 [start,end] 안 폭 비례 분배(추정)',
     };
@@ -7996,8 +8507,21 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
                     <td>{seg.score.toFixed(2)}</td>
                     <td>
                       {flowErr[seg.id] ? <span style={{ color: '#c0392b' }}>flow 추출 실패: {flowErr[seg.id]}</span>
-                        : ((merged && merged.segJoin[seg.id]) || (include[seg.id] ? '' : '제외'))}
-                      {seg.kind === 'page' && merged && !include[seg.id] ? '' : ''}
+                        : ((final && final.segJoin[seg.id]) || (include[seg.id] ? '' : '제외'))}
+                      {final && pieceIdxOf[seg.id] > 0 && (() => {
+                        const j = pieceIdxOf[seg.id], B = merged.pieces[j];
+                        const mn = -(B.leftExtra ? B.leftExtra.width : 0), mx = Math.min(analysis.nativeW - 2, B.totalW - 1);
+                        return (
+                          <div>
+                            {merged.joinsAuto[j].seamSuspect && <b style={{ color: '#c0392b' }}>이음새 의심 </b>}
+                            <label style={{ fontSize: '11px' }}>겹침/중복 제거 폭
+                              <input type="range" min={mn} max={mx} step="1" value={final.eff[j].trim} style={{ width: '180px' }}
+                                onPointerDown={() => setHist(h => [...h, adj])}
+                                onChange={e => setAdj({ ...adj, [j]: { ...(adj[j] || {}), trim: parseInt(e.target.value) } })} /> {final.eff[j].trim}px
+                            </label>
+                          </div>
+                        );
+                      })()}
                     </td>
                     <td>
                       {seg.kind === 'page' ? (
@@ -8017,18 +8541,19 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
           </div>
         </div>
       )}
-      {merged && (
+      {merged && final && (
         <div>
-          <div className="slider-label">합쳐진 스트립 미리보기 — {merged.synth.totalW}×{merged.H}px · 조각 {merged.pieces.length}개
+          <div className="slider-label">합쳐진 스트립 미리보기 — {final.synth.totalW}×{merged.H}px · 조각 {merged.pieces.length}개
             · page 조각의 시간은 구간 안 폭 비례 분배(추정), flow 조각은 x(t) 역변환</div>
           <div style={{ overflowX: 'auto', border: '1px solid var(--border-strong)', background: '#fff' }}>
             <div style={{ display: 'flex', width: 'max-content' }}>
-              {merged.synth.chunks.map((c, i) => <FlowChunkView key={i} chunk={c} scale={Math.min(1, 180 / merged.H)} />)}
+              {final.synth.chunks.map((c, i) => <FlowChunkView key={i} chunk={c} scale={Math.min(1, 180 / merged.H)} />)}
             </div>
           </div>
           <div className="toolbar"><button className="icon-btn" onClick={exportDebug}>이음·시간 매핑 JSON 내보내기 (디버그)</button></div>
-          {/* 마디 감지 · 묶기 · 빌더 전송은 연속 이동형 2단계(FlowStage2)를 그대로 재사용 — 합쳐진 스트립(청크) + 스트립좌표→시각 트랙을 넘긴다 */}
-          <FlowStage2 result={merged.synth} videoFile={videoFile} flowDefaults={uniDefaults} />
+          {/* 마디 감지 · 묶기 · 빌더 전송은 연속 이동형 2단계(FlowStage2) 로직을 복사한 UniStage2 — 마디 더블클릭 편집·누락 경고 추가. 합쳐진 스트립(청크) + 스트립좌표→시각 트랙을 넘긴다 */}
+          <UniStage2 result={final.synth} videoFile={videoFile} flowDefaults={uniDefaults}
+            editCtx={{ pieceRanges: final.ranges, onExtend, canUndo: hist.length > 0, onUndo: undo, msg: editMsg }} />
         </div>
       )}
     </div>
