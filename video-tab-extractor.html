@@ -7715,74 +7715,146 @@ function uniPasteStrip(chunks, canvas, x0) {
     base = ce;
   }
 }
-// 편집한 이음새 주변의 오선을 이어 준다: 이진 이미지에서 오선 행을 다시 찾고(planStaffRestore → detectStaffRowsFromGray)
-// 이음새를 가로지르는 줄을 paintStaffRestore로 그린다.
-function uniRepairStaff(chunks, x, W, totalW) {
-  const x0 = Math.max(0, Math.round(x - W * 0.5)), x1 = Math.min(totalW, Math.round(x + W * 0.5));
+// 조각 로컬 좌표 [a,b)의 픽셀을 한 장으로 — x<0은 왼쪽 원본 가장자리(leftExtra), 0~totalW는 조각, ≥totalW는 오른쪽 원본 가장자리(rightExtra)
+function uniPieceCols(p, a, b, H) {
+  const w = Math.max(1, Math.round(b - a));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = H;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, H);
+  const lw = p.leftExtra ? p.leftExtra.width : 0;
+  const put = (src, sx, sw, dx) => { if (sw > 0) ctx.drawImage(src, sx, 0, sw, H, dx, 0, sw, H); };
+  // 왼쪽 가장자리
+  const l0 = Math.max(a, -lw), l1 = Math.min(b, 0);
+  if (l1 > l0 && p.leftExtra) put(p.leftExtra, lw + l0, l1 - l0, l0 - a);
+  // 조각 본체
+  const m0 = Math.max(a, 0), m1 = Math.min(b, p.totalW);
+  if (m1 > m0) {
+    let base = 0;
+    for (const ch of p.chunks) {
+      const cs = base, ce = base + ch.width;
+      const lo = Math.max(m0, cs), hi = Math.min(m1, ce);
+      if (hi > lo) put(ch, lo - cs, hi - lo, lo - a);
+      base = ce;
+    }
+  }
+  // 오른쪽 가장자리
+  const r0 = Math.max(a, p.totalW), r1 = Math.min(b, p.totalW + (p.rightExtra ? p.rightExtra.width : 0));
+  if (r1 > r0 && p.rightExtra) put(p.rightExtra, r0 - p.totalW, r1 - r0, r0 - a);
+  return c;
+}
+
+// 이음새 접합 구간의 오선 복원 — 검출된 이음새 주변에서만, 1회만 칠한다. planStaffRestore(→ detectStaffRowsFromGray)가 돌려준 줄 두께가
+// 실제보다 두꺼울 수 있어(밀집한 마디에서 인접 행의 잉크가 클러스터에 섞임), 구간 안 행별 어두움을 재서 핵심 행(원본 두께)만 칠한다.
+function uniRepairStaff(chunks, x, W, totalW, tag) {
+  const half = Math.round(W * 0.5);
+  const x0 = Math.max(0, Math.round(x - half)), x1 = Math.min(totalW, Math.round(x + half));
   if (x1 - x0 < 20) return;
   const c = flowCropStrip(chunks, x0, x1);
   const ctx = c.getContext('2d');
   const img = ctx.getImageData(0, 0, c.width, c.height);
   const plan = planStaffRestore(img.data, c.width, c.height, false);
   if (!plan.length) return;
-  paintStaffRestore(img, c.width, plan);
+  const seamLocal = x - x0;
+  const reach = Math.max(40, Math.round(W * 0.12));
+  const logLines = [];
+  const active = [];
+  for (const row of plan) {
+    const before = row.y1 - row.y0 + 1;
+    row.segs = row.segs.map(([a, b]) => [Math.max(a, seamLocal - reach), Math.min(b, seamLocal + reach)]).filter(([a, b]) => b - a >= 4);
+    if (!row.segs.length) continue;
+    const frac = [];
+    for (let y = row.y0; y <= row.y1; y++) {
+      let dark = 0, tot = 0;
+      for (const [a, b] of row.segs) for (let xx = a; xx <= b; xx++) { tot++; if (img.data[(y * c.width + xx) * 4] < 128) dark++; }
+      frac.push(tot ? dark / tot : 0);
+    }
+    const mx = Math.max(...frac);
+    let ymin = -1, ymax = -1;
+    frac.forEach((f, k) => { if (f >= Math.max(0.05, mx * 0.6)) { if (ymin < 0) ymin = k; ymax = k; } });
+    if (ymin >= 0) { const oy0 = row.y0; row.y0 = oy0 + ymin; row.y1 = oy0 + ymax; }
+    logLines.push({ y0: row.y0, y1: row.y1, thicknessBefore: before, thicknessAfter: row.y1 - row.y0 + 1 });
+    active.push(row);
+  }
+  if (active.length) paintStaffRestore(img, c.width, active); // 1회만
   ctx.putImageData(img, 0, 0);
   uniPasteStrip(chunks, c, x0);
+  // eslint-disable-next-line no-console
+  console.log('[uni 오선 복원]', { tag: tag || 'seam', seamStripX: Math.round(x), lines: logLines, paintCalls: active.length ? 1 : 0 });
 }
 
-// 조각 목록 + 이음새 설정(자동 + 수동 보정 adj)으로 하나의 스트립을 합성하고 시간 매핑을 만든다.
+// 조각 목록 + 이음새 설정(자동 + 수동 보정 adj) + 삭제 구간(cuts)으로 하나의 스트립을 합성하고 시간 매핑을 만든다. 항상 원본 조각에서 새로 만든다.
 //  adj[i] = { trim?: 뒤 조각(i)의 앞쪽 trim(px, 음수면 그 조각 원본 왼쪽 가장자리에서 더 가져옴), tail?: 앞 조각(i-1)의 꼬리
 //            (px, 양수면 그 조각 원본 오른쪽 가장자리에서 더 가져오고, 음수면 꼬리를 더 자름) }
-function uniFinalize(merged, adj, nativeW) {
+//  cuts = [{ pieceIdx, x0, x1 }]  원본 조각 좌표 기준의 제외 구간 (마디 삭제)
+function uniFinalize(merged, adj, nativeW, cuts) {
+  cuts = cuts || [];
   const { pieces, joinsAuto, H } = merged;
   const eff = joinsAuto.map((j, i) => {
     const a = adj[i] || {};
     return { ...j, trim: a.trim != null ? a.trim : j.trim, tail: a.tail != null ? a.tail : 0, manual: a.trim != null || a.tail != null };
   });
   const builder = flowChunkBuilder(H, 6000);
-  const offsets = [], ranges = [], map = [], trimmed = [], effTrim = [], effTail = [], seamX = [];
+  const offsets = [], ranges = [], map = [], trimmed = [], effTrim = [], effTail = [], seamX = [], pRanges = [], joints = [];
   pieces.forEach((p, i) => {
     const trim = i === 0 ? 0 : eff[i].trim;
     const tail = i + 1 < pieces.length ? eff[i + 1].tail : 0;
     const startS = builder.total();
     offsets.push(startS);
-    let tr = trim;
-    if (trim < 0) {
-      const k = p.leftExtra ? Math.min(-trim, p.leftExtra.width) : 0;
-      if (k > 0) { builder.append(p.leftExtra, p.leftExtra.width - k, k); map.push({ s0: startS, s1: startS + k, pieceIdx: i, type: 'left-extra', x0: -k, x1: 0 }); }
-      tr = -k;
-    }
-    const a = Math.max(0, tr);
+    const leftW = p.leftExtra ? p.leftExtra.width : 0, rightW = p.rightExtra ? p.rightExtra.width : 0;
+    const lo = trim < 0 ? -Math.min(-trim, leftW) : trim;
     let cut = 0;
-    if (tail < 0) cut = Math.min(-tail, Math.max(0, p.totalW - 1 - a));
-    const b = p.totalW - cut;
-    const midS = builder.total();
-    let base = 0;
-    for (const c of p.chunks) {
-      const cs = base, ce = base + c.width;
-      const lo = Math.max(a, cs), hi = Math.min(b, ce);
-      if (hi > lo) builder.append(c, lo - cs, hi - lo);
-      base = ce;
+    if (tail < 0) cut = Math.min(-tail, Math.max(0, p.totalW - 1 - Math.max(0, lo)));
+    const ta = tail > 0 ? Math.min(tail, rightW) : 0;
+    const hi = p.totalW - cut + ta;
+    // 삭제 구간을 빼고 남은 로컬 구간들
+    const myCuts = cuts.filter(c => c.pieceIdx === i).sort((u, v) => u.x0 - v.x0);
+    const keep = [];
+    let cur = lo;
+    for (const c of myCuts) {
+      const c0 = Math.max(c.x0, lo), c1 = Math.min(c.x1, hi);
+      if (c1 <= c0) continue;
+      if (c0 > cur) keep.push([cur, c0]);
+      cur = Math.max(cur, c1);
     }
-    map.push({ s0: midS, s1: builder.total(), pieceIdx: i, type: 'piece', x0: a, x1: b });
-    if (a > 0) trimmed.push({ pieceIdx: i, joinIdx: i, x0: 0, x1: a, kind: '이음새에서 잘린 앞부분' });
-    if (cut > 0) trimmed.push({ pieceIdx: i, joinIdx: i + 1, x0: b, x1: p.totalW, kind: '이음새에서 잘린 꼬리' });
-    let ta = 0;
-    if (tail > 0 && p.rightExtra) {
-      ta = Math.min(tail, p.rightExtra.width);
+    if (cur < hi) keep.push([cur, hi]);
+    const myRanges = [];
+    keep.forEach(([r0, r1], idx) => {
       const s0 = builder.total();
-      builder.append(p.rightExtra, 0, ta);
-      map.push({ s0, s1: s0 + ta, pieceIdx: i, type: 'right-extra', x0: p.totalW, x1: p.totalW + ta });
-    }
-    effTrim.push(tr); effTail.push(ta > 0 ? ta : -cut);
+      if (idx > 0) joints.push(s0); // 삭제로 이어 붙이는 접합 위치 — 오선을 이어 준다
+      // 로컬 [r0,r1)을 왼쪽 가장자리 / 본체 / 오른쪽 가장자리 영역으로 나눠 그린다
+      const l1 = Math.min(r1, 0);
+      if (l1 > r0 && p.leftExtra) { builder.append(p.leftExtra, leftW + r0, l1 - r0); map.push({ s0: builder.total() - (l1 - r0), s1: builder.total(), pieceIdx: i, type: 'left-extra', x0: r0, x1: l1 }); }
+      const m0 = Math.max(r0, 0), m1 = Math.min(r1, p.totalW);
+      if (m1 > m0) {
+        const ms = builder.total();
+        let base = 0;
+        for (const ch of p.chunks) {
+          const cs = base, ce = base + ch.width;
+          const a2 = Math.max(m0, cs), b2 = Math.min(m1, ce);
+          if (b2 > a2) builder.append(ch, a2 - cs, b2 - a2);
+          base = ce;
+        }
+        map.push({ s0: ms, s1: builder.total(), pieceIdx: i, type: 'piece', x0: m0, x1: m1 });
+      }
+      const rr0 = Math.max(r0, p.totalW);
+      if (r1 > rr0 && p.rightExtra) { const rs = builder.total(); builder.append(p.rightExtra, rr0 - p.totalW, r1 - rr0); map.push({ s0: rs, s1: builder.total(), pieceIdx: i, type: 'right-extra', x0: rr0, x1: r1 }); }
+      myRanges.push({ lo: r0, hi: r1, s: s0 });
+    });
+    pRanges.push(myRanges);
+    if (lo > 0) trimmed.push({ pieceIdx: i, joinIdx: i, x0: 0, x1: lo, kind: '이음새에서 잘린 앞부분' });
+    if (cut > 0) trimmed.push({ pieceIdx: i, joinIdx: i + 1, x0: p.totalW - cut, x1: p.totalW, kind: '이음새에서 잘린 꼬리' });
+    for (const c of myCuts) trimmed.push({ pieceIdx: i, joinIdx: null, x0: c.x0, x1: c.x1, kind: '마디 삭제로 제외' });
+    effTrim.push(lo); effTail.push(ta > 0 ? ta : -cut);
     ranges.push({ type: p.type, s0: startS, s1: builder.total(), expect: p.expect || 0, pieceIdx: i, groupId: p.groupId || null });
-    seamX.push(startS + (trim < 0 ? (p.leftExtra ? Math.min(-trim, p.leftExtra.width) : 0) : 0));
+    seamX.push(startS + (lo < 0 ? -lo : 0));
   });
   const chunks = builder.finish();
   const totalW = builder.total();
-  eff.forEach((j, i) => { if (i > 0 && j.manual) uniRepairStaff(chunks, offsets[i], nativeW, totalW); });
+  eff.forEach((j, i) => { if (i > 0 && j.manual) uniRepairStaff(chunks, offsets[i], nativeW, totalW, 'seam ' + i); });
+  joints.forEach((x, k) => uniRepairStaff(chunks, x, nativeW, totalW, 'cut-joint ' + (k + 1)));
 
-  // 시간 매핑: 조각 로컬 좌표 → 시각 (flow: x(t) 역변환, page: 프레임별 [start,end] 구간 안에서 폭 비례 — 추정). 확장/잘림은 가장자리 값으로 고정.
+  // 시간 매핑: 조각 로컬 좌표 → 시각 (flow: x(t) 역변환, page: 타일의 [start,end] 구간 안에서 폭 비례 — 추정). 확장/잘림은 가장자리 값으로 고정.
   const T = [], S = [];
   const push = (s, t) => {
     const k = T.length - 1;
@@ -7802,12 +7874,13 @@ function uniFinalize(merged, adj, nativeW) {
     } else {
       tAt = p.tAt;
     }
-    const x0 = effTrim[i];
-    const x1 = p.totalW + (effTail[i] > 0 ? effTail[i] : effTail[i]);
-    const len = Math.max(1, x1 - x0);
-    for (let x = 0; x < len; x += 40) push(offsets[i] + x, tAt(x0 + x));
-    push(offsets[i] + len, tAt(x1));
+    for (const rg of pRanges[i]) {
+      const len = Math.max(1, rg.hi - rg.lo);
+      for (let x = 0; x < len; x += 40) push(rg.s + x, tAt(rg.lo + x));
+      push(rg.s + len, tAt(rg.hi));
+    }
   });
+  if (!T.length) { T.push(0); S.push(0); }
   const track = { t: T, X: S, k0: 0, k1: T.length - 1, totalW, nativeW, barCols: [0, 0], staticRanges: [] };
   const synth = { chunks, totalW, H, stats: {}, tFirst: T[0], track }; // 스트립 좌표 s ↔ 시각 t (x(t) 역변환 형태)
 
@@ -7835,7 +7908,7 @@ function uniFinalize(merged, adj, nativeW) {
     const j = joinsAuto[i];
     const A = j.internal ? j.cutOverlap : (j.state === 'overlap' ? Math.max(0, j.trim - j.dupFixed) : 0);
     const B = j.internal ? j.cutDup : (j.dupFixed || 0);
-    return { j: i, x: seamX[i], cut: A + B, overlap: A, dup: B, internal: !!j.internal, suspect: !!j.seamSuspect, suggest: j.suggestTrim || 0, manual: eff[i].manual, trim: effTrim[i] };
+    return { j: i, x: offsets[i], cut: A + B, overlap: A, dup: B, internal: !!j.internal, suspect: !!j.seamSuspect, suggest: j.suggestTrim || 0, manual: eff[i].manual, trim: effTrim[i] };
   }).filter(Boolean);
   return { chunks, totalW, H, offsets, ranges: grouped, seamX, seamInfo, map, trimmed, eff, segJoin, synth };
 }
@@ -7878,10 +7951,21 @@ function uniStripWarnings(chunks, bars, space, ranges) {
 
 // 마디선 오버레이 + 수동 보정 (FlowBarStrip 기반) + 마디 더블클릭 편집 모드: 편집 중인 마디의 좌우 가장자리 핸들을 끌면 원본 픽셀을
 // 더 가져오거나(바깥으로) 줄인다(안쪽으로). 빈 곳 한 번 클릭 = 마디선 추가(더블클릭과 구분하려고 250ms 지연).
-function UniBarStrip({ chunks, totalW, H, scale, bars, flagged, warnIdx, selIdx, editIdx, highlight, seams, onSeamDouble, onSelect, onCommit, onEdit, onExtend, scrollRef }) {
+function UniPreviewCanvas({ canvas, scale, left }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    const cv = ref.current;
+    if (!cv || !canvas) return;
+    cv.width = Math.max(1, Math.round(canvas.width * scale)); cv.height = Math.max(1, Math.round(canvas.height * scale));
+    cv.getContext('2d').drawImage(canvas, 0, 0, cv.width, cv.height);
+  }, [canvas, scale]);
+  return <canvas ref={ref} style={{ position: 'absolute', left, top: 0, zIndex: 3, outline: '1px solid rgba(30,200,80,0.8)' }} />;
+}
+
+function UniBarStrip({ chunks, totalW, H, scale, bars, flagged, warnIdx, selIdx, editIdx, highlight, getPreview, seams, onSeamDouble, onSelect, onCommit, onEdit, onExtend, scrollRef }) {
   const [drag, setDrag] = useState(null);
   const [edgeDrag, setEdgeDrag] = useState(null);
-  const dragRef = useRef(null), edgeRef = useRef(null), clickTimer = useRef(null);
+  const dragRef = useRef(null), edgeRef = useRef(null), clickTimer = useRef(null), rafRef = useRef(null);
   const latest = useRef({});
   latest.current = { bars, onCommit, onSelect, onExtend, scale, totalW };
   useEffect(() => {
@@ -7898,7 +7982,8 @@ function UniBarStrip({ chunks, totalW, H, scale, bars, flagged, warnIdx, selIdx,
       const g = edgeRef.current;
       if (g) {
         g.dx = (e.clientX - g.startClient) / L.scale;
-        setEdgeDrag({ edge: g.edge, dx: g.dx });
+        // requestAnimationFrame 단위로만 미리보기를 갱신한다(상태는 확정하지 않음)
+        if (!rafRef.current) rafRef.current = requestAnimationFrame(() => { rafRef.current = null; if (edgeRef.current) setEdgeDrag({ edge: edgeRef.current.edge, dx: edgeRef.current.dx }); });
       }
     }
     function onUp() {
@@ -7916,10 +8001,10 @@ function UniBarStrip({ chunks, totalW, H, scale, bars, flagged, warnIdx, selIdx,
       }
       const g = edgeRef.current;
       edgeRef.current = null;
-      if (g) { setEdgeDrag(null); if (Math.abs(g.dx || 0) >= 1) L.onExtend(g.edge, g.xEdge, Math.round(g.dx)); }
+      if (g) { if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; } setEdgeDrag(null); if (Math.abs(g.dx || 0) >= 1) L.onExtend(g.edge, g.xEdge, Math.round(g.dx)); }
     }
     function onKey(e) { // 드래그 중 Esc = 취소 (상태를 바꾸지 않았으므로 미리보기만 지운다)
-      if (e.key === 'Escape' && edgeRef.current) { edgeRef.current = null; setEdgeDrag(null); }
+      if (e.key === 'Escape' && edgeRef.current) { edgeRef.current = null; if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; } setEdgeDrag(null); }
     }
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
@@ -7975,19 +8060,36 @@ function UniBarStrip({ chunks, totalW, H, scale, bars, flagged, warnIdx, selIdx,
             <div style={{ position: 'absolute', left: highlight.x0 * scale, width: Math.max(2, (highlight.x1 - highlight.x0) * scale), top: 0, bottom: 0, background: 'rgba(30,200,80,0.45)', pointerEvents: 'none', zIndex: 4 }} />
           )}
           {edgeDrag && editIdx != null && bars[editIdx + 1] != null && (() => {
-            // 드래그 미리보기(상태는 바꾸지 않음): 가져올 원본 영역(반투명 초록, 안쪽이면 빨강) + "+N px"/"-N px" + 밀리는 마디 위치(점선)
+            // 드래그 미리보기(상태는 확정하지 않음): 이음새 구간만 부분 재합성해 스트립이 실시간으로 늘어나거나 줄어드는 모습을 보여 주고,
+            // 증감량/원본 한계를 숫자로 표시한다. 한계에 닿으면 빨간색 "원본 끝", 가져올 원본이 없으면 "원본 없음 — 사유".
             const xEdge = edgeDrag.edge === 'left' ? eL : eR;
-            const amount = Math.round(Math.abs(edgeDrag.dx));
-            const outward = (edgeDrag.edge === 'right' && edgeDrag.dx > 0) || (edgeDrag.edge === 'left' && edgeDrag.dx < 0);
+            const pv = getPreview ? getPreview(edgeDrag.edge, xEdge, edgeDrag.dx, { left: eL, right: eR }) : null;
+            const outward = pv ? pv.outward : ((edgeDrag.edge === 'right' && edgeDrag.dx > 0) || (edgeDrag.edge === 'left' && edgeDrag.dx < 0));
+            const amount = pv ? pv.amount : Math.round(Math.abs(edgeDrag.dx));
             const a0 = Math.min(xEdge, xEdge + edgeDrag.dx), a1 = Math.max(xEdge, xEdge + edgeDrag.dx);
-            const shift = outward ? amount : -amount;
+            const none = pv && (pv.noSeam || (outward && pv.limit === 0));
+            const red = none || (pv && pv.atLimit);
+            const label = none ? ('원본 없음 — ' + (pv.reason || '')) : ((outward ? '+' : '-') + amount + ' px' + (pv && outward ? ' · 원본 한계 ' + pv.limit + ' px' : '') + (pv && pv.atLimit ? ' · 원본 끝' : ''));
+            const shift = pv ? pv.shift : 0;
+            const live = pv && !pv.noSeam && (pv.insert || shift !== 0);
             return (
               <React.Fragment>
-                <div style={{ position: 'absolute', left: a0 * scale, width: Math.max(1, (a1 - a0) * scale), top: 0, bottom: 0, background: outward ? 'rgba(30,200,80,0.35)' : 'rgba(224,48,48,0.28)', pointerEvents: 'none', zIndex: 4 }}>
-                  <span style={{ position: 'absolute', top: 2, left: 2, background: '#fff', color: outward ? '#1e7d3c' : '#c0392b', fontSize: 12, fontWeight: 700, padding: '0 3px', whiteSpace: 'nowrap' }}>{(outward ? '+' : '-') + amount + ' px'}</span>
-                </div>
-                {bars.filter(b => (edgeDrag.edge === 'right' ? b > xEdge + 1 : b >= xEdge - 1)).map((b, k) => (
-                  <div key={'sh' + k} style={{ position: 'absolute', left: (b + shift) * scale, top: 0, bottom: 0, borderLeft: '2px dotted #1565c0', pointerEvents: 'none', zIndex: 4 }} />
+                {live && (
+                  <React.Fragment>
+                    <div style={{ position: 'absolute', left: 0, top: 0, width: (pv.total + Math.max(0, shift)) * scale, height: '100%', background: '#fff', zIndex: 3, pointerEvents: 'none' }} />
+                    <div style={{ position: 'absolute', left: 0, top: 0, width: pv.leftEnd * scale, height: '100%', overflow: 'hidden', zIndex: 3, pointerEvents: 'none' }}>
+                      <div style={{ display: 'flex' }}>{chunks.map((c, i) => <FlowChunkView key={'pl' + i} chunk={c} scale={scale} />)}</div>
+                    </div>
+                    {pv.insert && <UniPreviewCanvas canvas={pv.insert} scale={scale} left={pv.leftEnd * scale} />}
+                    <div style={{ position: 'absolute', left: (pv.tailFrom + shift) * scale, top: 0, width: Math.max(1, (pv.total - pv.tailFrom) * scale), height: '100%', overflow: 'hidden', zIndex: 3, pointerEvents: 'none' }}>
+                      <div style={{ display: 'flex', transform: 'translateX(' + (-pv.tailFrom * scale) + 'px)' }}>{chunks.map((c, i) => <FlowChunkView key={'pt' + i} chunk={c} scale={scale} />)}</div>
+                    </div>
+                  </React.Fragment>
+                )}
+                <div style={{ position: 'absolute', left: a0 * scale, width: Math.max(1, (a1 - a0) * scale), top: 0, bottom: 0, background: outward ? 'rgba(30,200,80,0.25)' : 'rgba(224,48,48,0.22)', pointerEvents: 'none', zIndex: 4 }} />
+                <div style={{ position: 'absolute', left: Math.min(a0, a1) * scale, top: 2, zIndex: 7, background: '#fff', border: '1px solid ' + (red ? '#c0392b' : '#1e7d3c'), color: red ? '#c0392b' : '#1e7d3c', fontSize: 12, fontWeight: 700, padding: '0 4px', whiteSpace: 'nowrap', pointerEvents: 'none' }}>{label}</div>
+                {!none && bars.filter(b => (edgeDrag.edge === 'right' ? b > xEdge + 1 : b >= xEdge - 1)).map((b, k) => (
+                  <div key={'sh' + k} style={{ position: 'absolute', left: (b + (shift || (outward ? amount : -amount))) * scale, top: 0, bottom: 0, borderLeft: '2px dotted #1565c0', pointerEvents: 'none', zIndex: 4 }} />
                 ))}
               </React.Fragment>
             );
@@ -8063,7 +8165,7 @@ async function uniCompose({ segs, include, products, uniDefaults, nativeW }) {
         const used = document.createElement('canvas');
         used.width = Math.max(1, f.len); used.height = H0;
         used.getContext('2d').drawImage(f.canvas, f.srcX, 0, f.len, H0, 0, 0, f.len, H0);
-        const lw = Math.min(f.srcX, 400), rw = Math.min(f.canvas.width - (f.srcX + f.len), 400);
+        const lw = f.srcX, rw = f.canvas.width - (f.srcX + f.len); // 인접 조각의 전체 원본 폭까지 가져올 수 있게 보관
         let leftExtra = null, rightExtra = null;
         if (lw > 0) { leftExtra = document.createElement('canvas'); leftExtra.width = lw; leftExtra.height = H0; leftExtra.getContext('2d').drawImage(f.canvas, f.srcX - lw, 0, lw, H0, 0, 0, lw, H0); }
         if (rw > 0) { rightExtra = document.createElement('canvas'); rightExtra.width = rw; rightExtra.height = H0; rightExtra.getContext('2d').drawImage(f.canvas, f.srcX + f.len, 0, rw, H0, 0, 0, rw, H0); }
@@ -8125,6 +8227,21 @@ function UniStage2({ result, videoFile, flowDefaults, editCtx }) {
   const scale = Math.min(1, 180 / H);
   const [editIdx, setEditIdx] = useState(null);
   const ctx2 = editCtx || {};
+  const editIdxRef = useRef(null), barsRef = useRef([]), delRef = useRef(null);
+  editIdxRef.current = editIdx; barsRef.current = bars;
+  delRef.current = () => { const i = editIdxRef.current, bs = barsRef.current; if (i != null && bs[i + 1] != null && ctx2.onDeleteMeasure) { ctx2.onDeleteMeasure(bs[i], bs[i + 1]); setEditIdx(null); } };
+  useEffect(() => {
+    function onKey(e) { // Delete/Backspace = 편집 중인 마디 삭제 (입력창에 포커스가 있으면 제외)
+      if (e.key !== 'Delete' && e.key !== 'Backspace') return;
+      if (editIdxRef.current == null) return;
+      const el = document.activeElement, tag = el && el.tagName;
+      if (el && (tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable || (tag === 'INPUT' && !['range', 'checkbox', 'radio', 'button'].includes(el.type)))) return;
+      e.preventDefault();
+      delRef.current();
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   async function detect() {
     setDetecting(true); setDetProgress(0); setSelIdx(null); setEditIdx(null);
@@ -8290,13 +8407,14 @@ function UniStage2({ result, videoFile, flowDefaults, editCtx }) {
         <span className="hint-text" style={{ margin: 0 }}>
           {editIdx != null ? ('편집 중: 마디 ' + (editIdx + 1) + ' — 초록 핸들을 끌면 이음새에서 잘린 구간 → 인접 조각 원본 가장자리 순으로 원본 픽셀을 가져오거나(바깥), 더 잘라 냅니다(안쪽)') : '마디를 더블클릭하면 편집 모드로 들어갑니다'}
         </span>
+        {editIdx != null && <button className="icon-btn" style={{ color: '#c0392b', borderColor: '#c0392b' }} onClick={() => { if (ctx2.onDeleteMeasure) ctx2.onDeleteMeasure(bars[editIdx], bars[editIdx + 1]); setEditIdx(null); }}>삭제 (Delete)</button>}
         {editIdx != null && <button className="icon-btn" onClick={() => setEditIdx(null)}>편집 종료</button>}
         <button className="icon-btn" onClick={() => ctx2.onUndo && ctx2.onUndo()} disabled={!ctx2.canUndo}>← 되돌리기</button>
         <button className="icon-btn" onClick={() => ctx2.onRedo && ctx2.onRedo()} disabled={!ctx2.canRedo}>다시 실행 →</button>
         {ctx2.msg && <span className="save-msg">{ctx2.msg}</span>}
       </div>
       <UniBarStrip chunks={chunks} totalW={totalW} H={H} scale={scale} bars={bars} flagged={flagged} warnIdx={warnings.map(w => w.measureIdx)} selIdx={selIdx} editIdx={editIdx}
-        highlight={ctx2.highlight || null} seams={ctx2.seams || []} onSeamDouble={j => ctx2.onSeamReset && ctx2.onSeamReset(j)}
+        getPreview={ctx2.getPreview || null} highlight={ctx2.highlight || null} seams={ctx2.seams || []} onSeamDouble={j => ctx2.onSeamReset && ctx2.onSeamReset(j)}
         onSelect={i => setSelIdx(i)} onCommit={commitBars}
         onEdit={i => { setEditIdx(i); setSelIdx(null); if (ctx2.onEditEnter) ctx2.onEditEnter(i, bars[i], bars[i + 1]); }}
         onExtend={(edge, xEdge, d) => ctx2.onExtend && ctx2.onExtend(edge, xEdge, d, editIdx != null && bars[editIdx + 1] != null ? { left: bars[editIdx], right: bars[editIdx + 1] } : null)} scrollRef={scrollRef} />
@@ -8376,12 +8494,13 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
   const [merged, setMerged] = useState(null);
   const [composing, setComposing] = useState(false);
   // 편집 상태 전체(이음새 trim/꼬리/슬라이더 {adj}, 조각 포함 토글 {include})를 하나의 undo/redo 스택(최대 100단계)으로 관리한다.
-  const [edit, setEditState] = useState({ adj: {}, include: {} });
+  const [edit, setEditState] = useState({ adj: {}, include: {}, cuts: [] });
   const editRef = useRef(edit); editRef.current = edit;
   const pastRef = useRef([]), futureRef = useRef([]);
   const [, setStackVer] = useState(0);
   const lastGestureRef = useRef(0);
   const { adj, include } = edit;
+  const cuts = edit.cuts || [];
   const sig = JSON.stringify(include);
   const [editMsg, setEditMsg] = useState('');
   const [hl, setHl] = useState(null);           // 적용 직후 새로 들어온 구간 하이라이트 {j, dTrim, dTail}
@@ -8389,9 +8508,9 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
   const [candPage, setCandPage] = useState({}); // duplicatePage지만 합성 스트립에 없는 마디가 있는 구간 → 포함 후보
   const hlTimer = useRef(null);
   const final = useMemo(
-    () => (merged ? uniFinalize(merged, merged.sig === sig ? adj : {}, analysis.nativeW) : null),
+    () => (merged ? uniFinalize(merged, merged.sig === sig ? adj : {}, analysis.nativeW, merged.sig === sig ? cuts : []) : null),
     // eslint-disable-next-line
-    [merged, adj, sig]
+    [merged, adj, cuts, sig]
   );
   function pushPast() { pastRef.current = [...pastRef.current.slice(-99), editRef.current]; futureRef.current = []; setStackVer(v => v + 1); }
   function commit(next) { pushPast(); setEditState(next); }               // 한 번의 조작 = 한 단계
@@ -8517,7 +8636,7 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
       const inc = {};
       for (const seg of list) inc[seg.id] = seg.kind === 'page' ? !dup[seg.id] : !!(prod.flow[seg.id] && prod.flow[seg.id].res);
       pastRef.current = []; futureRef.current = []; setStackVer(v => v + 1);
-      setEditState({ adj: {}, include: inc });
+      setEditState({ adj: {}, include: inc, cuts: [] });
       setExSegs(list); setDupPage(dup); setNccMap(ncc); setCandPage({}); setFlowErr(ferr);
       setRepT(Object.fromEntries(Object.entries(prod.page).map(([id, v]) => [id, v.t])));
       setVersion(v => v + 1);
@@ -8583,48 +8702,124 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
       pieceCount: merged.pieces.length, trimmedMapCount: final.trimmed.length,
     });
   }
-  // 마디 가장자리 확장: 마디 [left,right]를 이음새 좌우로 마디 1개 폭씩 넓힌 범위와 겹치는 이음새가 후보. 끄는 방향 쪽에서 가장 가까운
-  // 이음새를 골라, ① 그 이음새에서 잘린 구간 → ② 인접 조각의 원본 가장자리 순으로 이음새 위치에서 복원(이후 마디는 복원한 폭만큼 밀린다).
-  function onExtend(edge, xEdge, d, measure) {
-    if (!final || !merged) return;
+  // ---- 마디 가장자리 확장 ----
+  // 후보 이음새: 마디 [left,right]를 좌우로 마디 1개 폭씩 넓힌 범위와 겹치는 이음새. 끄는 방향 쪽에서 가장 가까운 것을 고른다.
+  function pickSeam(edge, xEdge, d, measure) {
     const mw = measure ? Math.max(1, measure.right - measure.left) : 400;
     const lo = (measure ? measure.left : xEdge) - mw, hi = (measure ? measure.right : xEdge) + mw;
     const cands = final.seamInfo.filter(sm => sm.x >= lo && sm.x <= hi);
-    if (!cands.length) { setEditMsg('이 마디 주변에 이음새 없음 — 마디 좌우 한 마디 폭 안에 이음새가 없습니다 (이음새 마커 ▼는 스트립 위 보라색 삼각형).'); return; }
+    if (!cands.length) return null;
     const dir = d >= 0 ? 1 : -1;
     const ahead = cands.filter(sm => (sm.x - xEdge) * dir >= -2);
     const pool = ahead.length ? ahead : cands;
-    const sm = pool.reduce((m, c) => (!m || Math.abs(c.x - xEdge) < Math.abs(m.x - xEdge) ? c : m), null);
+    return pool.reduce((m, c) => (!m || Math.abs(c.x - xEdge) < Math.abs(m.x - xEdge) ? c : m), null);
+  }
+  // 이음새 j에서 amount px를 가져오거나(outward) 더 자를 때의 새 trim/꼬리. 한계(limit)는 인접 조각의 전체 원본 폭까지:
+  // ① 이음새에서 잘린 구간(앞부분/꼬리) → ② 인접 조각 원본 가장자리 (오른쪽 핸들은 뒤 조각, 왼쪽 핸들은 앞 조각 쪽부터)
+  function computeEdit(sm, edge, amount, outward) {
     const j = sm.j, A = merged.pieces[j - 1], B = merged.pieces[j], e = final.eff[j];
-    const amount = Math.abs(Math.round(d));
-    const outward = (edge === 'right' && d > 0) || (edge === 'left' && d < 0);
-    let trim = e.trim, tail = e.tail, rest = amount, fromCut = 0, fromEdge = 0;
+    const leftW = B.leftExtra ? B.leftExtra.width : 0, rightW = A.rightExtra ? A.rightExtra.width : 0;
+    let limit;
+    if (outward) limit = Math.max(0, e.trim) + Math.max(0, -e.tail) + Math.max(0, leftW - Math.max(0, -e.trim)) + Math.max(0, rightW - Math.max(0, e.tail));
+    else limit = edge === 'right' ? Math.max(0, Math.min(analysis.nativeW - 2, B.totalW - 1) - e.trim) : Math.max(0, e.tail + Math.min(analysis.nativeW, A.totalW - 1));
+    const applied = Math.max(0, Math.min(amount, limit));
+    let trim = e.trim, tail = e.tail, rest = applied, fromCut = 0, fromEdge = 0;
     if (outward) {
-      if (trim > 0) { const r = Math.min(rest, trim); trim -= r; rest -= r; fromCut += r; }          // ① 잘린 앞부분
-      if (rest > 0 && tail < 0) { const r = Math.min(rest, -tail); tail += r; rest -= r; fromCut += r; } // ① 잘린 꼬리
-      const capL = () => (B.leftExtra ? B.leftExtra.width : 0) - Math.max(0, -trim);
-      const capR = () => (A.rightExtra ? A.rightExtra.width : 0) - Math.max(0, tail);
+      if (trim > 0) { const r = Math.min(rest, trim); trim -= r; rest -= r; fromCut += r; }
+      if (rest > 0 && tail < 0) { const r = Math.min(rest, -tail); tail += r; rest -= r; fromCut += r; }
+      const capL = () => leftW - Math.max(0, -trim), capR = () => rightW - Math.max(0, tail);
       const useLeft = () => { const r = Math.min(rest, capL()); if (r > 0) { trim -= r; rest -= r; fromEdge += r; } };
       const useRight = () => { const r = Math.min(rest, capR()); if (r > 0) { tail += r; rest -= r; fromEdge += r; } };
-      if (edge === 'right') { useLeft(); useRight(); } else { useRight(); useLeft(); }  // ② 인접 조각 원본 가장자리
-      if (rest === amount) {
-        const noExtra = !B.leftExtra && !A.rightExtra;
-        setEditMsg(sm.cut === 0 && trim === 0 && tail === 0 && noExtra
-          ? '이음새는 있지만 잘린 구간이 0 — 복원할 원본이 없습니다.'
-          : '이 방향으로 더 가져올 원본이 없습니다 (잘린 구간과 조각 가장자리를 모두 사용했습니다).');
-        return;
-      }
-    } else if (edge === 'right') trim = Math.min(analysis.nativeW - 2, B.totalW - 1, trim + amount);
-    else tail = Math.max(-Math.min(analysis.nativeW, A.totalW - 1), tail - amount);
-    commit({ ...edit, adj: { ...adj, [j]: { ...(adj[j] || {}), trim, tail } } });
+      if (edge === 'right') { useLeft(); useRight(); } else { useRight(); useLeft(); }
+    } else if (edge === 'right') trim = e.trim + applied;
+    else tail = e.tail - applied;
+    return { j, A, B, e, trim, tail, applied, limit, fromCut, fromEdge, outward };
+  }
+  function zeroReason(sm, r) {
+    return sm.cut === 0 && r.e.trim <= 0 && r.e.tail >= 0
+      ? '이음새는 있지만 잘린 구간이 0이고 인접 조각의 원본도 더 없습니다 (조각 끝).'
+      : '조각 끝 — 인접 조각의 원본을 모두 가져왔습니다.';
+  }
+  // 드래그 중 실시간 미리보기: 상태는 바꾸지 않고, 이음새 구간만 부분 재합성한 그림(삽입 영역 + 밀리는 꼬리)을 돌려 준다
+  function getPreview(edge, xEdge, dx, measure) {
+    if (!final || !merged) return null;
+    const outward = (edge === 'right' && dx > 0) || (edge === 'left' && dx < 0);
+    const sm = pickSeam(edge, xEdge, dx, measure);
+    if (!sm) return { noSeam: true, outward, amount: 0, limit: 0, reason: '이음새 없음 — 이 마디 주변(좌우 한 마디 폭)에 이음새가 없습니다' };
+    const r = computeEdit(sm, edge, Math.abs(Math.round(dx)), outward);
+    const p = final.offsets[sm.j], H = merged.H;
+    const out = { outward, amount: r.applied, limit: r.limit, total: final.totalW, insert: null, leftEnd: p, tailFrom: p, shift: 0, reason: null };
+    out.atLimit = outward && Math.abs(Math.round(dx)) >= r.limit;
+    if (outward && r.limit === 0) out.reason = zeroReason(sm, r);
+    if (outward && r.applied > 0) {
+      const dTrim = Math.max(0, r.e.trim - r.trim), dTail = Math.max(0, r.tail - r.e.tail);
+      const w = dTrim + dTail;
+      const c = document.createElement('canvas'); c.width = Math.max(1, w); c.height = H;
+      const ctx = c.getContext('2d');
+      if (dTail > 0) ctx.drawImage(uniPieceCols(r.A, r.A.totalW + r.e.tail, r.A.totalW + r.tail, H), 0, 0);
+      if (dTrim > 0) ctx.drawImage(uniPieceCols(r.B, r.trim, r.e.trim, H), dTail, 0);
+      out.insert = c; out.shift = w;
+    } else if (!outward && r.applied > 0) {
+      out.shift = -r.applied;
+      if (edge === 'right') out.tailFrom = p + r.applied; else out.leftEnd = p - r.applied;
+    }
+    return out;
+  }
+  // 바깥으로 가져온 B쪽 원본 가장자리가 현재 이음새(앞 조각 끝)와 이어지도록 NCC(잉크 연속성)로 정렬 오프셋을 구한다
+  function alignDelta(j, newTrim) {
+    try {
+      const W = analysis.nativeW, H = merged.H, B = merged.pieces[j];
+      const endX = final.offsets[j];
+      const tailC = document.createElement('canvas'); tailC.width = W; tailC.height = H;
+      const tctx = tailC.getContext('2d'); tctx.fillStyle = '#fff'; tctx.fillRect(0, 0, W, H);
+      const crop = flowCropStrip(final.chunks, Math.max(0, endX - W), endX);
+      tctx.drawImage(crop, W - crop.width, 0);
+      const headC = uniPieceCols(B, newTrim, newTrim + W, H);
+      const iA = tileInfoOf(tailC), iB = tileInfoOf(headC);
+      const sys = iA.sys || iB.sys;
+      if (!sys) return 0;
+      const mask = new Uint8Array(H);
+      for (const inf of [iA, iB]) if (inf.sys) for (let y = 0; y < H; y++) if (inf.sys.mask[y]) mask[y] = 1;
+      const r = findCutSeamOffset(tileInk(iA.g), W, H, iA.xR, tileInk(iB.g), W, iB.xL, mask, sys.space);
+      return r && r.match >= 4 ? r.d : 0;
+    } catch (err) { return 0; }
+  }
+  function onExtend(edge, xEdge, d, measure) {
+    if (!final || !merged) return;
+    const outward = (edge === 'right' && d > 0) || (edge === 'left' && d < 0);
+    const sm = pickSeam(edge, xEdge, d, measure);
+    if (!sm) { setEditMsg('이 마디 주변에 이음새 없음 — 마디 좌우 한 마디 폭 안에 이음새가 없습니다 (이음새 마커는 스트립 위 삼각형).'); return; }
+    const r = computeEdit(sm, edge, Math.abs(Math.round(d)), outward);
+    if (r.applied <= 0) { setEditMsg(outward ? '원본 없음 — ' + zeroReason(sm, r) : '더 자를 수 없습니다.'); return; }
+    let trim = r.trim;
+    let delta = 0;
+    if (outward && edge === 'right' && r.fromEdge > 0) {
+      delta = alignDelta(r.j, trim);
+      if (delta) trim = Math.max(-(r.B.leftExtra ? r.B.leftExtra.width : 0), Math.min(analysis.nativeW - 2, trim + delta));
+    }
+    commit({ ...edit, adj: { ...adj, [r.j]: { ...(adj[r.j] || {}), trim, tail: r.tail } } });
     if (outward) {
-      setHl({ j, dTrim: Math.max(0, e.trim - trim), dTail: Math.max(0, tail - e.tail) }); // 적용 직후 새로 들어온 구간을 약 2초간 초록으로
+      setHl({ j: r.j, dTrim: Math.max(0, r.e.trim - trim), dTail: Math.max(0, r.tail - r.e.tail) });
       clearTimeout(hlTimer.current); hlTimer.current = setTimeout(() => setHl(null), 2000);
     }
     setEditMsg(outward
-      ? ('이음새 ' + j + ': 잘린 구간 ' + fromCut + 'px + 조각 원본 가장자리 ' + fromEdge + 'px 복원 (이후 마디 ' + (fromCut + fromEdge) + 'px 밀림)')
-      : ('이음새 ' + j + ': ' + amount + 'px 더 잘라 냄'));
+      ? ('이음새 ' + r.j + ': 잘린 구간 ' + r.fromCut + 'px + 조각 원본 가장자리 ' + r.fromEdge + 'px 복원' + (delta ? ' (NCC 정렬 ' + (delta > 0 ? '+' : '') + delta + 'px)' : '') + ' · 원본 한계 ' + r.limit + 'px')
+      : ('이음새 ' + r.j + ': ' + r.applied + 'px 더 잘라 냄'));
   }
+  // 마디 삭제: 그 마디 구간을 원본 조각 좌표 기준의 제외 구간으로 기록한다 — 재합성해도 유지되고 undo/redo 스택에 들어간다
+  function onDeleteMeasure(left, right) {
+    if (!final || !merged) return;
+    const newCuts = [];
+    for (const m of final.map) {
+      const a = Math.max(left, m.s0), b = Math.min(right, m.s1);
+      if (b <= a) continue;
+      newCuts.push({ pieceIdx: m.pieceIdx, x0: m.x0 + (a - m.s0), x1: m.x0 + (b - m.s0) });
+    }
+    if (!newCuts.length) return;
+    commit({ ...edit, cuts: [...cuts, ...newCuts] });
+    setEditMsg('마디 삭제: ' + Math.round(right - left) + 'px 제거 — 뒤 마디를 앞으로 당겼습니다 (마디 감지·그룹·시간 매핑 재계산)');
+  }
+
   // 조각 점검: 구간별 [조각 id, 포함 여부, zero-shift NCC, 합성 스트립에 이미 포함된 비율, 이음새에서 제거된 폭]을 console.log로 남기고,
   // duplicatePage로 제외된 조각은 마디 단위로 비교해 합성 스트립에 없는 마디가 있으면 '포함 후보'로 표시한다.
   const finalRef = useRef(null); finalRef.current = final;
@@ -8735,7 +8930,7 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
                 {exSegs.map(seg => (
                   <tr key={seg.id} style={{ borderBottom: '1px solid var(--border)', verticalAlign: 'top', opacity: include[seg.id] ? 1 : 0.55 }}>
                     <td><input type="checkbox" checked={!!include[seg.id]} disabled={seg.kind === 'flow' && !(prodRef.current.flow[seg.id] && prodRef.current.flow[seg.id].res)}
-                      onChange={e => commit({ adj: {}, include: { ...include, [seg.id]: e.target.checked } })} /></td>
+                      onChange={e => commit({ adj: {}, cuts: [], include: { ...include, [seg.id]: e.target.checked } })} /></td>
                     <td><span style={{ color: UNI_KIND_COLOR[seg.kind] }}>■ </span>{UNI_KIND_LABEL[seg.kind]}{dupPage[seg.id] ? ' · duplicatePage (앞 페이지와 동일)' : ''}</td>
                     <td>{seg.start.toFixed(2)} ~ {seg.end.toFixed(2)}</td>
                     <td>{seg.score.toFixed(2)}</td>
@@ -8796,7 +8991,7 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
           {/* 마디 감지 · 묶기 · 빌더 전송은 연속 이동형 2단계(FlowStage2) 로직을 복사한 UniStage2 — 마디 더블클릭 편집·누락 경고 추가. 합쳐진 스트립(청크) + 스트립좌표→시각 트랙을 넘긴다 */}
           <UniStage2 result={final.synth} videoFile={videoFile} flowDefaults={uniDefaults}
             editCtx={{
-              pieceRanges: final.ranges, onExtend, onEditEnter, onSeamReset, canUndo: pastRef.current.length > 0, onUndo: undo, canRedo: futureRef.current.length > 0, onRedo: redo, msg: editMsg,
+              pieceRanges: final.ranges, onExtend, getPreview, onDeleteMeasure, onEditEnter, onSeamReset, canUndo: pastRef.current.length > 0, onUndo: undo, canRedo: futureRef.current.length > 0, onRedo: redo, msg: editMsg,
               highlight: hl && final && final.offsets[hl.j] != null ? { x0: final.offsets[hl.j] - hl.dTail, x1: final.offsets[hl.j] + hl.dTrim } : null,
               seams: final.seamInfo.map(sm => ({
                 ...sm,
