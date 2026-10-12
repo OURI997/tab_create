@@ -2013,11 +2013,14 @@ const SCROLL_PLAYHEAD_HUE_DEFAULT = 210;
 const SCROLL_PLAYHEAD_HUE_TOLERANCE_DEFAULT = 35;
 const SCROLL_PLAYHEAD_SAT_MIN_DEFAULT = 0.35;
 
-const SCROLL_DEFAULTS_INIT = {
-  removeBg: true, invertMode: 'auto', threshold: 110, softness: 12,
+// 스크롤형 / 연속 이동형 / 통합 모드가 공유하는 전처리 초기값(한 곳에서만 정의). 초기값일 뿐이라 사용자가 패널에서 바꿀 수 있고,
+// 새 영상을 불러오거나 모드를 바꾸면 다시 이 값으로 돌아온다. (invertMode 'auto'는 반전 여부만 정하고 강도/번짐 값은 건드리지 않는다)
+const DEFAULT_PREPROC = {
+  removeBg: true, invertMode: 'auto', threshold: 170, softness: 60,
   despeckle: true, despeckleSize: 3,
   playheadRemove: false, playheadColor: null, // null = SCROLL_PLAYHEAD_* 기본값 사용
 };
+const SCROLL_DEFAULTS_INIT = DEFAULT_PREPROC;
 
 // drawProcessed와 동일한 순서(재생 커서 제거 → 배경 threshold[+자동 반전 판단] → 잡티 제거)로,
 // 이미 원본 해상도로 캡처된 canvas에 "크롭 없이 제자리에서" 적용한다 — 대표 프레임은 스티칭 전에
@@ -3928,15 +3931,23 @@ function ScrollRoiPicker({ videoRef, videoLoaded, roi, setRoi, suppressRef }) {
     const scaleX = canvas.width / rect.width, scaleY = canvas.height / rect.height;
     return { x: (e.clientX - rect.left) * scaleX, y: (e.clientY - rect.top) * scaleY, scaleX, scaleY };
   }
-  function onDown(e) { dragStartRef.current = canvasPoint(e); }
+  function onDown(e) {
+    e.preventDefault(); // 드래그 중 텍스트 선택/이미지 드래그가 끼어들지 않게
+    dragStartRef.current = canvasPoint(e);
+    document.body.style.userSelect = 'none';
+  }
+  // 드래그 시작 후에는 마우스가 영상 밖으로 나가도 window에서 계속 추적하고, 좌표를 영상 영역으로 clamp한다
+  // (영상 밖이면 해당 축의 끝이 영상 가장자리 0%/100%에 고정된다).
   function onMove(e) {
     if (!dragStartRef.current) return;
+    const canvas = roiCanvasRef.current;
     const cur = canvasPoint(e);
+    const cx = Math.max(0, Math.min(canvas.width, cur.x)), cy = Math.max(0, Math.min(canvas.height, cur.y));
     const box = roiBoxRef.current;
-    const x0 = Math.min(dragStartRef.current.x, cur.x) / cur.scaleX;
-    const y0 = Math.min(dragStartRef.current.y, cur.y) / cur.scaleY;
-    const w = Math.abs(cur.x - dragStartRef.current.x) / cur.scaleX;
-    const h = Math.abs(cur.y - dragStartRef.current.y) / cur.scaleY;
+    const x0 = Math.min(dragStartRef.current.x, cx) / cur.scaleX;
+    const y0 = Math.min(dragStartRef.current.y, cy) / cur.scaleY;
+    const w = Math.abs(cx - dragStartRef.current.x) / cur.scaleX;
+    const h = Math.abs(cy - dragStartRef.current.y) / cur.scaleY;
     box.style.left = x0 + 'px'; box.style.top = y0 + 'px';
     box.style.width = w + 'px'; box.style.height = h + 'px';
     box.style.display = 'block';
@@ -3952,16 +3963,22 @@ function ScrollRoiPicker({ videoRef, videoLoaded, roi, setRoi, suppressRef }) {
       const curY = Math.max(0, Math.min(canvas.height, cur.y));
       const x0 = Math.min(start.x, curX), x1 = Math.max(start.x, curX);
       const y0 = Math.min(start.y, curY), y1 = Math.max(start.y, curY);
+      document.body.style.userSelect = '';
       if (x1 - x0 < 5 || y1 - y0 < 5) return;
       setRoi({ x0: x0 / canvas.width, y0: y0 / canvas.height, x1: x1 / canvas.width, y1: y1 / canvas.height });
     }
+    window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
-    return () => window.removeEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      document.body.style.userSelect = '';
+    };
   }, []);
 
   return (
     <div className="roi-wrap">
-      <canvas ref={roiCanvasRef} className="roi-canvas" onMouseDown={onDown} onMouseMove={onMove} />
+      <canvas ref={roiCanvasRef} className="roi-canvas" onMouseDown={onDown} onDragStart={e => e.preventDefault()} />
       <div ref={roiBoxRef} className="roi-box" />
     </div>
   );
@@ -4089,6 +4106,7 @@ function ScrollCaptureStep({ videoRef, scrollDefaults, setScrollDefaults, onDone
     if (!file) return;
     const video = videoRef.current;
     video.src = URL.createObjectURL(file);
+    setScrollDefaults(DEFAULT_PREPROC); // 새 영상 — 전처리 초기값으로
     setVideoLoaded(false);
     setRoi(null);
     setAnalysis(null);
@@ -6198,6 +6216,7 @@ function FlowStep({ videoRef, flowDefaults, setFlowDefaults, onModeBack }) {
     if (!file) return;
     const video = videoRef.current;
     video.src = URL.createObjectURL(file);
+    setFlowDefaults(DEFAULT_PREPROC); // 새 영상 — 전처리 초기값으로
     setVideoLoaded(false); setRoi(null); setPlaybarFrac(null); setResult(null); setDetected(null); setDetectMsg('');
     setVideoFile(file);
     video.onloadedmetadata = async () => {
@@ -7291,6 +7310,7 @@ function UniStep({ videoRef, onModeBack }) {
     if (!file) return;
     const video = videoRef.current;
     video.src = URL.createObjectURL(file);
+    setUniDefaults(DEFAULT_PREPROC); // 새 영상 — 전처리 초기값으로
     setVideoLoaded(false); setRoi(null); setAnalysis(null); setSegs([]); setSelIdx(null); setManualFrac(null);
     setVideoFile(file);
     video.onloadedmetadata = async () => {
@@ -9027,6 +9047,7 @@ function App() {
   const [flowDefaults, setFlowDefaults] = useState(SCROLL_DEFAULTS_INIT);
   const [scrollPhase, setScrollPhase] = useState('capture'); // 'capture' (2단계 수동 부분) | 'result' (4~5단계)
   const [scrollDefaults, setScrollDefaults] = useState(SCROLL_DEFAULTS_INIT);
+  useEffect(() => { setScrollDefaults(DEFAULT_PREPROC); setFlowDefaults(DEFAULT_PREPROC); }, [mode]); // 모드를 바꾸면 전처리도 초기값으로
   const [scrollCapture, setScrollCapture] = useState(null); // ScrollCaptureStep의 onDone 결과
 
   async function goToPreprocess() {
