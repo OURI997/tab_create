@@ -4,9 +4,9 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>코드보 만들기</title>
-<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
 <style>
   :root{
     --bg:#faf8f3; --card:#ffffff; --border:#e5e0d5; --border-strong:#c9c2b0;
@@ -890,18 +890,42 @@ function FloatingPreview({ title, lines, library, laneHeight, lyricFontSize, hid
 
 // ---------- Transpose helpers ----------
 const NOTE_SHARPS = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
-const FLAT_TO_SHARP = { Db: 'C#', Eb: 'D#', Gb: 'F#', Ab: 'G#', Bb: 'A#' };
+const NOTE_FLATS = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B'];
+// 원래 근음에 #/b가 없을 때 쓰는 일반적인 코드 표기 (C# · Eb · F# · Ab · Bb)
+const NOTE_COMMON = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B'];
+const NATURAL_PC = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+const FLAT_KEY_ROOTS = new Set(['F', 'Bb', 'Eb', 'Ab', 'Db', 'Gb']);
+const SHARP_KEY_ROOTS = new Set(['G', 'D', 'A', 'E', 'B', 'F#', 'C#']);
 
+function parseNote(s) {
+  const m = /^([A-Ga-g])(#|b)?/.exec(s || '');
+  if (!m) return null;
+  const letter = m[1].toUpperCase();
+  const acc = m[2] || '';
+  const pc = ((NATURAL_PC[letter] + (acc === '#' ? 1 : acc === 'b' ? -1 : 0)) % 12 + 12) % 12;
+  return { pc, acc, len: m[0].length };
+}
+
+// 코드 이름 조옮김 — 근음과 슬래시 뒤 베이스음을 모두 옮긴다 (C/E −2 → Bb/D).
+// 표기: 원래 근음에 b가 있으면 플랫, #이 있으면 샵, 없으면 일반 표기(NOTE_COMMON). 베이스음은 옮긴 근음의 조표 쪽(플랫/샵)을 따른다.
 function transposeChordName(name, semitones) {
-  const m = /^([A-Ga-g])([#b]?)/.exec(name || '');
-  if (!m) return name;
-  const rootRaw = m[1].toUpperCase() + m[2];
-  const rest = name.slice(m[0].length);
-  const normalized = FLAT_TO_SHARP[rootRaw] || rootRaw;
-  let idx = NOTE_SHARPS.indexOf(normalized);
-  if (idx === -1) return name;
-  idx = ((idx + semitones) % 12 + 12) % 12;
-  return NOTE_SHARPS[idx] + rest;
+  const src = name || '';
+  const root = parseNote(src);
+  if (!root) return name;
+  const shift = n => ((n + semitones) % 12 + 12) % 12;
+  const rootTable = root.acc === 'b' ? NOTE_FLATS : root.acc === '#' ? NOTE_SHARPS : NOTE_COMMON;
+  const newRoot = rootTable[shift(root.pc)];
+  let rest = src.slice(root.len);
+  const slash = rest.lastIndexOf('/');
+  if (slash >= 0) {
+    const bass = parseNote(rest.slice(slash + 1));
+    if (bass && slash + 1 + bass.len === rest.length) {
+      const bassTable = FLAT_KEY_ROOTS.has(newRoot) || newRoot.endsWith('b') ? NOTE_FLATS
+        : SHARP_KEY_ROOTS.has(newRoot) || newRoot.endsWith('#') ? NOTE_SHARPS : NOTE_COMMON;
+      rest = rest.slice(0, slash + 1) + bassTable[shift(bass.pc)];
+    }
+  }
+  return newRoot + rest;
 }
 
 function transposeChord(chord, semitones) {
