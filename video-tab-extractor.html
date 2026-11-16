@@ -928,10 +928,12 @@ function seekTo(video, t) {
 
 // ==== 페이지 전환형 — 전환 판정 ====
 // 평균 밝기 차이(diffScore)만으로는 악보 페이지 전환이 약하게 잡힌다(흰 배경·같은 오선이 대부분이라 값이 작다). 그래서
-// 행 평균을 뺀(오선 제거) 회색 영상끼리의 이동 0 상관(NCC)으로 "변화 점수 = 1 − NCC"를 쓴다(통합 모드 peak0와 같은 방식).
-//  - 재생바만 움직이는 같은 페이지: NCC ≈ 0.95 이상 → 점수 ≈ 0.05 이하
-//  - 페이지 전환(컷): NCC ≈ 0 → 점수 ≈ 1, 디졸브 중간 프레임: 0.15~0.5
-//  - 페이드 인/아웃(밝기만 바뀜): NCC가 밝기 배율에 무관해서 점수가 거의 0 — 페이드가 최댓값을 차지해 실제 전환을 묻어 버리던 문제가 없다
+// "글자·선(잉크)만 남긴 지도"끼리 행 평균을 뺀(오선 제거) 이동 0 상관(NCC)으로 "변화 점수 = 1 − NCC"를 쓴다.
+//  - 잉크 지도: 흰 배경 악보는 어두운 픽셀(<150), 어두운/반투명 배경 위 흰 TAB은 밝은 픽셀(>180)만 남긴다.
+//    반투명 오버레이 뒤로 비치는 연주 영상·손 움직임이 점수에 섞이지 않는다(실측: v09에서 회색 비교는 전환 0.04~0.3 vs 잡음 0.06로
+//    구분 불가, 잉크 비교는 전환 ≥0.17 vs 잡음 ≈0).
+//  - 잉크가 거의 없거나 너무 많은 영상(배경 판별 실패)은 회색 영상 비교로 대신한다.
+//  - 재생바만 움직이는 같은 페이지: 점수 ≈ 0~0.05 / 페이지 전환: 0.2~1 / 페이드(밝기만 변함): 잉크 지도가 거의 그대로라 낮다
 const PAGE_SAMPLE_MAXW = 320;
 function pageMakeCapture(video, roi) {
   const { rx0, ry0, rw, rh } = roiRectPx(video, roi);
@@ -946,18 +948,87 @@ function pageMakeCapture(video, roi) {
     ctx.drawImage(video, rx0, ry0, rw, rh, 0, 0, w, h);
     const d = ctx.getImageData(0, 0, w, h).data;
     const gray = new Uint8Array(w * h);
+    const colored = new Uint8Array(w * h); // 채도가 높은 픽셀(재생바·하이라이트·색 글자) — 잉크에서 뺀다
     let sum = 0, sq = 0;
     for (let i = 0, p = 0; i < d.length; i += 4, p++) {
-      const g = (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]) | 0;
+      const r = d[i], gg = d[i + 1], b = d[i + 2];
+      const g = (0.299 * r + 0.587 * gg + 0.114 * b) | 0;
       gray[p] = g; sum += g; sq += g * g;
+      if (Math.max(r, gg, b) - Math.min(r, gg, b) > 60) colored[p] = 1;
     }
     const n = w * h, mean = sum / n;
-    return { t, gray, w, h, std: Math.sqrt(Math.max(0, sq / n - mean * mean)) };
+    return { t, gray, colored, w, h, mean, std: Math.sqrt(Math.max(0, sq / n - mean * mean)) };
   };
 }
-const PAGE_BLANK_STD = 4; // 이보다 밋밋한 프레임은 빈 화면(검은 화면/단색 인트로)
-function pageChangeScore(a, b) {
-  const blankA = a.std < PAGE_BLANK_STD, blankB = b.std < PAGE_BLANK_STD;
+const PAGE_BLANK_STD = 4;          // 이보다 밋밋한 프레임은 빈 화면(검은 화면/단색 인트로)
+const PAGE_INK_DARK_BG = 180;      // 어두운 배경: 이보다 밝은 픽셀 = 잉크(흰 글자)
+const PAGE_INK_LIGHT_BG = 150;     // 밝은 배경: 이보다 어두운 픽셀 = 잉크(검은 글자)
+const PAGE_MIN_INK_FRAC = 0.0005;  // 잉크가 이보다 적으면 빈 화면으로 본다
+function pageMedian(arr) { const s = [...arr].sort((x, y) => x - y); return s.length ? s[Math.floor((s.length - 1) / 2)] : 0; }
+// 영상 전체 샘플로 배경(밝은/어두운)을 정하고 잉크 지도를 만든다. 잉크 비율이 비정상이면 회색 비교(mode 'gray')로 대신한다.
+function pagePrepareCompare(samples) {
+  const content = samples.filter(s => s.std >= PAGE_BLANK_STD);
+  const bg = pageMedian((content.length ? content : samples).map(s => s.mean));
+  const dark = bg < 128;
+  const th = dark ? PAGE_INK_DARK_BG : PAGE_INK_LIGHT_BG;
+  const inks = samples.map(s => {
+    const g = new Uint8Array(s.gray.length);
+    let cnt = 0;
+    for (let i = 0; i < g.length; i++) {
+      if (s.colored && s.colored[i]) continue; // 색이 있는 재생바·하이라이트는 잉크가 아니다
+      const on = dark ? s.gray[i] > th : s.gray[i] < th;
+      if (on) { g[i] = 255; cnt++; }
+    }
+    return { t: s.t, gray: g, w: s.w, h: s.h, inkFrac: cnt / g.length, std: s.std };
+  });
+  const fracMed = pageMedian(inks.filter(k => k.std >= PAGE_BLANK_STD).map(k => k.inkFrac));
+  const mode = (fracMed >= 0.002 && fracMed <= 0.5) ? 'ink' : 'gray';
+  const cmp = mode === 'ink' ? inks : samples;
+  const busy = pageMaskBusyColumns(cmp);
+  return { mode, dark, inkTh: th, inkFracMedian: fracMed, cmp: busy.cmp, busyCols: busy.count, busyFrac: busy.frac };
+}
+// 자주 바뀌는 열(오른쪽 코드 다이어그램처럼 코드마다 바뀌는 칸, 고정 위치 자막 등)은 페이지 전환 판정에서 뺀다.
+// 페이지 전환은 모든 열이 "가끔 한꺼번에" 바뀌고, 이런 칸은 "자주" 바뀐다 — 열별로 바뀐 비율을 재서
+// max(8%, 중앙값 × 2.5)를 넘는 열을 지운다. 지울 열이 폭의 절반을 넘으면(판별 실패) 지우지 않는다.
+function pageMaskBusyColumns(cmp) {
+  const n = cmp.length;
+  if (n < 6) return { cmp, count: 0, frac: 0 };
+  const { w, h } = cmp[0];
+  const changed = new Float32Array(w);
+  const minPix = Math.max(2, Math.round(h * 0.05));
+  let pairs = 0;
+  for (let k = 1; k < n; k++) {
+    const a = cmp[k - 1].gray, b = cmp[k].gray;
+    if (a.length !== b.length) continue;
+    pairs++;
+    for (let x = 0; x < w; x++) {
+      let c = 0;
+      for (let y = 0; y < h; y++) { const i = y * w + x; if (a[i] !== b[i]) c++; }
+      if (c >= minPix) changed[x]++;
+    }
+  }
+  if (!pairs) return { cmp, count: 0, frac: 0 };
+  const rate = Array.from(changed, v => v / pairs);
+  const med = pageMedian(rate);
+  const limit = Math.max(0.08, med * 2.5);
+  const mask = rate.map(r => r > limit);
+  // 고립된 한두 열은 무시하고, 바쁜 열 사이의 좁은 틈(≤3열)은 메운다
+  for (let x = 1; x < w - 1; x++) if (!mask[x] && mask[x - 1] && mask[Math.min(w - 1, x + 1)]) mask[x] = true;
+  const count = mask.filter(Boolean).length;
+  if (!count || count > w * 0.5) return { cmp, count: 0, frac: 0 };
+  const out = cmp.map(c => {
+    const g = new Uint8Array(c.gray);
+    let ink = 0;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = y * w + x; if (mask[x]) g[i] = 0; else if (g[i]) ink++; }
+    return { ...c, gray: g, inkFrac: c.inkFrac != null ? ink / g.length : c.inkFrac };
+  });
+  return { cmp: out, count, frac: count / w };
+}
+function pageIsBlank(c, mode) {
+  return mode === 'ink' ? (c.std < PAGE_BLANK_STD || c.inkFrac < PAGE_MIN_INK_FRAC) : c.std < PAGE_BLANK_STD;
+}
+function pageChangeScore(a, b, mode) {
+  const blankA = pageIsBlank(a, mode), blankB = pageIsBlank(b, mode);
   if (blankA && blankB) return 0;   // 빈 화면 → 빈 화면: 변화 없음
   if (blankA !== blankB) return 1;  // 빈 화면 ↔ 내용: 전환
   const ncc = uniZeroShiftNcc(a, b);
@@ -986,7 +1057,7 @@ function pageAutoThreshold(scores) {
 //  1) 너무 짧은 구간(전환 도중 프레임) 제거  2) 빈 화면 구간 제거  3) 바로 이웃한 같은 페이지는 하나로 합침
 // 반환: [{ s, e, rep, dropped? }] — s/e/rep는 샘플 인덱스
 const PAGE_MIN_SEG_SEC = 0.5;
-function pageBuildSegments(times, scores, th, samples, step) {
+function pageBuildSegments(times, scores, th, samples, step, mode) {
   const raw = [];
   let segStart = 0;
   for (let i = 0; i < scores.length; i++) {
@@ -999,7 +1070,7 @@ function pageBuildSegments(times, scores, th, samples, step) {
     const span = (times[e] - times[s]) + step;
     if (span < PAGE_MIN_SEG_SEC && raw.length > 1) { removed.short++; continue; }
     const rep = Math.max(s, e - 1);
-    if (samples && samples[rep] && samples[rep].std < PAGE_BLANK_STD) { removed.blank++; continue; }
+    if (samples && samples[rep] && pageIsBlank(samples[rep], mode)) { removed.blank++; continue; }
     kept.push({ s, e, rep });
   }
   // "같은 페이지" 기준: 평소 변화량(중앙값)과 전환 임계값의 중간 — 재생바 위치만 다른 같은 페이지는 합치고,
@@ -1009,7 +1080,7 @@ function pageBuildSegments(times, scores, th, samples, step) {
   for (const g of kept) {
     const last = merged[merged.length - 1];
     // 바로 앞 구간과 대표 프레임 차이가 전환 기준 이하면 같은 페이지(중간에 잠깐 튄 프레임 때문에 쪼개진 것) — 하나로 합친다.
-    if (last && samples && samples[last.rep] && samples[g.rep] && pageChangeScore(samples[last.rep], samples[g.rep]) <= sameThr) {
+    if (last && samples && samples[last.rep] && samples[g.rep] && pageChangeScore(samples[last.rep], samples[g.rep], mode) <= sameThr) {
       last.e = g.e; // 같은 페이지 — 시간 범위만 늘린다 (대표 프레임은 앞 구간 것 유지)
       removed.dup++;
       continue;
@@ -1298,27 +1369,30 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
         await seekTo(video, t);
         const sample = cap(t);
         times.push(t);
-        if (samples.length) {
-          const prev = samples[samples.length - 1];
-          diffs.push(pageChangeScore(prev, sample));
-          meanDiffs.push(pageMeanAbsDiff(prev, sample));
-        }
         samples.push(sample);
         idx++;
         setAnalyzeProgress(Math.min(100, Math.round((idx / totalSteps) * 100)));
         if (idx % 10 === 0) log('분석 중... ' + t.toFixed(1) + 's / ' + rangeE.toFixed(1) + 's');
       }
       setAnalyzeProgress(100);
-      samplesRef.current = samples;
-      setAnalysis({ times, diffs, meanDiffs, step, roi: roiAtStart, rangeS, rangeE });
+      // 다 모은 뒤 배경(밝은/어두운)을 정하고 비교한다 — 영상 전체를 보고 정해야 인트로 한 장에 휘둘리지 않는다
+      const prep = pagePrepareCompare(samples);
+      for (let i = 1; i < samples.length; i++) {
+        diffs.push(pageChangeScore(prep.cmp[i - 1], prep.cmp[i], prep.mode));
+        meanDiffs.push(pageMeanAbsDiff(samples[i - 1], samples[i]));
+      }
+      samplesRef.current = prep.cmp;
+      setAnalysis({ times, diffs, meanDiffs, step, roi: roiAtStart, rangeS, rangeE,
+        compare: { mode: prep.mode, darkBackground: prep.dark, inkThreshold: prep.inkTh, inkFracMedian: prep.inkFracMedian, busyColumnsExcluded: prep.busyFrac } });
       const maxObserved = Math.max(...diffs, 0);
       setThresholdRange({ min: 0, max: Math.max(1, maxObserved * 1.1), step: 0.005 });
       const initialThreshold = pageAutoThreshold(diffs);
       setThreshold(initialThreshold);
       const over = diffs.filter(d => d > initialThreshold).length;
-      log('분석 완료. 변화 점수(0=같은 화면, 1=완전히 다른 화면) 범위 ' + Math.min(...diffs, 0).toFixed(2) + ' ~ ' + maxObserved.toFixed(2)
+      log('분석 완료 (비교 방식: ' + (prep.mode === 'ink' ? (prep.dark ? '어두운 배경의 밝은 글자' : '밝은 배경의 어두운 글자') : '회색 영상')
+        + (prep.busyCols ? ', 자주 바뀌는 칸(코드 다이어그램 등) 폭 ' + Math.round(prep.busyFrac * 100) + '% 제외' : '') + '). 변화 점수(0=같은 화면, 1=완전히 다른 화면) 범위 ' + Math.min(...diffs, 0).toFixed(2) + ' ~ ' + maxObserved.toFixed(2)
         + ', 자동 임계값 ' + initialThreshold.toFixed(2) + ' (넘는 지점 ' + over + '곳). 대표 프레임을 자동으로 뽑습니다...');
-      await reextract({ times, diffs, step, roi: roiAtStart }, initialThreshold, samples);
+      await reextract({ times, diffs, step, roi: roiAtStart, compare: { mode: prep.mode } }, initialThreshold, prep.cmp);
     } catch (err) {
       log('분석 중 오류: ' + err.message);
     } finally {
@@ -1336,7 +1410,7 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
     try {
       const { times, diffs } = A;
       const step = A.step || (parseFloat(stepSec) || 0.3);
-      const { segments, removed } = pageBuildSegments(times, diffs, TH, samplesArg || samplesRef.current, step);
+      const { segments, removed } = pageBuildSegments(times, diffs, TH, samplesArg || samplesRef.current, step, A.compare ? A.compare.mode : 'gray');
       lastSegmentsRef.current = { threshold: TH, segments, removed };
       const video = videoRef.current;
       const newFrames = [];
@@ -1372,9 +1446,10 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
     const data = {
       kind: 'page_frames_debug',
       params: { step: analysis.step, rangeS: analysis.rangeS, rangeE: analysis.rangeE, roi: analysis.roi, threshold,
-        autoThreshold: pageAutoThreshold(analysis.diffs), minSegSec: PAGE_MIN_SEG_SEC, blankStd: PAGE_BLANK_STD },
+        autoThreshold: pageAutoThreshold(analysis.diffs), minSegSec: PAGE_MIN_SEG_SEC, blankStd: PAGE_BLANK_STD, compare: analysis.compare },
       frames: analysis.diffs.map((d, i) => ({ t0: analysis.times[i], t: analysis.times[i + 1], change: d, meanDiff: analysis.meanDiffs[i],
-        std: samplesRef.current[i + 1] ? samplesRef.current[i + 1].std : null, overThreshold: d > threshold })),
+        std: samplesRef.current[i + 1] ? samplesRef.current[i + 1].std : null,
+        inkFrac: samplesRef.current[i + 1] && samplesRef.current[i + 1].inkFrac != null ? +samplesRef.current[i + 1].inkFrac.toFixed(4) : null, overThreshold: d > threshold })),
       segments: segInfo ? segInfo.segments.map(g => ({ start: analysis.times[g.s], end: analysis.times[g.e], rep: analysis.times[g.rep] })) : [],
       removed: segInfo ? segInfo.removed : null,
     };
