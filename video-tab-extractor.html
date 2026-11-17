@@ -1119,7 +1119,10 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
   const rangeStartRef = useRef(0);
   const rangeEndRef = useRef(0);
   const durationRef = useRef(0);
-  const busyRef = useRef(false);          // 분석·추출 중에는 다른 seek(슬라이더·구간 핸들)이 끼어들지 않게 막는다
+  const busyRef = useRef(false);
+  const [autoRoiMsg, setAutoRoiMsg] = useState('');
+  const [autoRoiBusy, setAutoRoiBusy] = useState(false);
+  const autoRoiSrcRef = useRef(null);          // 분석·추출 중에는 다른 seek(슬라이더·구간 핸들)이 끼어들지 않게 막는다
   const samplesRef = useRef([]);          // 분석 때 모은 저해상도 샘플 — 빈 화면/중복 페이지 판정용
   const lastSegmentsRef = useRef(null);
 
@@ -1234,6 +1237,25 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
     canvas.getContext('2d').drawImage(video, 0, 0);
     drawRoiBoxOverlay();
   }
+
+  async function runAutoRoi(manual) {
+    const video = videoRef.current;
+    const src = video && (video.currentSrc || video.src);
+    if (!src || busyRef.current) return;
+    setAutoRoiBusy(true); setAutoRoiMsg('TAB 영역을 찾는 중...');
+    const r = await autoFindTabRoi(src);
+    setAutoRoiBusy(false);
+    if (r) { setRoi({ x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1 }); setAutoRoiMsg('TAB 오선을 찾아 영역을 자동으로 지정했습니다 (' + r.frames + '/5 장면). 다르면 드래그로 다시 지정하세요.'); }
+    else setAutoRoiMsg(manual ? 'TAB 오선을 찾지 못했습니다 — 드래그로 직접 지정하세요.' : '');
+  }
+  useEffect(() => {
+    if (!videoLoaded) return;
+    const video = videoRef.current;
+    const src = video && (video.currentSrc || video.src);
+    if (!src || autoRoiSrcRef.current === src || roiRef.current) return;
+    autoRoiSrcRef.current = src;
+    runAutoRoi(false);
+  }, [videoLoaded]);
 
   function requestScrub(t) {
     if (busyRef.current) return; // 분석·추출 중 seek 금지 — 분석 루프가 엉뚱한 시점의 프레임을 읽게 된다
@@ -1497,6 +1519,12 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
             <div ref={roiBoxRef} className="roi-box" />
           </div>
         </div>
+        {videoLoaded && (
+          <div className="toolbar" style={{ marginTop: 6 }}>
+            <button className="icon-btn" onClick={() => runAutoRoi(true)} disabled={autoRoiBusy || analyzing || extracting}>{autoRoiBusy ? '찾는 중...' : 'TAB 영역 자동 찾기'}</button>
+            {autoRoiMsg && <span className="hint-text">{autoRoiMsg}</span>}
+          </div>
+        )}
         <div className="slider-label">
           {roi
             ? ('지정된 영역: 가로 ' + (roi.x0*100).toFixed(0) + '%~' + (roi.x1*100).toFixed(0) + '%, 세로 ' + (roi.y0*100).toFixed(0) + '%~' + (roi.y1*100).toFixed(0) + '%')
@@ -4117,8 +4145,135 @@ async function runMiniStitchForRange(video, roi, startT, endT, diffThreshold, sc
 
 // ---- ROI 드래그 선택 UI — CaptureStep과 같은 패턴(별도 컴포넌트로 분리해 스크롤/페이지 두
 // 플로우가 각자의 캔버스 ref를 갖게 함, 상태 공유 없음) ----
+// ==== TAB 영역 자동 찾기 ====
+// 영상 몇 장면(5장)에서 "같은 간격의 가는 가로선 6줄"(TAB 오선)을 찾아 그 위아래로 오선 높이만큼 여유를 둔 영역을 제안한다.
+// 흰 악보(어두운 선)·어두운 오버레이(밝은 선) 모두 찾고, 오선이 진하게 안 잡히면 연한 선(Guitar Pro 회색 오선 등)으로 다시 찾는다.
+// 오선 5줄(오선보)과 TAB 6줄이 같이 있으면 TAB(6줄)을 고른다. 가로 범위는 오선이 실제로 그어진 범위(오른쪽 코드 다이어그램 칸 제외).
+// 메인 <video>를 건드리지 않도록 같은 영상을 별도 <video>로 열어 seek한다(재생 위치·화면 갱신에 영향 없음).
+function tabRoiLinesIn(g, w, h, lenient) {
+  const out = [];
+  const pass = (isDark, T, ds, gap) => {
+    const frac = new Float32Array(h), anyCol = [];
+    for (let y = 3; y < h - 3; y++) {
+      let c = 0;
+      const row = new Uint8Array(w);
+      for (let x = 0; x < w; x++) {
+        const v = g[y * w + x];
+        let hit = false;
+        for (const [du, dd] of ds) {
+          const a = g[(y - du) * w + x], b = g[(y + dd) * w + x];
+          if (isDark ? (a - v > T && b - v > T) : (v - a > T && v - b > T)) { hit = true; break; }
+        }
+        if (hit) { c++; row[x] = 1; }
+      }
+      frac[y] = c / w; anyCol[y] = row;
+    }
+    let grp = [];
+    const flush = () => {
+      if (!grp.length) return;
+      let sy = 0, mx = 0, x0 = w, x1 = -1;
+      for (const y of grp) { sy += y; mx = Math.max(mx, frac[y]); const r = anyCol[y]; for (let x = 0; x < w; x++) if (r[x]) { if (x < x0) x0 = x; if (x > x1) x1 = x; } }
+      out.push({ y: sy / grp.length, x0, x1, frac: mx });
+      grp = [];
+    };
+    for (let y = 3; y < h - 3; y++) {
+      if (frac[y] > 0.35) { if (grp.length && y - grp[grp.length - 1] > gap) flush(); grp.push(y); }
+    }
+    flush();
+  };
+  if (!lenient) { pass(true, 35, [[2, 2]], 1); pass(false, 35, [[2, 2]], 1); }
+  else { const ds = [[2, 2], [1, 2], [2, 1], [3, 3]]; pass(true, 20, ds, 2); pass(false, 20, ds, 2); }
+  return out.sort((a, b) => a.y - b.y);
+}
+function tabRoiStaves(lines) {
+  const ys = lines.map(l => l.y), res = [];
+  for (let i = 0; i < ys.length; i++) for (let j = i + 1; j < ys.length; j++) {
+    const sp = ys[j] - ys[i];
+    if (sp < 4 || sp > 40) continue;
+    const seq = [i, j];
+    let k = j;
+    for (;;) {
+      let nx = -1;
+      for (let m = k + 1; m < ys.length; m++) if (Math.abs(ys[m] - ys[k] - sp) <= Math.max(1.5, sp * 0.12)) { nx = m; break; }
+      if (nx < 0) break;
+      seq.push(nx); k = nx;
+    }
+    if (seq.length >= 5) res.push({ top: ys[seq[0]], bottom: ys[seq[seq.length - 1]], n: seq.length,
+      x0: Math.min(...seq.map(m => lines[m].x0)), x1: Math.max(...seq.map(m => lines[m].x1)) });
+  }
+  res.sort((a, b) => b.n - a.n || a.top - b.top);
+  const fin = [];
+  for (const r of res) if (fin.every(f => r.bottom < f.top - 2 || r.top > f.bottom + 2)) fin.push(r);
+  return fin.sort((a, b) => a.top - b.top);
+}
+function tabRoiFromGray(g, w, h) {
+  let st = tabRoiStaves(tabRoiLinesIn(g, w, h, false));
+  if (!st.some(x => x.n >= 6)) st = tabRoiStaves(tabRoiLinesIn(g, w, h, true));
+  const six = st.filter(x => x.n >= 6);
+  const pick = (six.length ? six : st);
+  if (!pick.length) return null;
+  const s = pick[pick.length - 1]; // TAB은 보통 오선보 아래 — 6줄 중 가장 아래
+  const hs = s.bottom - s.top;
+  return {
+    x0: Math.max(0, (s.x0 - 0.02 * w) / w), x1: Math.min(1, (s.x1 + 0.02 * w) / w),
+    y0: Math.max(0, (s.top - 1.0 * hs) / h), y1: Math.min(1, (s.bottom + 1.0 * hs) / h),
+  };
+}
+async function autoFindTabRoi(srcUrl) {
+  if (!srcUrl) return null;
+  const v = document.createElement('video');
+  v.muted = true; v.preload = 'auto'; v.playsInline = true; v.src = srcUrl;
+  v.className = 'hidden-video';
+  document.body.appendChild(v);
+  try {
+    await new Promise((res, rej) => { v.onloadeddata = res; v.onerror = () => rej(new Error('영상 열기 실패')); setTimeout(res, 8000); });
+    const dur = v.duration || 0;
+    if (!v.videoWidth || !(dur > 0)) return null;
+    const W = 640, H = Math.max(8, Math.round(v.videoHeight * W / v.videoWidth));
+    const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+    const ctx = cv.getContext('2d', { willReadFrequently: true });
+    const found = [];
+    for (let k = 1; k <= 5; k++) {
+      await seekTo(v, dur * k / 6);
+      ctx.drawImage(v, 0, 0, W, H);
+      const d = ctx.getImageData(0, 0, W, H).data, g = new Int16Array(W * H);
+      for (let i = 0, p = 0; i < d.length; i += 4, p++) g[p] = (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]) | 0;
+      const r = tabRoiFromGray(g, W, H);
+      if (r) found.push(r);
+    }
+    if (found.length < 2) return null;
+    const med = key => { const a = found.map(f => f[key]).sort((x, y) => x - y); return a[Math.floor((a.length - 1) / 2)]; };
+    return { x0: med('x0'), y0: med('y0'), x1: med('x1'), y1: med('y1'), frames: found.length };
+  } catch (e) {
+    return null;
+  } finally {
+    v.removeAttribute('src'); v.load(); v.remove();
+  }
+}
+
 function ScrollRoiPicker({ videoRef, videoLoaded, roi, setRoi, suppressRef }) {
   const roiCanvasRef = useRef(null);
+  const [autoMsg, setAutoMsg] = useState('');
+  const [autoBusy, setAutoBusy] = useState(false);
+  const autoDoneSrcRef = useRef(null);
+  async function runAutoRoi(manual) {
+    const video = videoRef.current;
+    const src = video && (video.currentSrc || video.src);
+    if (!src) return;
+    setAutoBusy(true); setAutoMsg('TAB 영역을 찾는 중...');
+    const r = await autoFindTabRoi(src);
+    setAutoBusy(false);
+    if (r) { setRoi({ x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1 }); setAutoMsg('TAB 오선을 찾아 영역을 자동으로 지정했습니다 (' + r.frames + '/5 장면). 다르면 드래그로 다시 지정하세요.'); }
+    else setAutoMsg(manual ? 'TAB 오선을 찾지 못했습니다 — 드래그로 직접 지정하세요.' : '');
+  }
+  useEffect(() => {
+    if (!videoLoaded) return;
+    const video = videoRef.current;
+    const src = video && (video.currentSrc || video.src);
+    if (!src || autoDoneSrcRef.current === src || roi) return;
+    autoDoneSrcRef.current = src;
+    runAutoRoi(false);
+  }, [videoLoaded]);
   const roiBoxRef = useRef(null);
   const dragStartRef = useRef(null);
   const roiRef = useRef(null);
@@ -4214,12 +4369,20 @@ function ScrollRoiPicker({ videoRef, videoLoaded, roi, setRoi, suppressRef }) {
   }, []);
 
   return (
-    <div className="roi-grab" onMouseDown={onDown}>
-      <div className="roi-wrap">
-        <canvas ref={roiCanvasRef} className="roi-canvas" onDragStart={e => e.preventDefault()} />
-        <div ref={roiBoxRef} className="roi-box" />
+    <React.Fragment>
+      <div className="roi-grab" onMouseDown={onDown}>
+        <div className="roi-wrap">
+          <canvas ref={roiCanvasRef} className="roi-canvas" onDragStart={e => e.preventDefault()} />
+          <div ref={roiBoxRef} className="roi-box" />
+        </div>
       </div>
-    </div>
+      {videoLoaded && (
+        <div className="toolbar" style={{ marginTop: 6 }}>
+          <button className="icon-btn" onClick={() => runAutoRoi(true)} disabled={autoBusy}>{autoBusy ? '찾는 중...' : 'TAB 영역 자동 찾기'}</button>
+          {autoMsg && <span className="hint-text">{autoMsg}</span>}
+        </div>
+      )}
+    </React.Fragment>
   );
 }
 
