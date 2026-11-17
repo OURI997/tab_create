@@ -198,6 +198,10 @@
   @media (max-width:640px){
     .float-preview{width:46vw;}
   }
+  /* 펼친 미리보기 패널(오른쪽 고정, 300px)이 편집 영역을 가리지 않도록 — 화면이 넉넉하지 않으면 본문을 왼쪽으로 비켜 둔다 */
+  @media (min-width:1100px) and (max-width:1479px){
+    body.float-preview-open .app{margin-left:max(0px, calc((100vw - 48px - 780px - 332px) / 2));margin-right:332px;}
+  }
   .preview-modal-backdrop{
     position:fixed;inset:0;background:rgba(0,0,0,0.5);
     display:flex;align-items:center;justify-content:center;z-index:100;padding:24px;
@@ -1547,7 +1551,10 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   // now identical for every block regardless of whether it has linked audio; only playback-dependent
   // bits (auto-preview, the independent play bar, time-range text) key off hasAudio below.
   const [videoMeta, setVideoMeta] = useState(null);
-  const [lineText, setLineText] = useState('');
+  // 줄 가사 원문 — item.lyrics.lineText에 저장해 새로고침·임시저장 후에도 남고, "가사 한꺼번에 넣기"로 바깥에서 채울 수도 있다
+  const [lineText, setLineTextRaw] = useState(() => (item.lyrics && item.lyrics.lineText) || '');
+  const extLineText = item.lyrics ? item.lyrics.lineText : undefined;
+  useEffect(() => { if (extLineText != null) setLineTextRaw(prev => (prev === extLineText ? prev : extLineText)); }, [extLineText]);
   const [pendingXPct, setPendingXPct] = useState(null);
   const [pendingSnapped, setPendingSnapped] = useState(false);
   const [selectedTagId, setSelectedTagId] = useState(null);
@@ -1816,6 +1823,10 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   function updateLyrics(patch) {
     onChange({ ...item, lyrics: { ...lyricsObj, ...patch } });
   }
+  function setLineText(v) {
+    setLineTextRaw(v);
+    updateLyrics({ lineText: v });
+  }
   function addTag() {
     const id = Date.now() + '_' + Math.random().toString(36).slice(2);
     updateLyrics({ tags: [...tags, { id, text: '가사', xPct: 8, yPct: Math.min(90, 15 + tags.length * 20) }] });
@@ -1944,6 +1955,55 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     xPct: t.xPct,
     time: t.time != null ? t.time : start + (t.xPct / 100) * (end - start),
   }));
+  // 자동 배치: 아직 놓지 않은 단어(칩 단위)를 [마지막으로 놓은 위치 이후 ~ 이미지 끝] 구간에 고르게 나누고,
+  // 각 목표 위치에서 가장 가까운 음표 열(noteColumns)로 맞춘다(순서가 뒤집히지 않게, 같은 열은 한 번만). 음표 열이 모자라면 고른 간격 그대로.
+  function autoPlaceWords() {
+    if (!chipUnits.length) return;
+    const from = Math.max(0, lastPlacedXPct + 1), to = 98;
+    if (to - from < 2) { setGuidance('남은 구간이 없습니다 — 마지막 배치를 지우고 다시 시도하세요.'); return; }
+    const n = chipUnits.length;
+    const cols = [...(noteColumns || [])].filter(c => c > from - 0.5 && c <= to + 1).sort((a, b) => a - b);
+    const xs = [];
+    let ci = 0;
+    for (let i = 0; i < n; i++) {
+      const target = n === 1 ? from : from + (to - from) * i / n;
+      let x = target;
+      if (cols.length >= n) {
+        // 남은 단어 수만큼 열을 남겨 두고 목표에 가장 가까운 열을 고른다
+        let best = -1, bd = Infinity;
+        for (let k = ci; k <= cols.length - (n - i); k++) { const d = Math.abs(cols[k] - target); if (d < bd) { bd = d; best = k; } }
+        if (best >= 0) { x = cols[best]; ci = best + 1; }
+      }
+      if (xs.length && x <= xs[xs.length - 1]) x = xs[xs.length - 1] + 0.5;
+      xs.push(Math.min(100 + LYRIC_MARGIN_PCT, x));
+    }
+    let cur = [...tags];
+    let lastX = -Infinity;
+    chipUnits.forEach((u, i) => {
+      const x = Math.max(xs[i], lastX + 0.5);
+      const id = Date.now() + '_' + i + '_' + Math.random().toString(36).slice(2);
+      cur = [...cur, { id, text: words[u[0]], xPct: x, time: xPctToTime(x), yPct: CLICK_LYRIC_Y_PCT, viaClick: true }];
+      // 붙여 둔 칩(여러 단어를 한 덩어리로)은 클릭 배치와 똑같이 앞 단어 바로 뒤에 이어 붙인다
+      if (u.length > 1) cur = appendJoinedTags(cur, u.slice(1).map(k => words[k])).tags;
+      lastX = Math.max(...cur.filter(t => t.viaClick).map(t => t.xPct));
+    });
+    placementRef.current.tags = cur;
+    updateLyrics({ tags: cur });
+    setPendingXPct(null);
+    setGuidance('자동 배치했습니다 — 단어를 클릭하고 ←/→로 다듬거나, "배치 지우기"로 되돌리세요.');
+  }
+  const autoPlaceRef = useRef(null);
+  autoPlaceRef.current = () => { if (chipUnits.length) autoPlaceWords(); };
+  useEffect(() => {
+    const h = () => autoPlaceRef.current && autoPlaceRef.current();
+    window.addEventListener('tab-lyrics-autoplace-all', h);
+    return () => window.removeEventListener('tab-lyrics-autoplace-all', h);
+  }, []);
+  function clearClickTags() {
+    updateLyrics({ tags: tags.filter(t => !t.viaClick) });
+    setPendingXPct(null);
+    setGuidance('이 줄의 배치를 지웠습니다.');
+  }
   function xPctToTime(xPct) {
     if (calibPoints.length < 2 || xPct < calibPoints[0].xPct || xPct > calibPoints[calibPoints.length - 1].xPct) {
       return start + (xPct / 100) * (end - start);
@@ -2540,7 +2600,12 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
 
         <div className="lyric-head-mini">
           <span>가사 배치 — 이미지를 보고 그 아래 트랙에서 같은 x 위치를 클릭해 가사를 배치하세요 (수동으로 추가한 가사는 ⠿ 손잡이로 끌어서 이동)</span>
-          <button className="icon-btn" onClick={addTag}>+ 가사 추가</button>
+          <div className="block-actions">
+            <button className="icon-btn" onClick={autoPlaceWords} disabled={chipUnits.length === 0}
+              title="아직 배치하지 않은 단어를 남은 구간에 고르게 놓고 가까운 음표 위치에 맞춥니다. 놓인 뒤 단어를 클릭해 방향키로 다듬으세요.">자동 배치</button>
+            {clickTags.length > 0 && <button className="icon-btn" onClick={clearClickTags} title="이 줄에 클릭/자동으로 놓은 가사를 모두 지웁니다(직접 추가한 가사는 유지)">배치 지우기</button>}
+            <button className="icon-btn" onClick={addTag}>+ 가사 추가</button>
+          </div>
         </div>
         <div className="lane-wrap">
           {refStripHeight > 0 && processedSrc && (
@@ -2843,7 +2908,12 @@ function GlobalSettings({ defaults, setDefaults, titleFontSize, setTitleFontSize
 function FloatingPreview({ title, items, titleFontSize, referenceWidth, imageGap, lyricFontSize, lyricLetterSpacing, lyricAreaHeight, defaults }) {
   const [previewSrc, setPreviewSrc] = useState(null);
   const [busy, setBusy] = useState(false);
-  const [collapsed, setCollapsed] = useState(false);
+  // 좁은 화면(1100px 미만)에서는 미리보기가 본문을 가리므로 접힌 상태로 시작
+  const [collapsed, setCollapsed] = useState(() => typeof window !== 'undefined' && window.innerWidth < 1100);
+  useEffect(() => {
+    document.body.classList.toggle('float-preview-open', !collapsed);
+    return () => document.body.classList.remove('float-preview-open');
+  }, [collapsed]);
   const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
@@ -2901,6 +2971,10 @@ function FloatingPreview({ title, items, titleFontSize, referenceWidth, imageGap
 function TabScoreBuilder() {
   const [title, setTitle] = useState('');
   const [items, setItems] = useState([]);
+  const [bulkLyricOpen, setBulkLyricOpen] = useState(false);
+  const [bulkLyricText, setBulkLyricText] = useState('');
+  const [bulkLyricStart, setBulkLyricStart] = useState('1');
+  const [bulkLyricMsg, setBulkLyricMsg] = useState('');
   const [defaults, setDefaults] = useState(DEFAULTS_INIT);
   const [titleFontSize, setTitleFontSize] = useState(44);
   const [lyricFontSize, setLyricFontSize] = useState(26);
@@ -3260,6 +3334,31 @@ function TabScoreBuilder() {
   function updateItem(id, next) {
     setItems(prev => prev.map(it => it.id === id ? next : it));
   }
+  // 가사 한꺼번에 넣기: 붙여넣은 가사를 줄바꿈으로 나눠 위에서부터 TAB 줄마다 한 줄씩 넣는다(빈 줄 = 가사 없는 TAB 줄, 전주·간주 등).
+  // 이미 배치를 끝낸 줄(클릭 배치 태그가 있는 줄)은 덮어쓰지 않고 건너뛴다 — 다시 넣고 싶으면 그 줄의 "배치 지우기" 후 실행.
+  function applyBulkLyrics() {
+    const lines = bulkLyricText.replace(/\r/g, '').split('\n').map(l => l.trim());
+    while (lines.length && lines[lines.length - 1] === '') lines.pop();
+    if (!lines.length) { setBulkLyricMsg('가사를 붙여넣으세요.'); return; }
+    const startIdx = Math.max(0, Math.min(items.length - 1, (parseInt(bulkLyricStart, 10) || 1) - 1));
+    let li = 0, filled = 0, skipped = 0;
+    const next = items.map((it, idx) => {
+      if (idx < startIdx || li >= lines.length) return it;
+      const placed = ((it.lyrics && it.lyrics.tags) || []).some(t => t.viaClick);
+      if (placed) { skipped++; return it; }
+      const text = lines[li++];
+      if (text) filled++;
+      return { ...it, lyrics: { ...(it.lyrics || { tags: [], areaHeightRatio: null }), lineText: text } };
+    });
+    setItems(next);
+    const rest = lines.length - li;
+    setBulkLyricMsg(filled + '개 줄에 가사를 넣었습니다' + (skipped ? ' (이미 배치된 ' + skipped + '줄은 건너뜀)' : '')
+      + (rest > 0 ? ' — 남은 가사 ' + rest + '줄은 TAB 줄이 모자라 넣지 못했습니다.' : '.') + ' 각 줄에서 트랙을 클릭해 배치하거나 "모든 줄 자동 배치"를 누르세요.');
+  }
+  function autoPlaceAllLyrics() {
+    window.dispatchEvent(new CustomEvent('tab-lyrics-autoplace-all'));
+    setBulkLyricMsg('모든 줄에 자동 배치했습니다 — 각 줄에서 단어를 클릭해 ←/→로 다듬으세요.');
+  }
   function deleteItem(id) {
     setItems(prev => prev.filter(it => it.id !== id));
     setMergeSelectedIds(prev => {
@@ -3410,6 +3509,7 @@ function TabScoreBuilder() {
       <div className="toolbar">
         <input ref={fileInputRef} type="file" accept="image/*" multiple onChange={handleFiles} style={{ display: 'none' }} />
         <button onClick={() => fileInputRef.current && fileInputRef.current.click()}>TAB 이미지 추가</button>
+        <button className="icon-btn" onClick={() => setBulkLyricOpen(o => !o)} disabled={items.length === 0}>가사 한꺼번에 넣기</button>
         <button onClick={handleExport} disabled={items.length === 0 || exporting}>
           {exporting ? '내보내는 중...' : 'PNG로 내보내기'}
         </button>
@@ -3530,6 +3630,21 @@ function TabScoreBuilder() {
               {mergePreviewSrc && <img src={mergePreviewSrc} alt="합치기 미리보기" className="merge-preview-img" />}
             </div>
           )}
+        </div>
+      )}
+
+      {bulkLyricOpen && items.length > 0 && (
+        <div className="block">
+          <div className="lyric-head-mini"><span>가사 한꺼번에 넣기 — 한 줄 = TAB 한 줄. 빈 줄은 가사 없는 줄(전주·간주)로 건너뜁니다.</span></div>
+          <textarea className="onset-line-input" rows={8} value={bulkLyricText} onChange={e => setBulkLyricText(e.target.value)}
+            placeholder={'곡 전체 가사를 붙여넣으세요. 예)\n\n(전주라 가사 없는 줄은 빈 줄)\n그대 내 맘에 들어오면은\n조용히 눈을 감아요'} />
+          <div className="toolbar" style={{ marginTop: 8 }}>
+            <label style={{ fontSize: 13 }}>시작 줄(TAB 이미지 번호) <input type="number" min="1" max={items.length} value={bulkLyricStart} onChange={e => setBulkLyricStart(e.target.value)} style={{ width: 64 }} /></label>
+            <button onClick={applyBulkLyrics}>줄마다 넣기</button>
+            <button className="icon-btn" onClick={autoPlaceAllLyrics}>모든 줄 자동 배치</button>
+            <button className="icon-btn" onClick={() => setBulkLyricOpen(false)}>닫기</button>
+          </div>
+          {bulkLyricMsg && <div className="hint-text" style={{ marginTop: 6 }}>{bulkLyricMsg}</div>}
         </div>
       )}
 

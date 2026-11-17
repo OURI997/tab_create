@@ -1375,6 +1375,26 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
         },
         onProgress: p => setAnalyzeProgress(Math.min(100, Math.round(p * 100))),
       });
+      // 빠른 재생 중 디코더가 따라가지 못해 프레임이 건너뛰어진 구간(샘플 간격 > 2.5×step)은 seek로 채운다 —
+      // 건너뛴 곳에 페이지 전환이 있으면 통째로 놓치기 때문(실측: 1080p 영상에서 18초 구멍).
+      {
+        const gaps = [];
+        const edges = [rangeS - step, ...times, rangeE];
+        for (let i = 1; i < edges.length; i++) if (edges[i] - edges[i - 1] > step * 2.5) gaps.push([edges[i - 1], edges[i]]);
+        let filled = 0;
+        for (const [g0, g1] of gaps) {
+          for (let t = Math.max(rangeS, g0 + step); t < g1 - step * 0.5 && t < rangeE; t += step) {
+            await seekTo(video, t);
+            times.push(t); samples.push(cap(t)); filled++;
+          }
+        }
+        if (filled) {
+          const order = times.map((t, i) => i).sort((i, j) => times[i] - times[j]);
+          const t2 = order.map(i => times[i]), s2 = order.map(i => samples[i]);
+          times.length = 0; samples.length = 0; times.push(...t2); samples.push(...s2);
+          log('빠른 재생 중 건너뛴 구간 ' + gaps.length + '곳을 seek로 보충했습니다 (' + filled + '장).');
+        }
+      }
       if (samples.length < 2) throw new Error('프레임을 충분히 읽지 못했습니다 (' + samples.length + '개)');
       setAnalyzeProgress(100);
       // 다 모은 뒤 배경(밝은/어두운)을 정하고 비교한다 — 영상 전체를 보고 정해야 인트로 한 장에 휘둘리지 않는다
