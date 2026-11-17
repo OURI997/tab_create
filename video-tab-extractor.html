@@ -935,6 +935,7 @@ function seekTo(video, t) {
 //  - 잉크가 거의 없거나 너무 많은 영상(배경 판별 실패)은 회색 영상 비교로 대신한다.
 //  - 재생바만 움직이는 같은 페이지: 점수 ≈ 0~0.05 / 페이지 전환: 0.2~1 / 페이드(밝기만 변함): 잉크 지도가 거의 그대로라 낮다
 const PAGE_SAMPLE_MAXW = 320;
+const PAGE_ANALYZE_RATE = 8; // 분석용 재생 배속
 function pageMakeCapture(video, roi) {
   const { rx0, ry0, rw, rh } = roiRectPx(video, roi);
   const scale = Math.min(1, PAGE_SAMPLE_MAXW / Math.max(1, rw));
@@ -1362,18 +1363,19 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
     const cap = pageMakeCapture(video, roiAtStart);
     busyRef.current = true;
     try {
-      let idx = 0;
-      for (let k = 0; ; k++) {
-        const t = rangeS + k * step; // 누적 오차 없이 계산
-        if (t >= rangeE) break;
-        await seekTo(video, t);
-        const sample = cap(t);
-        times.push(t);
-        samples.push(sample);
-        idx++;
-        setAnalyzeProgress(Math.min(100, Math.round((idx / totalSteps) * 100)));
-        if (idx % 10 === 0) log('분석 중... ' + t.toFixed(1) + 's / ' + rangeE.toFixed(1) + 's');
-      }
+      // 빠른 재생(8배속)으로 흘려보내며 step 간격의 프레임만 집는다 — 샘플마다 seek하던 방식(샘플당 0.1~0.3초)보다 몇 배 빠르다.
+      // 프레임 시각은 실제 표시된 프레임의 mediaTime을 쓴다. rVFC가 없는 브라우저는 flowPlayPass가 seek 방식으로 대신한다.
+      let lastLog = -1;
+      await flowPlayPass(video, {
+        startT: rangeS, endT: Math.max(rangeS, rangeE - 0.02), rate: PAGE_ANALYZE_RATE, maxRate: PAGE_ANALYZE_RATE, minGap: step,
+        onFrame: t => {
+          times.push(t);
+          samples.push(cap(t));
+          if (samples.length - lastLog >= 10) { lastLog = samples.length; log('분석 중... ' + t.toFixed(1) + 's / ' + rangeE.toFixed(1) + 's'); }
+        },
+        onProgress: p => setAnalyzeProgress(Math.min(100, Math.round(p * 100))),
+      });
+      if (samples.length < 2) throw new Error('프레임을 충분히 읽지 못했습니다 (' + samples.length + '개)');
       setAnalyzeProgress(100);
       // 다 모은 뒤 배경(밝은/어두운)을 정하고 비교한다 — 영상 전체를 보고 정해야 인트로 한 장에 휘둘리지 않는다
       const prep = pagePrepareCompare(samples);
@@ -2375,6 +2377,22 @@ function paintStaffRestore(imageData, w, plan) {
 }
 
 // 반환: 복원 정보 [{y0,y1,restored,weakAdded}] 또는 null (디버그 오버레이용)
+function keepWhiteInkIfBusy(d) {
+  let colored = 0;
+  const n = d.length / 4;
+  for (let i = 0; i < d.length; i += 4) {
+    const r = d[i], g = d[i + 1], b = d[i + 2];
+    const mx = r > g ? (r > b ? r : b) : (g > b ? g : b), mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+    if (mx > 140 && mx - mn > 70) colored++;
+  }
+  if (colored < n * 0.015) return false;
+  for (let i = 0; i < d.length; i += 4) {
+    const r = d[i], g = d[i + 1], b = d[i + 2];
+    const mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+    d[i] = mn; d[i + 1] = mn; d[i + 2] = mn;
+  }
+  return true;
+}
 function scrollApplyPreprocInPlace(canvas, opts) {
   if (!opts.removeBg && !opts.playheadRemove) return null;
   const ctx = canvas.getContext('2d');
@@ -2393,6 +2411,10 @@ function scrollApplyPreprocInPlace(canvas, opts) {
     const avg = computeAvgLuminanceFromCanvas(canvas);
     const invert = opts.invertMode === 'auto' ? (avg < 128) : (opts.invertMode === 'on');
     const imageData = ctx.getImageData(0, 0, w, h);
+    // 어두운 배경(반전) + 뒤로 연주 영상이 비치는 반투명 오버레이: 밝지만 색이 있는 픽셀(기타 몸통·피부·조명)이 흰 글자와 함께
+    // 잉크로 잡혀 화면이 뭉개지고 오선 검출이 실패한다. 이런 픽셀이 화면의 1.5% 이상이면 밝기 대신 "흰 정도"(min(R,G,B))로 바꿔
+    // 흰 글자·선만 남긴다. 색 있는 밝은 픽셀이 거의 없는 평범한 검은 배경 영상(빨간 강조 숫자 등)은 건드리지 않는다.
+    if (invert && opts.whiteInk !== false) keepWhiteInkIfBusy(imageData.data);
     // 기존 임계값·번짐·잡티 제거는 그대로 두고, 오선 행에만 보정을 추가한다
     const plan = opts.restoreStaff === false ? null : planStaffRestore(imageData.data, w, h, invert);
     applyThreshold(imageData, opts.threshold, invert, opts.softness || 0);
@@ -5657,7 +5679,7 @@ function flowYield() { return new Promise(r => setTimeout(r, 0)); }
 // 순차 재생 기반 프레임 수집 — requestVideoFrameCallback으로 프레임이 실제로 표시될 때마다 호출되며 미디어 시간
 // 간격 ≥ minGap인 프레임만 onFrame(mediaTime)으로 넘긴다(seek 금지: 시작 위치를 잡을 때 한 번만 seek).
 // 미지원 브라우저는 기존 seek 방식으로 폴백한다.
-async function flowPlayPass(video, { startT, endT, rate, minGap, onFrame, onProgress, abortRef }) {
+async function flowPlayPass(video, { startT, endT, rate, minGap, onFrame, onProgress, abortRef, maxRate }) {
   const span = Math.max(0.001, endT - startT);
   if (!flowRvfcSupported(video)) {
     for (let t = startT; t <= endT && !(abortRef && abortRef.current); t += minGap) {
@@ -5668,7 +5690,7 @@ async function flowPlayPass(video, { startT, endT, rate, minGap, onFrame, onProg
     return;
   }
   video.muted = true;
-  video.playbackRate = Math.max(0.25, Math.min(3, rate || 1));
+  video.playbackRate = Math.max(0.25, Math.min(maxRate || 3, rate || 1));
   flowInternalPlayRef.current = true; // 분석 패스의 내부 재생 — play 가드가 막지 않게 한다
   let failure = null;
   try {
@@ -7868,6 +7890,58 @@ async function uniMedianCapture(video, roi, seg, maxN) {
   return caps.length >= 3 ? medianOfCanvases(caps) : caps[0];
 }
 
+// 모든 page 구간의 시간 중앙값 프레임을 "빠른 재생 한 번"으로 모은다 — 구간마다 최대 15번씩 seek하던 방식(페이지당 수 초)을 대신한다.
+// 구간별로 [start+0.05, end−0.05]에 고르게 놓은 목표 시각을 지나는 첫 프레임을 집고(구간당 최대 maxN장), 구간이 끝나면 바로 중앙값을
+// 계산해 원본 프레임들은 버린다(메모리 절약). page 구간 사이가 3초 넘게 떨어져 있으면(긴 flow 구간 등) 재생으로 건너지 않고 seek로 넘어간다.
+// 반환: { [seg.id]: canvas } — 프레임을 3장 미만으로 모은 구간은 빠진다(호출부가 seek 방식으로 보충).
+const UNI_MEDIAN_RATE = 4;
+async function uniCollectPageMedians(video, roi, pages, maxN, abortRef, onProgress) {
+  const out = {};
+  if (!flowRvfcSupported(video) || !pages.length) return out;
+  const plan = pages.map(seg => {
+    const a = seg.start + 0.05, b = seg.end - 0.05;
+    if (b - a < 0.1) return null;
+    const n = Math.max(1, Math.min(maxN, Math.floor((b - a) / 0.1) + 1));
+    const targets = [];
+    for (let i = 0; i < n; i++) targets.push(n === 1 ? (a + b) / 2 : a + (b - a) * i / (n - 1));
+    return { seg, a, b, targets, next: 0, caps: [] };
+  }).filter(Boolean).sort((p, q) => p.a - q.a);
+  if (!plan.length) return out;
+  // 가까이 붙은 구간끼리 묶어 한 번에 재생
+  const runs = [];
+  for (const p of plan) {
+    const last = runs[runs.length - 1];
+    if (last && p.a - last[last.length - 1].b <= 3) last.push(p); else runs.push([p]);
+  }
+  const total = plan.length;
+  let finished = 0;
+  const flush = p => {
+    if (p.done) return;
+    p.done = true;
+    if (p.caps.length >= 3) out[p.seg.id] = medianOfCanvases(p.caps);
+    p.caps = [];
+    finished++;
+    if (onProgress) onProgress(finished / total);
+  };
+  for (const run of runs) {
+    if (abortRef && abortRef.current) break;
+    let k = 0;
+    await flowPlayPass(video, {
+      startT: Math.max(0, run[0].a - 0.05), endT: run[run.length - 1].b + 0.05, rate: UNI_MEDIAN_RATE, maxRate: UNI_MEDIAN_RATE, minGap: 0, abortRef,
+      onFrame: t => {
+        while (k < run.length && t > run[k].b) { flush(run[k]); k++; }
+        if (k >= run.length) return;
+        const p = run[k];
+        if (t < p.a || p.next >= p.targets.length || t < p.targets[p.next]) return;
+        p.caps.push(flowCaptureCurrent(video, roi));
+        while (p.next < p.targets.length && p.targets[p.next] <= t) p.next++; // 건너뛴 목표는 이 프레임으로 대신한다
+      },
+    });
+    for (const p of run) flush(p);
+  }
+  return out;
+}
+
 // 조각 꼬리/머리 — 오른쪽/왼쪽 정렬한 ROI 폭(W)짜리 캔버스. 이음 탐지(findSeamOverlap)는 같은 폭의 타일 두 장을 입력으로 받는다.
 function uniTail(piece, W, H) {
   const c = document.createElement('canvas'); c.width = W; c.height = H;
@@ -7883,6 +7957,42 @@ function uniHead(piece, W, H) {
   return c;
 }
 
+// 창 맞대기(registration): 앞 조각의 마지막 화면(tail, 폭 W)과 뒤 조각의 첫 화면(head, 폭 W)이 "같은 장면이 s만큼 왼쪽으로 밀린 것"인지
+// 직접 맞춰 본다 — head(x) = tail(x + s). 시간상 붙어 있는 두 조각(흐르던 악보가 잠깐 끊겼다 이어짐, 정지 페이지 뒤에 같은 화면에서
+// 흐르기 시작 등)은 화면이 거의 같으므로 NCC가 1에 가깝게 나오고, 겹침 폭(W − s)을 정확히 알 수 있다. 음악적으로 같은 마디가
+// 반복되는 것과 헷갈리지 않도록 s는 maxFrac·W 이하로만 찾는다(호출부: 사이에 '컷'이 있으면 0.08, 없으면 0.5).
+// 반환: { s(원본 px), ncc } 또는 null(맞는 위치 없음)
+const UNI_REG_MIN_NCC = 0.8;
+function uniRegisterWindows(tail, head, maxFrac) {
+  if (!tail || !head || tail.width !== head.width || tail.height !== head.height || !(maxFrac > 0)) return null;
+  const W = tail.width;
+  const la = flowLowFromCanvas(tail, 480, 0), lb = flowLowFromCanvas(head, 480, 0);
+  const za = flowToZeroMeanRows(la), zb = flowToZeroMeanRows(lb);
+  const w = la.w, h = la.h, noMask = new Uint8Array(w);
+  const sMax = Math.min(w - 16, Math.floor(w * maxFrac));
+  let best = -2, bestS = 0;
+  for (let sh = 0; sh <= sMax; sh++) {
+    const v = flowNccAt(za, zb, w, h, noMask, sh);
+    if (v > best + 1e-6) { best = v; bestS = sh; } // 동률이면 작은 이동을 택한다
+  }
+  if (best < UNI_REG_MIN_NCC) return null;
+  // 원본 해상도(최대 1920폭)에서 ±(축소 배율+1)px 범위로 다듬기
+  const k = W / w;
+  let s0 = Math.round(bestS * k);
+  if (k > 1.01) {
+    const fa = flowLowFromCanvas(tail, 1920, 0), fb = flowLowFromCanvas(head, 1920, 0);
+    const k2 = W / fa.w, zfa = flowToZeroMeanRows(fa), zfb = flowToZeroMeanRows(fb), m2 = new Uint8Array(fa.w);
+    const c = Math.round(bestS * k / k2), r = Math.ceil(k / k2) + 1;
+    let bv = -2, bs = c;
+    for (let sh = Math.max(0, c - r); sh <= Math.min(fa.w - 16, c + r); sh++) {
+      const v = flowNccAt(zfa, zfb, fa.w, fa.h, m2, sh);
+      if (v > bv + 1e-6) { bv = v; bs = sh; }
+    }
+    s0 = Math.round(bs * k2);
+  }
+  return { s: Math.max(0, Math.min(W - 1, s0)), ncc: best };
+}
+
 // 조각 경계 분석(자동 결정은 보수적): 겹침 제거 폭이 ROI 폭의 30%를 넘거나 1·2위 후보의 IoU 격차(margin)가 작으면(<0.15) 자동으로
 // 지우지 않고 '이음새 의심'으로 플래그한다(제안 폭은 suggestTrim에 남겨 슬라이더로 적용할 수 있게). 잘려 나갈 픽셀은 버리지 않고
 // 조각 원본을 그대로 보관하므로(uniFinalize가 매번 다시 합성), trim은 언제든 되돌릴 수 있다.
@@ -7893,6 +8003,15 @@ function uniAnalyzeJoins(pieces, W, H) {
     if (B.internalJoin) { joins.push({ ...B.internalJoin }); continue; }
     const join = { state: 'butt', suspect: true, seamSuspect: false, trim: 0, suggestTrim: 0, ovl: null, dupFixed: 0, suggestDup: 0, margin: null };
     const tailA = uniTail(A, W, H), headB = uniHead(B, W, H);
+    // 1순위: 창 맞대기 — 두 화면이 같은 장면의 연속이면 겹침 폭을 바로 안다(오선·마디 검출에 의존하지 않음)
+    const reg = B.regFrac ? uniRegisterWindows(tailA, headB, B.regFrac) : null;
+    if (reg) {
+      join.trim = Math.max(0, Math.min(W - reg.s, Math.min(W, B.totalW) - 2));
+      join.state = 'overlap'; join.suspect = false; join.registered = true; join.margin = 1;
+      join.ovl = { status: 'overlap', px: join.trim, iou: reg.ncc, why: 'registered', cands: [] };
+      joins.push(join);
+      continue;
+    }
     const iA = tileInfoOf(tailA), iB = tileInfoOf(headB);
     if (iA.sys || iB.sys) {
       const mask = new Uint8Array(H);
@@ -8339,8 +8458,16 @@ function UniBarStrip({ chunks, totalW, H, scale, bars, flagged, warnIdx, selIdx,
 
 // 포함된 구간들로 조각(page 묶음 / flow)을 만든다 (합성은 uniFinalize — 이음새 보정을 바꿀 때마다 원본 조각으로 다시 한다)
 let uniGroupSeq = 0;
-async function uniCompose({ segs, include, products, uniDefaults, nativeW }) {
+async function uniCompose({ segs, include, products, uniDefaults, nativeW, allSegs }) {
   const pieces = [];
+  // 두 구간 사이에 '컷'이 있으면 서로 다른 페이지일 수 있으므로 창 맞대기는 거의 같은 화면(이동 ≤ 8%)만 인정하고,
+  // 컷이 없으면(슬라이드·미세 이동·흐름의 끊김) 화면 폭의 절반까지 이동을 허용한다.
+  const regFracBetween = (a, b) => {
+    if (!a || !b) return 0;
+    const hasCut = (allSegs || []).some(x => x.kind === 'cut' && x.start >= a.end - 0.02 && x.end <= b.start + 0.02);
+    return hasCut ? 0.08 : 0.5;
+  };
+  let lastSeg = null; // 직전에 넣은 조각의 구간
   const segJoinPage = {};
   const segContrib = {}; // 합성 기여: { px(새로 추가), dropped(앞 조각과 동일해 전부 제거), removed(이음새에서 제거된 폭) }
   let group = [];
@@ -8348,7 +8475,33 @@ async function uniCompose({ segs, include, products, uniDefaults, nativeW }) {
     if (!group.length) return;
     const tiles = group.map(g => ({ canvas: cloneCanvas(g.raw), t: g.t, t0: g.seg.start, t1: g.seg.end }));
     const built = await buildCutFrames(tiles, uniDefaults);
+    const groupRegFrac = regFracBetween(lastSeg, group[0].seg);
+    lastSeg = group[group.length - 1].seg;
     if (built) {
+      // page 묶음 안의 이음 보정: 이웃한 두 타일이 같은 장면의 연속(창 맞대기 성공)이면 그 겹침으로 덮어쓴다.
+      // buildCutFrames의 오선 기반 겹침 판정이 놓치거나 잘못 잡은 경우(같은 마디가 두 번 들어가는 문제)를 바로잡는다.
+      {
+        let pk = -1;
+        for (let k = 0; k < built.frames.length; k++) {
+          const fb = built.frames[k];
+          if (fb.dup) continue;
+          if (pk >= 0) {
+            const fa = built.frames[pk];
+            const reg = uniRegisterWindows(fa.canvas, fb.canvas, regFracBetween(group[pk].seg, group[k].seg));
+            if (reg) {
+              const eA = fa.srcX + fa.len, end = fb.srcX + fb.len;
+              const ns = Math.max(0, Math.min(fb.canvas.width, eA - reg.s));
+              if (Math.abs(ns - fb.srcX) > 6) {
+                fb.srcX = ns; fb.len = Math.max(0, end - ns);
+                fb.dupFixed = 0; fb.dupSuspect = false;
+                fb.ovl = { kind: 'overlap', px: ns, iou: reg.ncc, why: 'registered' };
+                if (fb.len <= 2) { fb.dup = true; fb.len = 0; }
+              }
+            }
+          }
+          if (!fb.dup) pk = k;
+        }
+      }
       const lay = renderFrames(built.frames, 'horizontal');
       const ids = group.map(g => g.seg.id);
       built.frames.forEach((f, k) => {
@@ -8392,7 +8545,7 @@ async function uniCompose({ segs, include, products, uniDefaults, nativeW }) {
         pieces.push({
           type: 'page', segIds: [ids[k]], chunks: [used], totalW: used.width, fallbackT: t0,
           tAt: x => t0 + (Math.max(0, Math.min(used.width, x)) / used.width) * (t1 - t0), // 타일 안 폭 비례(추정)
-          leftExtra, rightExtra, groupId: gid, expect: firstReal ? groupExpect : 0, internal: !firstReal,
+          leftExtra, rightExtra, groupId: gid, expect: firstReal ? groupExpect : 0, internal: !firstReal, regFrac: firstReal ? groupRegFrac : 0,
           internalJoin: firstReal ? null : {
             state: cutOverlap > 0 ? 'overlap' : 'butt', suspect: !(cutOverlap > 0), seamSuspect: false, trim: 0, suggestTrim: 0,
             ovl: o ? { status: o.kind, px: o.px || 0, iou: o.iou != null ? o.iou : null, why: o.why || null, cands: o.cands } : null,
@@ -8400,6 +8553,19 @@ async function uniCompose({ segs, include, products, uniDefaults, nativeW }) {
           },
         });
         firstReal = false;
+      });
+    } else {
+      // 어느 타일에서도 오선을 찾지 못함 — 이음 분석 없이 전처리한 타일을 그대로 이어 붙인다(결과가 아예 안 나오는 것보다 낫다).
+      const gid = ++uniGroupSeq;
+      group.forEach((g, gi) => {
+        const c = cloneCanvas(g.raw);
+        scrollApplyPreprocInPlace(c, uniDecideOpts(c, uniDefaults));
+        segJoinPage[g.seg.id] = '오선 미검출 — 그대로 이어 붙임';
+        segContrib[g.seg.id] = { px: c.width, dropped: false, removed: 0 };
+        const t0 = g.seg.start, t1 = g.seg.end;
+        pieces.push({ type: 'page', segIds: [g.seg.id], chunks: [c], totalW: c.width, fallbackT: t0,
+          tAt: x => t0 + (Math.max(0, Math.min(c.width, x)) / c.width) * (t1 - t0),
+          leftExtra: null, rightExtra: null, groupId: gid, expect: 0, internal: false, internalJoin: null, regFrac: gi === 0 ? groupRegFrac : regFracBetween(group[gi - 1].seg, g.seg) });
       });
     }
     group = [];
@@ -8413,7 +8579,10 @@ async function uniCompose({ segs, include, products, uniDefaults, nativeW }) {
       await flush();
       const fp = products.flow[seg.id];
       if (fp && fp.res) segContrib[seg.id] = { px: fp.res.totalW, dropped: false, removed: 0 };
-      if (fp && fp.res) pieces.push({ type: 'flow', segIds: [seg.id], chunks: fp.res.chunks, totalW: fp.res.totalW, track: fp.res.track, tFirst: fp.res.tFirst, leftExtra: null, rightExtra: null, expect: 0 });
+      if (fp && fp.res) {
+        pieces.push({ type: 'flow', segIds: [seg.id], chunks: fp.res.chunks, totalW: fp.res.totalW, track: fp.res.track, tFirst: fp.res.tFirst, leftExtra: null, rightExtra: null, expect: 0, regFrac: regFracBetween(lastSeg, seg) });
+        lastSeg = seg;
+      }
     }
   }
   await flush();
@@ -8807,12 +8976,19 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
         if (det && det.cols.length && det.band) prod.removal = { cols: det.cols, band: det.band };
       }
       const pages = list.filter(s => s.kind === 'page');
+      // 시간 중앙값: 빠른 재생 한 번으로 모든 page 구간의 프레임을 모은다(실패하거나 프레임이 모자란 구간만 아래에서 seek로 보충)
+      let fastMedian = {};
+      if (removeMode === 'median' && pages.length) {
+        report('page 프레임 수집 중 (빠른 재생)...', 0.1);
+        try { fastMedian = await uniCollectPageMedians(video, roi, pages, 9, abortRef, f => report('page 프레임 수집 중 (빠른 재생)...', 0.1 + 0.18 * f)); }
+        catch (err) { fastMedian = {}; }
+      }
       for (let i = 0; i < pages.length; i++) {
         if (abortRef.current) { setMsg('중단되었습니다.'); return; }
         const seg = pages[i];
         const t = seg.repT != null ? seg.repT : (seg.start + seg.end) / 2; // 대표 프레임 후보(diff가 가장 작은 지점)
         // 기본(시간 중앙값): 구간 [start+0.05, end-0.05]의 최대 15프레임 픽셀별 중앙값 — 재생바가 한 위치에 머무는 시간이 절반 미만이면 사라진다
-        const raw = removeMode === 'median' ? await uniMedianCapture(video, roi, seg, 15) : await captureRepCanvas(video, roi, t);
+        const raw = removeMode === 'median' ? (fastMedian[seg.id] || await uniMedianCapture(video, roi, seg, 9)) : await captureRepCanvas(video, roi, t);
         const rr = (autoRemove || manualFrac != null) ? uniRemovePlaybar(raw, { mode: removeMode, manualFrac, defaults: uniDefaults, globalRemoval: prod.removal }) : { cols: [] };
         prod.page[seg.id] = { raw, t, cols: rr.cols };
         if (rr.band && !prod.band) prod.band = rr.band;
@@ -8839,17 +9015,35 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
         }
       }
       // 연속한 page 구간 둘의 대표 프레임(전처리 후) 영점 이동 NCC ≥ 0.98이면 duplicatePage — 뒤쪽을 기본 제외(토글로 복구)
+      // dup[id] = 제외 사유: true/'same'(앞 페이지와 동일), 'faded'(페이드 중인 흐린 사본), 'noStaff'(오선이 없는 화면 — 광고·타이틀 등)
       const dup = {}, ncc = {};
+      const stdOf = lowS => { let a = 0, q = 0; const g = lowS.gray; for (let i = 0; i < g.length; i++) { a += g[i]; q += g[i] * g[i]; } const m = a / g.length; return Math.sqrt(Math.max(0, q / g.length - m * m)); };
       let prev = null;
       for (const seg of list) {
         if (seg.kind === 'flow') { prev = null; continue; }
-        const low = uniProcessedLow(prod.page[seg.id].raw, uniDefaults);
+        const raw = prod.page[seg.id].raw;
+        const low = uniProcessedLow(raw, uniDefaults);
+        const rawLow = flowLowFromCanvas(raw, 480, 0);
+        const cur = { id: seg.id, low, rawLow, std: stdOf(rawLow) };
         if (prev) {
           const v = uniZeroShiftNcc(prev.low, low);
           ncc[seg.id] = v;
-          if (v >= 0.98) dup[seg.id] = true; else prev = { low };
-        } else prev = { low };
+          if (v >= 0.98) { dup[seg.id] = 'same'; continue; }
+          // 페이드 인/아웃 도중에 잡힌 흐린 사본: 원본 밝기 구조는 같은데(NCC ≥ 0.9) 대비가 뚜렷이 낮다(< 70%) — 흐린 쪽을 제외
+          const rv = uniZeroShiftNcc(prev.rawLow, rawLow);
+          if (rv >= 0.9 && Math.min(prev.std, cur.std) < 0.7 * Math.max(prev.std, cur.std)) {
+            if (cur.std < prev.std) { dup[seg.id] = 'faded'; continue; }
+            dup[prev.id] = 'faded';
+          }
+        }
+        prev = cur;
       }
+      // 오선이 없는 화면(광고·타이틀·엔딩 카드) 제외 — 대부분(≥60%)의 page 조각에서 오선을 찾은 영상에서만 적용
+      const pageIds = list.filter(sg => sg.kind === 'page').map(sg => sg.id);
+      const hasBand = {};
+      for (const id of pageIds) hasBand[id] = !!uniFindBand(prod.page[id].raw, uniDefaults);
+      const bandCount = pageIds.filter(id => hasBand[id]).length;
+      if (pageIds.length >= 3 && bandCount >= pageIds.length * 0.6) for (const id of pageIds) if (!hasBand[id] && !dup[id]) dup[id] = 'noStaff';
       const inc = {};
       for (const seg of list) inc[seg.id] = seg.kind === 'page' ? !dup[seg.id] : !!(prod.flow[seg.id] && prod.flow[seg.id].res);
       pastRef.current = []; futureRef.current = []; setStackVer(v => v + 1);
@@ -8875,9 +9069,12 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
     const id = setTimeout(async () => {
       setComposing(true);
       try {
-        const res = await uniCompose({ segs: exSegs, include, products: prodRef.current, uniDefaults, nativeW: analysis.nativeW });
+        const res = await uniCompose({ segs: exSegs, include, products: prodRef.current, uniDefaults, nativeW: analysis.nativeW, allSegs: segs });
         if (res) res.sig = sig; // 이 합성이 어떤 포함 상태에서 만들어졌는지 — 이음새 보정(adj)은 같은 포함 상태에서만 적용된다
-        if (tok === composeTokenRef.current) setMerged(res);
+        if (tok === composeTokenRef.current) {
+          setMerged(res);
+          if (!res) setMsg('합칠 조각이 없습니다 — 포함된 조각이 없거나 추출에 실패했습니다. 조각 목록의 체크 상태와 영역(ROI)·전처리 설정을 확인하세요.');
+        }
       } catch (err) {
         setMsg('합치기 오류: ' + err.message);
       } finally { setComposing(false); }
@@ -9148,7 +9345,7 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
                   <tr key={seg.id} style={{ borderBottom: '1px solid var(--border)', verticalAlign: 'top', opacity: include[seg.id] ? 1 : 0.55 }}>
                     <td><input type="checkbox" checked={!!include[seg.id]} disabled={seg.kind === 'flow' && !(prodRef.current.flow[seg.id] && prodRef.current.flow[seg.id].res)}
                       onChange={e => commit({ adj: {}, cuts: [], include: { ...include, [seg.id]: e.target.checked } })} /></td>
-                    <td><span style={{ color: UNI_KIND_COLOR[seg.kind] }}>■ </span>{UNI_KIND_LABEL[seg.kind]}{dupPage[seg.id] ? ' · duplicatePage (앞 페이지와 동일)' : ''}</td>
+                    <td><span style={{ color: UNI_KIND_COLOR[seg.kind] }}>■ </span>{UNI_KIND_LABEL[seg.kind]}{dupPage[seg.id] ? (dupPage[seg.id] === 'faded' ? ' · 자동 제외: 흐린 사본(페이드 중)' : dupPage[seg.id] === 'noStaff' ? ' · 자동 제외: 오선 없음(악보 아님)' : ' · duplicatePage (앞 페이지와 동일)') : ''}</td>
                     <td>{seg.start.toFixed(2)} ~ {seg.end.toFixed(2)}</td>
                     <td>{seg.score.toFixed(2)}</td>
                     <td>
