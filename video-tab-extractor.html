@@ -4228,12 +4228,24 @@ function tabRoiFromGray(g, w, h) {
     for (let x = xs0; x <= xs1; x++) { const v = g[y * w + x]; if (dark ? v > 180 : v < 150) c++; }
     prof[y] = c / Math.max(1, xs1 - xs0 + 1);
   }
+  // 행마다 "악보 바탕색과 같은 픽셀" 비율. 악보 패널이 단색 바탕이면(오선 띠 중앙값 ≥ 0.8) 바탕이 깨지는 행(연주 영상)을 벽으로 본다
+  const bgLevel = bandVals.length ? bandVals[bandVals.length >> 1] : 255;
+  const bgFrac = new Float32Array(h);
+  for (let y = 0; y < h; y++) {
+    let c = 0;
+    for (let x = xs0; x <= xs1; x += 2) if (Math.abs(g[y * w + x] - bgLevel) < 28) c++;
+    bgFrac[y] = c / Math.max(1, Math.floor((xs1 - xs0) / 2) + 1);
+  }
+  const bandBg = [];
+  for (let y = Math.round(s.top); y <= Math.round(s.bottom); y++) bandBg.push(bgFrac[y]);
+  bandBg.sort((p, q) => p - q);
+  const plainPanel = bandBg.length && bandBg[bandBg.length >> 1] >= 0.8;
   const walk = (start, step, maxd, mind) => {
     let y = start, last = start, gap = 0, wall = 0, wallAt = null;
     while (y + step >= 0 && y + step < h && Math.abs(y + step - start) <= maxd) {
       y += step;
       const p = prof[y];
-      if (p > 0.45) { if (!wall) wallAt = y; wall++; } else wall = 0;
+      if (p > 0.45 || (plainPanel && bgFrac[y] < 0.3)) { if (!wall) wallAt = y; wall++; } else wall = 0;
       if (wall >= 3) break;
       if (p > 0.005) { if (!wall) last = y; gap = 0; }
       else if (++gap > 0.6 * hs) break;
@@ -4254,8 +4266,45 @@ function tabRoiFromGray(g, w, h) {
     if (o.bottom < s.top) y0 = Math.max(y0, o.bottom + 1.2 * sp);
     else if (o.top > s.bottom) y1 = Math.min(y1, o.top - 1.2 * sp);
   }
+  // 좌우 경계: 오선 줄이 실제로 이어지는 범위까지만. 화면 높이만큼 길게 내려오는 세로 벽(옆에 붙은 코드 다이어그램 패널의 경계 등)을 만나면
+  // 그 안쪽에서 멈춘다 — 패널은 장면마다 내용이 바뀌는 고정 오버레이라, 창 맞대기·중복 판정을 망친다.
+  const isInk = v => (dark ? v > 180 : v < 150);
+  const lineYs = Array.from({ length: s.n }, (_, i) => Math.round(s.top + i * sp));
+  const colOk = x => {
+    let c = 0;
+    // 연한 회색 오선도 있으므로 절대 밝기 대신 위아래(±3행)보다 뚜렷이(≥18) 진한지로 본다
+    const q = Math.max(3, Math.round(sp * 0.35));
+    for (const ly of lineYs) for (let d = -1; d <= 1; d++) {
+      const yy = ly + d;
+      if (yy - q < 0 || yy + q >= h) continue;
+      const v = g[yy * w + x], a = g[(yy - q) * w + x], b = g[(yy + q) * w + x];
+      if (dark ? (v - a >= 18 && v - b >= 18) : (a - v >= 18 && b - v >= 18)) { c++; break; }
+    }
+    return c >= Math.ceil(s.n / 2);
+  };
+  const wy0 = Math.max(0, Math.round(s.top - 1.5 * hs)), wy1 = Math.min(h - 1, Math.round(s.bottom + 1.5 * hs));
+  const isWall = x => {
+    if (wy1 - wy0 < 2.5 * hs) return false;
+    let c = 0;
+    for (let y = wy0; y <= wy1; y++) if (isInk(g[y * w + x])) c++;
+    return c > 0.9 * (wy1 - wy0 + 1);
+  };
+  const walkX = (from, step, lim) => {
+    let x = from, last = from, fail = 0;
+    while (x + step >= 0 && x + step < w && (x + step - lim) * step <= 0) {
+      x += step;
+      if (isWall(x)) return { x: last, wall: true };
+      if (colOk(x)) { last = x; fail = 0; } else if (++fail > 5) break;
+    }
+    return { x: last, wall: false };
+  };
+  const xc = Math.round((xs0 + xs1) / 2);
+  let L = { x: xs0, wall: false }, R = { x: xs1, wall: false };
+  if (colOk(xc) || colOk(xc - 2) || colOk(xc + 2)) { L = walkX(xc, -1, 0); R = walkX(xc, 1, w - 1); }
+  const lx = L.x, rx = R.x;
+  const padL = L.wall ? 0 : 0.02 * w, padR = R.wall ? 0 : 0.02 * w;
   return {
-    x0: Math.max(0, (s.x0 - 0.02 * w) / w), x1: Math.min(1, (s.x1 + 0.02 * w) / w),
+    x0: Math.max(0, (lx - padL) / w), x1: Math.min(1, (rx + 1 + padR) / w),
     y0: Math.max(0, y0 / h), y1: Math.min(1, (y1 + 1) / h),
     // 움직임 분석용 핵심 띠: TAB 오선 ± 선 간격 0.8배 (코드 다이어그램·제목·오선보처럼 따로 움직이는 것은 빼고 판정한다)
     coreY0: Math.max(0, (s.top - 0.8 * sp) / h), coreY1: Math.min(1, (s.bottom + 0.8 * sp) / h),
@@ -9695,6 +9744,614 @@ function UniExtract({ videoRef, videoFile, roi, rangeStart, rangeEnd, rate, segs
   );
 }
 
+// ================================================================================================
+// 자동(신규) — 창 맞대기(모자이크) 엔진
+// 영상의 모든 장면을 "긴 악보 띠를 들여다보는 창"으로 보고, 장면끼리 가로 이동량을 맞춰 하나의 띠로 붙인다.
+// 페이지 전환·스크롤·연속 이동·점프 스크롤을 구분하지 않는다 — 구분 없이 한 번 재생으로 끝난다.
+//  1) 이웃 장면(5fps)끼리 이동량 맞추기(-2%~35%, NCC ≥ 0.7) → 안정 구간(run)
+//  2) 구간 사이: 앞 구간 마지막 장면 ↔ 뒤 구간 첫 장면 맞추기(-2%~95%, 오선 띠 + 전체 영역 NCC 평균).
+//     NCC ≥ 0.65(공통 점프 폭 근처는 0.6) · 겹침 ≥ 8%면 겹쳐 붙이고, 아니면 뒤에 이어 붙인다(누락 의심 표시).
+//  3) 띠의 64px 블록마다 그 블록을 덮는 장면들(최대 7장)의 픽셀 중앙값 → 재생바·스티커·잔상 제거
+// ================================================================================================
+const MOS_FPS = 5, MOS_REG_W = 480, MOS_OUT_W = 1280, MOS_RUN_NCC = 0.7, MOS_BLOCK = 64, MOS_MAX_COVER = 7;
+
+// RGBA → 잉크(0/1): 밝은 배경은 어두운 글자(<150), 어두운 배경은 밝은 글자(>180). 색이 있는 픽셀(재생바·강조)은 제외
+function mosInk(d, OW, y0, y1, dark) {
+  const h = y1 - y0, ink = new Uint8Array(OW * h);
+  for (let y = y0, p = 0; y < y1; y++) {
+    let i = y * OW * 4;
+    for (let x = 0; x < OW; x++, i += 4, p++) {
+      const r = d[i], g = d[i + 1], b = d[i + 2];
+      const mx = r > g ? (r > b ? r : b) : (g > b ? g : b), mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+      if (mx - mn > 60) continue;
+      const gr = 0.299 * r + 0.587 * g + 0.114 * b;
+      if (dark ? gr > 180 : gr < 150) ink[p] = 1;
+    }
+  }
+  return ink;
+}
+// 잉크 → 폭 W·높이 hh로 상자 축소, 행 평균 제거(오선 제거) → Int8(×127). frac = 잉크 비율
+function mosDown(ink, OW, h, W, hh) {
+  const sum = new Float32Array(W * hh), cnt = new Float32Array(W * hh);
+  const xm = new Int32Array(OW);
+  for (let x = 0; x < OW; x++) xm[x] = Math.min(W - 1, Math.floor(x * W / OW));
+  let tot = 0;
+  for (let y = 0; y < h; y++) {
+    const by = Math.min(hh - 1, Math.floor(y * hh / h)) * W, r = y * OW;
+    for (let x = 0; x < OW; x++) { const v = ink[r + x]; sum[by + xm[x]] += v; cnt[by + xm[x]] += 1; tot += v; }
+  }
+  const z = new Int8Array(W * hh);
+  for (let y = 0; y < hh; y++) {
+    let m = 0;
+    const r = y * W;
+    for (let x = 0; x < W; x++) { sum[r + x] = cnt[r + x] ? sum[r + x] / cnt[r + x] : 0; m += sum[r + x]; }
+    m /= W;
+    for (let x = 0; x < W; x++) z[r + x] = Math.round((sum[r + x] - m) * 127);
+  }
+  return { z, frac: tot / Math.max(1, OW * h) };
+}
+// 출력 해상도 잉크의 행 평균 제거(이동량 다듬기용)
+function mosZeroMean(ink, OW, h) {
+  const f = new Float32Array(OW * h);
+  for (let y = 0; y < h; y++) {
+    let m = 0;
+    const r = y * OW;
+    for (let x = 0; x < OW; x++) m += ink[r + x];
+    m /= OW;
+    for (let x = 0; x < OW; x++) f[r + x] = ink[r + x] - m;
+  }
+  return f;
+}
+// b(x) = a(x + s) 가정의 겹침 영역 NCC (s ≥ 0: 창이 오른쪽으로 s 이동)
+function mosNcc(za, zb, W, h, s) {
+  const n = W - Math.abs(s);
+  if (n <= 0) return -1;
+  let ab = 0, aa = 0, bb = 0;
+  for (let y = 0; y < h; y++) {
+    const r = y * W, ao = r + (s >= 0 ? s : 0), bo = r + (s >= 0 ? 0 : -s);
+    for (let x = 0; x < n; x++) { const a = za[ao + x], b = zb[bo + x]; ab += a * b; aa += a * a; bb += b * b; }
+  }
+  if (aa < 1e-9 || bb < 1e-9) return -1;
+  return ab / Math.sqrt(aa * bb);
+}
+// 열 프로파일 상관으로 이동량 후보 상위 k개(±1 포함)
+function mosProfileCands(za, zb, W, h, smin, smax, k, out) {
+  const pa = new Float32Array(W), pb = new Float32Array(W);
+  for (let y = 0; y < h; y++) for (let x = 0; x < W; x++) { pa[x] += Math.abs(za[y * W + x]); pb[x] += Math.abs(zb[y * W + x]); }
+  let ma = 0, mb = 0;
+  for (let x = 0; x < W; x++) { ma += pa[x]; mb += pb[x]; }
+  ma /= W; mb /= W;
+  for (let x = 0; x < W; x++) { pa[x] -= ma; pb[x] -= mb; }
+  const sc = [];
+  for (let s = smin; s <= smax; s++) {
+    const n = W - Math.abs(s);
+    if (n < 16) { sc.push([-1, s]); continue; }
+    let ab = 0, aa = 0, bb = 0;
+    const ao = s >= 0 ? s : 0, bo = s >= 0 ? 0 : -s;
+    for (let x = 0; x < n; x++) { const a = pa[ao + x], b = pb[bo + x]; ab += a * b; aa += a * a; bb += b * b; }
+    const d = Math.sqrt(aa * bb);
+    sc.push([d > 1e-9 ? ab / d : -1, s]);
+  }
+  sc.sort((p, q) => q[0] - p[0]);
+  for (let i = 0; i < Math.min(k, sc.length); i++) for (const d of [-1, 0, 1]) out.add(sc[i][1] + d);
+  return out;
+}
+// pred: 직전 이동량(같은 구간 안). 반복되는 마디 때문에 "한 마디 더 간" 위치도 거의 같은 점수가 나오므로,
+// 1등과 0.04 이내인 후보 중 직전 이동량에 가장 가까운 것을 고른다 (스크롤 속도는 0.2초 사이에 거의 변하지 않는다)
+function mosRegister(za, zb, W, h, smin, smax, pred) {
+  const cands = new Set();
+  for (let s = Math.max(smin, -3); s <= Math.min(smax, 3); s++) cands.add(s);
+  if (pred != null) for (let s = Math.round(pred) - 4; s <= Math.round(pred) + 4; s++) cands.add(s);
+  mosProfileCands(za, zb, W, h, smin, smax, 6, cands);
+  let best = [-2, 0];
+  const all = [];
+  for (const s of [...cands].sort((a, b) => a - b)) {
+    if (s < smin || s > smax || W - Math.abs(s) < 16) continue;
+    const v = mosNcc(za, zb, W, h, s);
+    all.push([v, s]);
+    if (v > best[0] + 1e-6) best = [v, s];
+  }
+  if (pred != null) {
+    let pick = best;
+    for (const c of all) if (c[0] >= best[0] - 0.04 && Math.abs(c[1] - pred) < Math.abs(pick[1] - pred) - 2) pick = c;
+    return pick;
+  }
+  return best;
+}
+// 오선 띠 NCC와 전체 영역(코드·마디 번호·가사 포함) NCC의 평균 — 반복 마디와 헷갈리지 않게
+function mosRegister2(A, B, W, smin, smax) {
+  const cands = new Set();
+  mosProfileCands(A.low, B.low, W, A.hl, smin, smax, 6, cands);
+  mosProfileCands(A.full, B.full, W, A.hf, smin, smax, 6, cands);
+  if (A.ext) mosProfileCands(A.ext, B.ext, W, A.hf, smin, smax, 6, cands);
+  let best = [-2, 0];
+  for (const s of [...cands].sort((a, b) => a - b)) {
+    if (s < smin || s > smax || W - Math.abs(s) < 16) continue;
+    let v = 0.5 * (mosNcc(A.low, B.low, W, A.hl, s) + mosNcc(A.full, B.full, W, A.hf, s));
+    // 띠 바깥 글자가 겹침 영역에 있으면 같은 비중으로 — 반복 마디에 한 마디 어긋나 붙는 것을 막는다
+    if (A.ext) { const e = mosNcc(A.ext, B.ext, W, A.hf, s); if (e > -1) v = (2 * v + e) / 3; }
+    if (v > best[0] + 1e-6) best = [v, s];
+  }
+  return best;
+}
+// 출력 해상도에서 이동량 다듬기 (저해상도 이동량 × 배율의 누적 오차가 띠를 번지게 하는 것을 막는다)
+function mosRefine(fa, fb, OW, h, sc, r) {
+  let best = [-2, sc];
+  for (let s = sc - r; s <= sc + r; s++) {
+    if (OW - Math.abs(s) < 16) continue;
+    const v = mosNcc(fa, fb, OW, h, s);
+    if (v > best[0] + 1e-6) best = [v, s];
+  }
+  return best[1];
+}
+function mosMedianSmall(a, n) { // n ≤ 7, 삽입 정렬
+  for (let i = 1; i < n; i++) { const v = a[i]; let j = i - 1; while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; j--; } a[j + 1] = v; }
+  return n & 1 ? a[n >> 1] : ((a[(n >> 1) - 1] + a[n >> 1]) >> 1);
+}
+// 구간 하나의 블록 bi를 덮는 장면들의 픽셀 중앙값 → Uint8Array(OH×B)
+function mosRenderBlock(keys, bi, OW, OH, bg) {
+  const B = MOS_BLOCK, bx = bi * B;
+  let cov = keys.filter(k => k.x <= bx && k.x + OW >= bx + B);
+  if (!cov.length) cov = keys.filter(k => k.x < bx + B && k.x + OW > bx);
+  if (!cov.length) return null;
+  if (cov.length > MOS_MAX_COVER) cov = Array.from({ length: MOS_MAX_COVER }, (_, i) => cov[Math.round(i * (cov.length - 1) / (MOS_MAX_COVER - 1))]);
+  const out = new Uint8Array(OH * B), vals = new Int32Array(MOS_MAX_COVER);
+  for (let xx = 0; xx < B; xx++) {
+    const gx = bx + xx;
+    for (let y = 0; y < OH; y++) {
+      let n = 0;
+      for (const k of cov) { const lx = gx - k.x; if (lx >= 0 && lx < OW) vals[n++] = k.gray[y * OW + lx]; }
+      out[y * B + xx] = n ? mosMedianSmall(vals, n) : bg;
+    }
+  }
+  return out;
+}
+
+// 화면에 고정된 배경 추정: 서로 다른 구간의 장면들(악보 내용은 다름)의 픽셀 중앙값. 밝은 바탕 기준으로 돌려 반환.
+// 사진·그림 배경이 있을 때(오선 줄이 아닌 회색 영역이 4% 이상)만 쓴다 — 흰 바탕 영상은 null (지울 것이 없다)
+function mosScreenBackground(samples, OW, OH, dark) {
+  if (samples.length < 5) return null;
+  const n = samples.length, bgv = new Uint8Array(OW * OH), tmp = new Uint8Array(n);
+  for (let p = 0; p < bgv.length; p++) {
+    for (let i = 0; i < n; i++) tmp[i] = samples[i][p];
+    tmp.sort();
+    bgv[p] = dark ? 255 - tmp[n >> 1] : tmp[n >> 1];
+  }
+  // 오선처럼 폭 전체에 걸친 어두운 행은 보호 (모든 장면에 같은 자리에 있는 진짜 악보 요소)
+  const lineRow = new Uint8Array(OH);
+  let busy = 0, cnt = 0;
+  for (let y = 0; y < OH; y++) {
+    let d = 0;
+    for (let x = 0; x < OW; x++) if (bgv[y * OW + x] < 150) d++;
+    if (d > OW * 0.5) { lineRow[y] = 1; continue; }
+    for (let x = 0; x < OW; x++) { const v = bgv[y * OW + x]; if (v > 40 && v < 215) busy++; cnt++; }
+  }
+  const busyFrac = cnt ? busy / cnt : 0;
+  if (busyFrac < 0.04) return null;
+  return { bg: bgv, lineRow, busyFrac };
+}
+
+// 그림 배경 지우기(검은 탑햇): 닫힘(최대→최소 필터)과 원본의 차이 = 커널보다 가는 어두운 구조(오선·숫자·마디선·글자)만 남는다.
+// 사진의 넓은 어두운 영역(머리카락·기타 그림자)은 커널보다 커서 사라진다. buf는 밝은 바탕 기준 그레이.
+function mosTopHatClean(buf, w, h, k) {
+  const r = k >> 1, tmp = new Uint8Array(w * h), clo = new Uint8Array(w * h);
+  const pass = (src, dst, horiz, useMax) => {
+    const n = horiz ? w : h, m = horiz ? h : w;
+    for (let j = 0; j < m; j++) {
+      for (let i = 0; i < n; i++) {
+        let v = useMax ? 0 : 255;
+        const a = Math.max(0, i - r), b = Math.min(n - 1, i + r);
+        for (let q = a; q <= b; q++) {
+          const x = horiz ? src[j * w + q] : src[q * w + j];
+          if (useMax ? x > v : x < v) v = x;
+        }
+        if (horiz) dst[j * w + i] = v; else dst[i * w + j] = v;
+      }
+    }
+  };
+  pass(buf, tmp, true, true); pass(tmp, clo, false, true);   // 팽창(밝은 쪽 최대)
+  pass(clo, tmp, true, false); pass(tmp, clo, false, false); // 침식 → 닫힘
+  for (let p = 0; p < buf.length; p++) {
+    const ink = clo[p] - buf[p];
+    buf[p] = 255 - Math.min(255, Math.max(0, (ink - 25) * 2.2)) | 0;
+  }
+}
+
+// 한 번 재생하면서 장면을 모으고 구간(run)을 만든다. 반환: 구간 목록 + 렌더된 블록
+async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress }) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const { rx0, ry0, rw, rh } = roiRectPx(video, roi);
+  const OW = Math.max(64, Math.min(MOS_OUT_W, Math.round(rw)));
+  const OH = Math.max(16, Math.round(rh * OW / rw));
+  const core = roi.core || { y0: roi.y0, y1: roi.y1 };
+  const cy0 = Math.max(0, Math.min(OH - 8, Math.round((core.y0 * vh - ry0) * OH / rh)));
+  const cy1 = Math.max(cy0 + 8, Math.min(OH, Math.round((core.y1 * vh - ry0) * OH / rh)));
+  const hc = cy1 - cy0;
+  const W = MOS_REG_W, k = W / OW;
+  const hl = Math.max(8, Math.round(hc * k)), hf = Math.max(8, Math.round(OH * k));
+  const kk = OW / W, rr = Math.ceil(kk) + 1;
+  const cv = document.createElement('canvas'); cv.width = OW; cv.height = OH;
+  const ctx = cv.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingQuality = 'high';
+  // 배경 밝기: 오선 띠의 중앙값 (구간 3곳)
+  const bandVals = [];
+  for (const f of [0.3, 0.5, 0.7]) {
+    await seekSafe(video, startT + (endT - startT) * f);
+    ctx.drawImage(video, rx0, ry0, rw, rh, 0, 0, OW, OH);
+    const d = ctx.getImageData(0, cy0, OW, hc).data;
+    for (let i = 0; i < d.length; i += 4 * 7) bandVals.push(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
+  }
+  bandVals.sort((a, b) => a - b);
+  const dark = bandVals.length ? bandVals[bandVals.length >> 1] < 128 : false;
+  const bg = dark ? 0 : 255;
+
+  const runs = [];
+  let cur = null, prev = null, nFrames = 0, nBlank = 0, bgSamples = [];
+  const KEY_MOVE = Math.round(OW / 6);
+  const flushRun = (final) => {
+    const r = cur;
+    if (!r) return;
+    const keys = r.keys;
+    if (final) {
+      if (r.pend) { keys.push(r.pend); r.pend = null; }
+      if (r.frames.length < 2) { cur = null; return; }
+      let lo = Infinity, hi = -Infinity;
+      for (const f of r.frames) { lo = Math.min(lo, f.x); hi = Math.max(hi, f.x + OW); }
+      const b0 = r.nextBlock != null ? r.nextBlock : Math.floor(lo / MOS_BLOCK), b1 = Math.ceil(hi / MOS_BLOCK);
+      for (let bi = b0; bi < b1; bi++) { const b = mosRenderBlock(keys, bi, OW, OH, bg); if (b) r.blocks.set(bi, b); }
+      r.lo = lo; r.hi = hi;
+      const xs = r.frames.map(f => f.x).sort((a, b) => a - b);
+      r.xr = xs[xs.length >> 1];
+      r.static = xs[xs.length - 1] - xs[0] <= 4;
+      // 화면에 고정된 배경(사진·영상 배경) 추정용 표본: 구간마다 가운데 장면 하나
+      bgSamples.push(keys[keys.length >> 1].gray);
+      if (bgSamples.length > 40) bgSamples = bgSamples.filter((_, i) => i % 2 === 0);
+      r.keys = null;
+      const slim = q => ({ low: q.low, full: q.full, ext: q.ext, zf: q.zf });
+      r.first = slim(r.first); r.last = slim(r.last);
+      runs.push(r);
+      cur = null;
+      return;
+    }
+    // 긴 연속 이동 구간: 이미 지나간 블록을 미리 렌더하고 장면을 버려 메모리를 아낀다
+    const frontier = r.frames[r.frames.length - 1].x - Math.ceil(0.05 * OW);
+    if (r.nextBlock == null) r.nextBlock = Math.floor(Math.min(...keys.map(q => q.x)) / MOS_BLOCK);
+    const upto = Math.floor(frontier / MOS_BLOCK);
+    for (let bi = r.nextBlock; bi < upto; bi++) { const b = mosRenderBlock(keys, bi, OW, OH, bg); if (b) r.blocks.set(bi, b); }
+    if (upto > r.nextBlock) r.nextBlock = upto;
+    r.keys = keys.filter(q => q.x + OW > r.nextBlock * MOS_BLOCK);
+  };
+  const onFrame = t => {
+    ctx.drawImage(video, rx0, ry0, rw, rh, 0, 0, OW, OH);
+    const d = ctx.getImageData(0, 0, OW, OH).data;
+    nFrames++;
+    const inkC = mosInk(d, OW, cy0, cy1, dark);
+    const lowR = mosDown(inkC, OW, hc, W, hl);
+    if (lowR.frac < 0.001) { nBlank++; flushRun(true); prev = null; return; }
+    const full = mosDown(mosInk(d, OW, 0, OH, dark), OW, OH, W, hf).z;
+    // 오선 띠 바깥(코드 이름·마디 번호·가사)만 남긴 지도 — 반복되는 마디 패턴과 달리 마디마다 다르다
+    const ext = full.slice(), ey0 = Math.floor(cy0 * hf / OH), ey1 = Math.ceil(cy1 * hf / OH);
+    ext.fill(0, ey0 * W, Math.min(hf, ey1) * W);
+    const fr = { t, low: lowR.z, full, ext, zf: mosZeroMean(inkC, OW, hc) };
+    const gray = new Uint8Array(OW * OH);
+    for (let i = 0, p = 0; p < gray.length; i += 4, p++) gray[p] = (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]) | 0;
+    let joined = false;
+    if (cur && prev) {
+      const dt = Math.max(0.05, t - prev.t), gapK = Math.max(1, dt / 0.2);
+      const pred = cur.vel != null ? cur.vel * dt : null; // 저해상도 px
+      const [v, s] = mosRegister(prev.low, fr.low, W, hl, -Math.round(0.02 * W), Math.round(0.35 * W), pred);
+      // 갑자기 크게 넘어간 장면은 같은 구간으로 잇지 않는다 — 반복 마디 때문에 "한 마디 덜 간" 위치가 맞는 것처럼 보이기 쉬워서,
+      // 큰 점프는 구간 사이 맞대기(코드 이름·마디 번호까지 보는 비교 + 공통 점프 폭)에 맡긴다
+      const jumpLim = 0.12 * W * gapK;
+      const sudden = pred != null ? Math.abs(s - pred) > jumpLim : Math.abs(s) > Math.min(0.35 * W, 0.2 * W * gapK);
+      if (v >= MOS_RUN_NCC && !sudden) {
+        const so = mosRefine(prev.zf, fr.zf, OW, hc, Math.round(s * kk), rr);
+        const x = cur.frames[cur.frames.length - 1].x + so;
+        cur.frames.push({ t, x });
+        cur.vel = (so / kk) / dt;
+        const near = cur.keys.filter(q => Math.abs(q.x - x) < KEY_MOVE);
+        const lastKey = cur.keys[cur.keys.length - 1];
+        if (!lastKey || Math.abs(x - lastKey.x) >= KEY_MOVE || (t - lastKey.t >= 1.0 && near.length < MOS_MAX_COVER)) { cur.keys.push({ x, t, gray }); cur.pend = null; }
+        else cur.pend = { x, t, gray };
+        cur.last = fr;
+        joined = true;
+        if (cur.keys.length > 24) flushRun(false);
+      }
+    }
+    if (!joined) {
+      flushRun(true);
+      cur = { frames: [{ t, x: 0 }], keys: [{ x: 0, t, gray }], pend: null, blocks: new Map(), first: fr, last: fr, nextBlock: null, vel: null };
+    }
+    prev = fr;
+  };
+  await flowPlayPass(video, {
+    startT, endT, rate, maxRate: rate, minGap: 1 / MOS_FPS - 0.01, onFrame,
+    onProgress: f => onProgress && onProgress(f), abortRef,
+  });
+  flushRun(true);
+  return { runs, OW, OH, hc, hl, hf, W, kk, rr, dark, bg, nFrames, nBlank, screenBg: mosScreenBackground(bgSamples, OW, OH, dark) };
+}
+
+// 구간 사이 맞대기 → 띠 위 배치
+function mosPlace(col) {
+  const { runs, OW, hc, hl, hf, W, kk, rr } = col;
+  // 겹침 8% 미만은 찾지 않는다 — 좁은 띠끼리는 우연히 NCC가 높게 나와 진짜 겹침(30~60%)을 이기고 "이어 붙임 + 중복"이 된다
+  const smin = -Math.round(0.02 * W), smax = Math.round(0.92 * W);
+  const A = r => ({ low: r.last.low, full: r.last.full, ext: r.last.ext, hl, hf }), Bf = r => ({ low: r.first.low, full: r.first.full, ext: r.first.ext, hl, hf });
+  const cand = [];
+  for (let i = 1; i < runs.length; i++) cand.push(mosRegister2(A(runs[i - 1]), Bf(runs[i]), W, smin, smax));
+  // 점프 스크롤: 확실한 맞대기(NCC ≥ 0.85, 겹침 ≥ 8%)가 3곳 이상이면 그 이동 폭의 중앙값 근처(±3%)에서 다시 맞춰 본다
+  const conf = cand.filter(([v, s]) => v >= 0.85 && (W - s) / W >= 0.08 && s > 0.05 * W).map(c => c[1]).sort((a, b) => a - b);
+  const D = conf.length >= 3 ? conf[(conf.length - 1) >> 1] : null;
+  const place = [], joins = [];
+  let end = 0;
+  runs.forEach((r, ri) => {
+    let off;
+    if (ri === 0) off = 0;
+    else {
+      const p = runs[ri - 1];
+      let [v, s] = cand[ri - 1];
+      if (D != null && Math.abs(s - D) > 0.03 * W) {
+        const [vD, sD] = mosRegister2(A(p), Bf(r), W, Math.max(smin, D - Math.round(0.03 * W)), Math.min(smax, D + Math.round(0.03 * W)));
+        if (vD >= 0.6 && vD >= v - 0.08) { v = vD; s = sD; }
+      }
+      const overlap = (W - s) / W;
+      const thr = D != null && Math.abs(s - D) <= 0.03 * W ? 0.6 : 0.65;
+      if (v >= thr && overlap >= 0.08) {
+        const so = mosRefine(p.last.zf, r.first.zf, OW, hc, Math.round(s * kk), rr);
+        off = place[ri - 1] + p.frames[p.frames.length - 1].x + so;
+        joins.push({ type: 'overlap', ncc: v, overlap, x: off });
+      } else {
+        off = end;
+        // 앞뒤 장면이 전혀 다르면(0.2초 사이에 바뀜) 페이지 전환 — 이어 붙이는 게 정상.
+        // 점프 스크롤(공통 폭이 있는 영상)이거나, 움직이는 구간 사이에 장면이 0.6초 넘게 비면 누락 의심
+        const moving = q => q.hi - q.lo - OW >= OW * 0.25;
+        const gapT = r.frames[0].t - p.frames[p.frames.length - 1].t;
+        joins.push({ type: 'append', ncc: v, x: off, suspect: D != null || ((moving(p) || moving(r)) && gapT > 0.6) });
+      }
+    }
+    place.push(off);
+    end = Math.max(end, off + r.hi);
+  });
+  const lo = Math.min(0, ...runs.map((r, i) => place[i] + r.lo));
+  return { place: place.map(p => p - lo), joins: joins.map(j => ({ ...j, x: j.x - lo })), total: Math.max(1, Math.ceil(end - lo)), D };
+}
+
+// 띠 그리기 → 청크(≤6000px) + 스트립 좌표↔시각 트랙
+function mosRender(col, pl, preproc) {
+  const { runs, OW, OH, dark, bg } = col;
+  const total = pl.total, B = MOS_BLOCK;
+  const CH = 6000, chunks = [], sb = col.screenBg;
+  for (let c0 = 0; c0 < total; c0 += CH) {
+    const cw = Math.min(CH, total - c0);
+    const buf = new Uint8Array(cw * OH).fill(bg);
+    runs.forEach((r, ri) => {
+      const base = Math.round(pl.place[ri]);
+      const clean = sb && r.static; // 정지 구간: 블록 좌표 → 화면 좌표가 고정이라 배경을 뺄 수 있다 (움직이는 구간은 중앙값이 이미 지움)
+      for (const [bi, blk] of r.blocks) {
+        const gx0 = base + bi * B;
+        if (gx0 + B <= c0 || gx0 >= c0 + cw) continue;
+        for (let xx = 0; xx < B; xx++) {
+          const lx = gx0 + xx - c0;
+          if (lx < 0 || lx >= cw) continue;
+          const wx = bi * B + xx - r.xr; // 화면(창) 안 x
+          for (let y = 0; y < OH; y++) {
+            let v = blk[y * B + xx];
+            if (clean && wx >= 0 && wx < OW && !sb.lineRow[y]) {
+              const vv = dark ? 255 - v : v, b = sb.bg[y * OW + wx];
+              if (Math.abs(vv - b) < 32 || vv > 200) v = bg; // 배경과 같은 픽셀 → 종이색
+            }
+            buf[y * cw + lx] = v;
+          }
+        }
+      }
+    });
+    if (dark) for (let p = 0; p < buf.length; p++) buf[p] = 255 - buf[p];
+    if (sb) mosTopHatClean(buf, cw, OH, Math.max(7, Math.round(col.hc / 6.6 * 1.2) | 1));
+    const c = document.createElement('canvas'); c.width = cw; c.height = OH;
+    const g = c.getContext('2d');
+    const im = g.createImageData(cw, OH);
+    for (let p = 0, i = 0; p < buf.length; p++, i += 4) { const v = buf[p]; im.data[i] = im.data[i + 1] = im.data[i + 2] = v; im.data[i + 3] = 255; }
+    g.putImageData(im, 0, 0);
+    if (preproc) scrollApplyPreprocInPlace(c, { ...preproc, invertMode: 'off', playheadRemove: false });
+    chunks.push(c);
+  }
+  // 시간: 정지 구간은 창 전체를 구간 시간에 비례 분배, 움직이는 구간은 창 가운데가 지나가는 시각
+  const pts = [];
+  runs.forEach((r, ri) => {
+    const base = pl.place[ri], f = r.frames, t0 = f[0].t, t1 = f[f.length - 1].t;
+    const s0 = base + r.lo, s1 = base + r.hi;
+    pts.push([s0, t0]);
+    if (r.hi - r.lo - OW >= OW * 0.25) for (const q of f) pts.push([base + q.x + OW / 2, q.t]);
+    pts.push([s1, t1]);
+  });
+  pts.sort((a, b) => a[0] - b[0]);
+  const T = [], S = [];
+  for (const [s, t] of pts) {
+    const k = T.length - 1;
+    if (k >= 0 && (t < T[k] || s <= S[k])) { if (t > T[k]) T[k] = t; continue; }
+    T.push(t); S.push(s);
+  }
+  if (!T.length) { T.push(0); S.push(0); }
+  const track = { t: T, X: S, k0: 0, k1: T.length - 1, totalW: total, nativeW: OW, barCols: [0, 0], staticRanges: [] };
+  return { chunks, totalW: total, H: OH, stats: {}, tFirst: T[0], track };
+}
+
+// 마디 삭제: 스트립 [a, b) 열을 잘라내고 트랙도 당긴다
+function mosCutStrip(result, a, b) {
+  a = Math.max(0, Math.round(a)); b = Math.min(result.totalW, Math.round(b));
+  if (b <= a) return result;
+  const builder = flowChunkBuilder(result.H, 6000);
+  let x = 0;
+  for (const c of result.chunks) {
+    const c0 = x, c1 = x + c.width;
+    if (a > c0) builder.append(c, 0, Math.min(c1, a) - c0);
+    if (b < c1) builder.append(c, Math.max(b, c0) - c0, c1 - Math.max(b, c0));
+    x = c1;
+  }
+  const chunks = builder.finish(), totalW = builder.total();
+  const T = [], S = [], tr = result.track;
+  tr.X.forEach((s, i) => {
+    if (s >= a && s < b) return;
+    const ns = s >= b ? s - (b - a) : s;
+    if (S.length && ns <= S[S.length - 1]) return;
+    T.push(tr.t[i]); S.push(ns);
+  });
+  if (!T.length) { T.push(0); S.push(0); }
+  return { ...result, chunks, totalW, track: { ...tr, t: T, X: S, k1: T.length - 1, totalW }, tFirst: T[0] };
+}
+
+function MosaicStep({ videoRef, onModeBack }) {
+  const [videoFile, setVideoFile] = useState(null);
+  const [videoLoaded, setVideoLoaded] = useState(false);
+  const [duration, setDuration] = useState(0);
+  const [rangeStart, setRangeStart] = useState(0);
+  const [rangeEnd, setRangeEnd] = useState(0);
+  const [roi, setRoi] = useState(null);
+  const [rate, setRate] = useState(4);
+  const [cleanBg, setCleanBg] = useState(true);
+  const [running, setRunning] = useState(false);
+  const [pct, setPct] = useState(0);
+  const [msg, setMsg] = useState('영상 파일을 선택하세요. TAB 영역은 자동으로 찾습니다.');
+  const [result, setResult] = useState(null);
+  const [info, setInfo] = useState(null);
+  const [hist, setHist] = useState({ past: [], future: [] });
+  const abortRef = useRef(false);
+  const bgSeekRef = useRef(false);
+
+  function handleFileChange(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const video = videoRef.current;
+    video.src = URL.createObjectURL(file);
+    setVideoLoaded(false); setRoi(null); setResult(null); setInfo(null); setHist({ past: [], future: [] });
+    setVideoFile(file);
+    video.onloadedmetadata = async () => {
+      setVideoLoaded(true);
+      setDuration(video.duration);
+      setRangeStart(0); setRangeEnd(video.duration);
+      setMsg('영상 로드됨: ' + video.duration.toFixed(1) + '초, ' + video.videoWidth + 'x' + video.videoHeight + '. TAB 영역을 찾는 중입니다 — 찾으면 "자동 추출"을 누르세요.');
+      await seekSafe(video, 0.001);
+      await seekTo(video, 0);
+    };
+  }
+
+  async function run() {
+    const video = videoRef.current;
+    if (!video || !roi) return;
+    abortRef.current = false;
+    setRunning(true); setPct(0); setResult(null); setInfo(null); setHist({ past: [], future: [] });
+    bgSeekRef.current = true;
+    const t0 = performance.now();
+    try {
+      setMsg('영상을 한 번 재생하며 장면을 맞추는 중...');
+      const col = await mosCollect(video, roi, {
+        rate, startT: rangeStart, endT: Math.max(rangeStart, rangeEnd - 0.02), abortRef,
+        onProgress: f => setPct(Math.round(f * 90)),
+      });
+      if (abortRef.current) { setMsg('중단됨'); return; }
+      if (!col.runs.length) { setMsg('악보 장면을 찾지 못했습니다 — TAB 영역을 다시 지정해 보세요.'); return; }
+      const t1 = performance.now();
+      const pl = mosPlace(col);
+      setPct(95);
+      await new Promise(r => setTimeout(r, 0));
+      const res = mosRender(col, pl, cleanBg ? DEFAULT_PREPROC : null);
+      const t2 = performance.now();
+      const nAppend = pl.joins.filter(j => j.type === 'append').length, nSuspect = pl.joins.filter(j => j.suspect).length;
+      setInfo({
+        frames: col.nFrames, blank: col.nBlank, runs: col.runs.length, overlap: pl.joins.length - nAppend, append: nAppend, suspect: nSuspect,
+        width: res.totalW, H: res.H, screenBg: col.screenBg ? Math.round(col.screenBg.busyFrac * 100) : 0, collectS: (t1 - t0) / 1000, buildS: (t2 - t1) / 1000, D: pl.D, dark: col.dark,
+        seams: pl.joins.map((j, i) => ({
+          j: i + 1, x: Math.round(j.x), suspect: !!j.suspect, manual: false,
+          tip: (j.type === 'overlap' ? '겹쳐 붙임 (겹침 ' + Math.round(j.overlap * 100) + '%' : j.suspect ? '이어 붙임 — 앞뒤 장면이 맞지 않음, 누락 의심 (' : '이어 붙임 — 페이지 전환 (') + ' · NCC ' + j.ncc.toFixed(2) + ')',
+        })),
+      });
+      setResult(res);
+      if (window.__mosDbg) window.__mosResult = { res, joins: pl.joins, runs: col.runs.map(r => ({ t0: r.frames[0].t, t1: r.frames[r.frames.length - 1].t, lo: r.lo, hi: r.hi })) };
+      setPct(100);
+      setMsg('완료: ' + ((t2 - t0) / 1000).toFixed(1) + '초');
+    } catch (err) {
+      setMsg('오류: ' + (err && err.message ? err.message : err));
+    } finally {
+      bgSeekRef.current = false;
+      setRunning(false);
+    }
+  }
+
+  // 마디 삭제 · 되돌리기 — 스냅샷 = { result, seams }
+  function onDeleteMeasure(a, b) {
+    if (!result || !info) return;
+    const cut = Math.round(b) - Math.round(a);
+    setHist({ past: [...hist.past, { result, seams: info.seams }], future: [] });
+    setResult(mosCutStrip(result, a, b));
+    setInfo({ ...info, seams: info.seams.filter(sm => sm.x < a || sm.x >= b).map(sm => (sm.x >= b ? { ...sm, x: sm.x - cut } : sm)) });
+  }
+  function undo() {
+    if (!hist.past.length) return;
+    const p = hist.past[hist.past.length - 1];
+    setHist({ past: hist.past.slice(0, -1), future: [{ result, seams: info.seams }, ...hist.future] });
+    setResult(p.result); setInfo({ ...info, seams: p.seams });
+  }
+  function redo() {
+    if (!hist.future.length) return;
+    const n = hist.future[0];
+    setHist({ past: [...hist.past, { result, seams: info.seams }], future: hist.future.slice(1) });
+    setResult(n.result); setInfo({ ...info, seams: n.seams });
+  }
+
+  return (
+    <div>
+      <div className="block">
+        <div className="block-head"><span>자동 (신규) — 영상 종류를 고르지 않고 한 번에 추출</span></div>
+        <p className="hint-text">
+          페이지 전환·스크롤·연속 이동·점프 스크롤이 섞여 있어도 같은 방식으로 처리합니다. 모든 장면을 "긴 악보 띠를 들여다보는 창"으로 보고,
+          장면끼리 가로 이동량을 맞춰 하나의 띠로 붙입니다. 영상은 한 번만 재생하며, 같은 자리를 비춘 여러 장면의 중앙값으로 재생바·스티커·잔상을 지웁니다.
+        </p>
+        <div className="controls">
+          <label>영상 파일: <input type="file" accept="video/*" onChange={handleFileChange} disabled={running} /></label>
+          <label>분석 배속:
+            <select value={rate} onChange={e => setRate(parseFloat(e.target.value))} disabled={running} style={{ width: 'auto', marginLeft: '6px' }}>
+              <option value="2">2배 (느린 PC)</option><option value="4">4배 (기본)</option><option value="8">8배 (빠름)</option>
+            </select>
+          </label>
+          <label><input type="checkbox" checked={cleanBg} onChange={e => setCleanBg(e.target.checked)} disabled={running} /> 배경 정리(흑백)</label>
+        </div>
+        <div className="slider-label" style={{ marginTop: '8px' }}>TAB 영역 — 자동으로 찾습니다(코드 다이어그램·가사 포함). 다르면 드래그로 다시 지정</div>
+        <ScrollRoiPicker videoRef={videoRef} videoLoaded={videoLoaded} roi={roi} setRoi={setRoi} suppressRef={bgSeekRef} />
+        {videoLoaded && (
+          <>
+            <div className="slider-label" style={{ marginTop: '8px' }}>추출 구간 — {rangeStart.toFixed(1)}s ~ {rangeEnd.toFixed(1)}s</div>
+            <MiniRangeTimeline duration={duration} start={rangeStart} end={rangeEnd} onChange={(a, b) => { if (!running) { setRangeStart(a); setRangeEnd(b); } }} />
+          </>
+        )}
+      </div>
+      <div className="toolbar">
+        <button className="icon-btn" onClick={onModeBack} disabled={running}>← 모드</button>
+        <button onClick={run} disabled={!videoLoaded || !roi || running}>{running ? '추출 중...' : '자동 추출'}</button>
+        {running && <button className="icon-btn" onClick={() => { abortRef.current = true; }}>중단</button>}
+        <span className="save-msg">{running ? msg + ' — ' + pct + '%' : msg}</span>
+      </div>
+      {running && (
+        <div style={{ height: '8px', background: 'var(--border)', borderRadius: '4px', overflow: 'hidden' }}>
+          <div style={{ width: pct + '%', height: '100%', background: 'var(--accent)' }} />
+        </div>
+      )}
+      {result && info && (
+        <div className="block">
+          <div className="block-head"><span>합쳐진 악보 띠</span></div>
+          <p className="hint-text">
+            장면 {info.frames}개 · 안정 구간 {info.runs}개 · 겹쳐 붙임 {info.overlap}곳 · 이어 붙임 {info.append}곳{info.suspect ? ' (그중 누락 의심 ' + info.suspect + '곳 — 띠 위 빨간 표시를 확인하세요)' : ''}
+            {info.D != null ? ' · 점프 폭 ' + Math.round(info.D / MOS_REG_W * 100) + '%' : ''}{info.screenBg ? ' · 화면 배경(그림) 제거' : ''} · {result.totalW}×{result.H}px ·
+            재생 {info.collectS.toFixed(1)}초 + 합치기 {info.buildS.toFixed(1)}초
+          </p>
+          <UniStage2 result={result} videoFile={videoFile} flowDefaults={DEFAULT_PREPROC}
+            editCtx={{ onDeleteMeasure, canUndo: hist.past.length > 0, onUndo: undo, canRedo: hist.future.length > 0, onRedo: redo, seams: info.seams }} />
+        </div>
+      )}
+    </div>
+  );
+}
+
 function App() {
   // 1단계: 모드 선택. 'page'(페이지 전환형, 기존 로직 그대로) | 'scroll'(스크롤형, 새 모드) | null(선택 전).
   const [mode, setMode] = useState(null);
@@ -9715,6 +10372,8 @@ function App() {
   const flowVideoRef = useRef(null);
   // 통합(자동 감지) 모드 전용 <video>
   const uniVideoRef = useRef(null);
+  // 자동(신규) 모드 전용 <video>
+  const mosVideoRef = useRef(null);
   const [flowDefaults, setFlowDefaults] = useState(SCROLL_DEFAULTS_INIT);
   const [scrollPhase, setScrollPhase] = useState('capture'); // 'capture' (2단계 수동 부분) | 'result' (4~5단계)
   const [scrollDefaults, setScrollDefaults] = useState(SCROLL_DEFAULTS_INIT);
@@ -9758,6 +10417,7 @@ function App() {
       <video ref={scrollVideoRef} muted className="hidden-video" />
       <video ref={flowVideoRef} muted playsInline className="hidden-video" />
       <video ref={uniVideoRef} muted playsInline className="hidden-video" />
+      <video ref={mosVideoRef} muted playsInline className="hidden-video" />
 
       <div className="titlebar">
         <h1>영상에서 TAB 추출</h1>
@@ -9766,8 +10426,8 @@ function App() {
 
       <div className="notice-banner">
         <div>
-          <b>안내:</b> <b>페이지 전환형</b>, <b>스크롤형</b>, <b>연속 이동형</b> TAB 영상과, 이 방식들이 섞인 영상(<b>통합 · 자동 감지</b>)을
-          지원합니다 (투명 오버레이형은 아직 지원하지 않습니다). 모든 처리는 이 브라우저 안에서만 이뤄지고, 영상이나 이미지를 서버로
+          <b>안내:</b> 처음이면 <b>자동 (신규)</b>를 쓰세요 — 영상 종류를 고르지 않고 한 번 재생으로 추출합니다. 기존 <b>페이지 전환형</b>, <b>스크롤형</b>, <b>연속 이동형</b>,
+          <b>통합 · 자동 감지</b> 모드도 그대로 있습니다 (투명 오버레이형은 아직 지원하지 않습니다). 모든 처리는 이 브라우저 안에서만 이뤄지고, 영상이나 이미지를 서버로
           전송하지 않습니다.
         </div>
       </div>
@@ -9776,6 +10436,12 @@ function App() {
         <div className="block">
           <div className="block-head"><span>1단계 — 영상 종류 선택</span></div>
           <p className="hint-text">영상이 어떤 방식으로 넘어가는지에 따라 처리 방식이 완전히 다릅니다 — 맞는 쪽을 골라주세요.</p>
+          <div className="mode-card-row" style={{ marginBottom: '10px' }}>
+            <button className="mode-card" onClick={() => setMode('mosaic')} style={{ borderColor: 'var(--accent)' }}>
+              <div className="mode-card-title">자동 (신규 · 추천)</div>
+              <div className="mode-card-desc">영상 종류를 고를 필요 없음 — 페이지 전환·스크롤·연속 이동·점프 스크롤을 한 번 재생으로 자동 처리</div>
+            </button>
+          </div>
           <div className="mode-card-row">
             <button className="mode-card" onClick={() => setMode('page')}>
               <div className="mode-card-title">페이지 전환형</div>
@@ -9851,6 +10517,9 @@ function App() {
         </React.Fragment>
       )}
 
+      {mode === 'mosaic' && (
+        <MosaicStep videoRef={mosVideoRef} onModeBack={() => setMode(null)} />
+      )}
       {mode === 'uni' && (
         <React.Fragment>
           <div className="step-nav">
