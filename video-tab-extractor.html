@@ -137,6 +137,16 @@
 .mos-ask-row .seg-btn:first-child { border-radius: 6px 0 0 6px; }
 .mos-ask-row .seg-btn:last-child { border-radius: 0 6px 6px 0; }
 .mos-ask-row .seg-btn.on { background: var(--accent); color: #fff; border-color: var(--accent); position: relative; z-index: 1; }
+.mos-scenes { margin: 6px 0 10px; }
+.mos-scenes > summary { cursor: pointer; font-weight: 600; font-size: 14px; padding: 4px 0; }
+.mos-scene-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; max-height: 520px; overflow: auto; padding: 2px; }
+.mos-scene { border: 1px solid var(--border); border-radius: 8px; padding: 6px; background: var(--panel, #fff); font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
+.mos-scene.off { opacity: .45; }
+.mos-scene img { width: 100%; height: 64px; object-fit: contain; object-position: left center; background: #fff; border-radius: 4px; }
+.mos-scene-head { display: flex; align-items: center; gap: 6px; }
+.mos-scene-head span { flex: 1; color: var(--muted, #666); }
+.mos-scene-ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.mos-scene-ctl select { width: auto; font-size: 12px; padding: 2px 4px; }
 </style>
 </head>
 <body>
@@ -922,12 +932,16 @@ function waitForFramePresented(video) {
 let seekCounter = 0; // 스크롤 모드 단계별 계측용 (seek 횟수)
 function seekTo(video, t) {
   seekCounter++;
+  // 영상 맨 끝으로의 이동은 일부 브라우저(사파리)·파일에서 'seeked'가 오지 않아 분석이 영영 멈췄다 →
+  // 끝에서 0.05초 앞까지만 이동하고, 4초 안에 응답이 없으면 그냥 다음으로 넘어간다
+  const d = video.duration;
+  if (isFinite(d) && d > 0.1) t = Math.min(t, d - 0.05);
   return new Promise(resolve => {
-    const onSeeked = () => {
-      video.removeEventListener('seeked', onSeeked);
-      waitForFramePresented(video).then(resolve);
-    };
+    let done = false;
+    const end = () => { if (done) return; done = true; video.removeEventListener('seeked', onSeeked); resolve(); };
+    const onSeeked = () => { waitForFramePresented(video).then(end); };
     video.addEventListener('seeked', onSeeked);
+    setTimeout(end, 4000);
     video.currentTime = t;
   });
 }
@@ -5992,24 +6006,56 @@ function flowYield() { return new Promise(r => setTimeout(r, 0)); }
 // 순차 재생 기반 프레임 수집 — requestVideoFrameCallback으로 프레임이 실제로 표시될 때마다 호출되며 미디어 시간
 // 간격 ≥ minGap인 프레임만 onFrame(mediaTime)으로 넘긴다(seek 금지: 시작 위치를 잡을 때 한 번만 seek).
 // 미지원 브라우저는 기존 seek 방식으로 폴백한다.
-async function flowPlayPass(video, { startT, endT, rate, minGap, onFrame, onProgress, abortRef, maxRate }) {
+// 분석용 재생 패스 (모든 모드 공통)
+//  - 탭이 가려지면(다른 탭·창 최소화) 브라우저가 영상을 멈추거나 프레임을 주지 않는다(사파리·크롬 모두).
+//    → 가려지는 즉시 일시정지하고, 돌아오면 마지막으로 읽은 시점부터 이어서 재생한다. onPause(true/false)로 화면에 알린다.
+//  - 감시: 보이는 상태에서 3초 넘게 프레임이 안 오면 다시 재생, 그래도 안 되면 조금 건너뛴다. 끝 근처면 끝낸다 (멈춤 방지)
+//  - 배속 자동 조절: 장면 간격이 목표(minGap)의 2배를 넘으면(4K 등 디코딩이 못 따라감) 배속을 낮춘다
+//  - stats: { pauses, stalls, rateChanges:[{t, rate}], gaps }
+function flowPauseNotice(on) {
+  let el = document.getElementById('analysis-pause-notice');
+  if (on) {
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'analysis-pause-notice';
+      el.style.cssText = 'position:fixed;left:50%;top:12px;transform:translateX(-50%);z-index:9999;background:#b45309;color:#fff;padding:10px 16px;border-radius:8px;font-size:14px;box-shadow:0 4px 14px rgba(0,0,0,.25);max-width:90vw;text-align:center';
+      document.body.appendChild(el);
+    }
+    el.textContent = '다른 탭으로 이동해 분석을 일시정지했습니다 — 이 탭에서 이어서 진행합니다';
+    el.style.display = 'block';
+    clearTimeout(el._t); el._t = setTimeout(() => { el.style.display = 'none'; }, 6000);
+  } else if (el) {
+    el.textContent = '분석을 이어서 진행합니다';
+    clearTimeout(el._t); el._t = setTimeout(() => { el.style.display = 'none'; }, 2500);
+  }
+}
+async function flowPlayPass(video, { startT, endT, rate, minGap, onFrame, onProgress, abortRef, maxRate, onPause, stats }) {
+  onPause = onPause || flowPauseNotice;
   const span = Math.max(0.001, endT - startT);
+  const st = stats || {};
+  st.pauses = 0; st.stalls = 0; st.rateChanges = []; st.frames = 0;
   if (!flowRvfcSupported(video)) {
     for (let t = startT; t <= endT && !(abortRef && abortRef.current); t += minGap) {
       await seekTo(video, t);
-      onFrame(t);
+      onFrame(t); st.frames++;
       if (onProgress) onProgress((t - startT) / span);
     }
     return;
   }
   video.muted = true;
-  video.playbackRate = Math.max(0.25, Math.min(maxRate || 3, rate || 1));
+  let curRate = Math.max(0.25, Math.min(maxRate || 3, rate || 1));
+  video.playbackRate = curRate;
+  st.rateChanges.push({ t: startT, rate: curRate });
   flowInternalPlayRef.current = true; // 분석 패스의 내부 재생 — play 가드가 막지 않게 한다
   let failure = null;
+  let onVis = null, watchdog = null;
   try {
     await seekSafe(video, startT);
     await new Promise(resolve => {
-      let last = -Infinity, done = false;
+      let last = -Infinity, done = false, hiddenPaused = false, resuming = false;
+      let lastCbWall = performance.now(), stallTries = 0, pending = false;
+      const gaps = [];
+      const req = () => { if (!pending && !done) { pending = true; video.requestVideoFrameCallback(cb); } };
       const finish = () => {
         if (done) return;
         done = true;
@@ -6018,23 +6064,75 @@ async function flowPlayPass(video, { startT, endT, rate, minGap, onFrame, onProg
         resolve();
       };
       video.addEventListener('ended', finish);
-      const cb = (now, meta) => {
+      const resumeFrom = async t => {
+        if (done || resuming) return;
+        resuming = true;
+        try {
+          await seekSafe(video, Math.max(startT, t));
+          video.playbackRate = curRate;
+          req();
+          await video.play().catch(() => {});
+          lastCbWall = performance.now();
+        } finally { resuming = false; }
+      };
+      onVis = () => {
         if (done) return;
+        if (document.hidden) {
+          if (!hiddenPaused) { hiddenPaused = true; st.pauses++; video.pause(); onPause && onPause(true); }
+        } else if (hiddenPaused) {
+          hiddenPaused = false; onPause && onPause(false);
+          resumeFrom(last > -Infinity ? last : startT);
+        }
+      };
+      document.addEventListener('visibilitychange', onVis);
+      watchdog = setInterval(() => {
+        if (done || hiddenPaused || resuming) return;
         if (abortRef && abortRef.current) { finish(); return; }
+        if (performance.now() - lastCbWall < 3000) return;
+        const t = Math.max(last, video.currentTime || 0);
+        if (t >= endT - 0.5 || video.ended) { finish(); return; } // 끝 근처에서 멈춤 → 끝낸다
+        st.stalls++;
+        stallTries++;
+        if (stallTries > 4) { finish(); return; }
+        // 1·2회: 그 자리에서 다시 재생, 3회 이상: 조금 건너뛰어 재생
+        resumeFrom(stallTries <= 2 ? t : t + minGap * 2 * stallTries);
+      }, 1000);
+      const cb = (now, meta) => {
+        pending = false;
+        if (done) return;
+        lastCbWall = performance.now();
+        if (abortRef && abortRef.current) { finish(); return; }
+        if (hiddenPaused) return;
         const t = meta.mediaTime;
         if (t - last >= minGap) {
+          if (last > -Infinity && t > last) {
+            gaps.push(t - last);
+            if (gaps.length >= 12) {
+              const g = gaps.slice().sort((x, y) => x - y)[gaps.length >> 1];
+              gaps.length = 0;
+              if (g > minGap * 2 && curRate > 1) {
+                curRate = Math.max(1, Math.round(curRate * 0.7 * 10) / 10);
+                video.playbackRate = curRate;
+                st.rateChanges.push({ t, rate: curRate });
+              }
+            }
+          }
           last = t;
-          try { onFrame(t); } catch (err) { failure = err; finish(); return; }
+          stallTries = 0;
+          try { onFrame(t); st.frames++; } catch (err) { failure = err; finish(); return; }
           if (onProgress) onProgress(Math.min(1, (t - startT) / span));
         }
         if (t >= endT) { finish(); return; }
-        video.requestVideoFrameCallback(cb);
+        req();
       };
-      video.requestVideoFrameCallback(cb);
-      video.play().catch(err => { failure = err; finish(); });
+      req();
+      if (document.hidden) { hiddenPaused = true; st.pauses++; onPause && onPause(true); }
+      else video.play().catch(err => { failure = err; finish(); });
     });
   } finally {
     // 정상 종료·에러·취소 모두 항상 복구
+    if (onVis) document.removeEventListener('visibilitychange', onVis);
+    if (watchdog) clearInterval(watchdog);
     flowInternalPlayRef.current = false;
     video.pause(); video.muted = true; video.playbackRate = 1;
   }
@@ -9985,7 +10083,10 @@ function mosTopHatClean(buf, w, h, k) {
 }
 
 // 한 번 재생하면서 장면을 모으고 구간(run)을 만든다. 반환: 구간 목록 + 렌더된 블록
-async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress, motion }) {
+let mosRunSeq = 0;
+// strict: 장면 나누기(사용자가 "이 장면 나누기")용 — 정지 장면에서 조금만 달라져도 새 장면으로 본다
+// diag: 진단 기록 배열 — 장면마다 [시각, 저해상도 일치, 이동, 고해상도 일치, 코드줄 일치, 판정] (판정: J 이어짐, N 새 장면, B 빈 화면)
+async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress, motion, strict, forceDark, diag, stats }) {
   const vw = video.videoWidth, vh = video.videoHeight;
   const { rx0, ry0, rw, rh } = roiRectPx(video, roi);
   const OW = Math.max(64, Math.min(MOS_OUT_W, Math.round(rw)));
@@ -10009,8 +10110,9 @@ async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress
     for (let i = 0; i < d.length; i += 4 * 7) bandVals.push(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
   }
   bandVals.sort((a, b) => a - b);
-  const dark = bandVals.length ? bandVals[bandVals.length >> 1] < 128 : false;
+  const dark = forceDark != null ? forceDark : bandVals.length ? bandVals[bandVals.length >> 1] < 128 : false;
   const bg = dark ? 0 : 255;
+  const D3 = x => Math.round(x * 1000) / 1000;
 
   const runs = [];
   let cur = null, prev = null, nFrames = 0, nBlank = 0, bgSamples = [];
@@ -10054,7 +10156,7 @@ async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress
     nFrames++;
     const inkC = mosInk(d, OW, cy0, cy1, dark);
     const lowR = mosDown(inkC, OW, hc, W, hl);
-    if (lowR.frac < 0.001) { nBlank++; flushRun(true); prev = null; return; }
+    if (lowR.frac < 0.001) { nBlank++; flushRun(true); prev = null; if (diag) diag.push([D3(t), null, null, null, null, 'B']); return; }
     const full = mosDown(mosInk(d, OW, 0, OH, dark), OW, OH, W, hf).z;
     // 오선 띠 바깥(코드 이름·마디 번호·가사)만 남긴 지도 — 반복되는 마디 패턴과 달리 마디마다 다르다
     const ext = full.slice(), ey0 = Math.floor(cy0 * hf / OH), ey1 = Math.ceil(cy1 * hf / OH);
@@ -10062,7 +10164,7 @@ async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress
     const fr = { t, low: lowR.z, full, ext, zf: mosZeroMean(inkC, OW, hc) };
     const gray = new Uint8Array(OW * OH);
     for (let i = 0, p = 0; p < gray.length; i += 4, p++) gray[p] = (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]) | 0;
-    let joined = false;
+    let joined = false, dv = null, ds = null, dref = null, de = null;
     if (cur && prev) {
       const dt = Math.max(0.05, t - prev.t), gapK = Math.max(1, dt / 0.2);
       const pred = cur.vel != null ? cur.vel * dt : null; // 저해상도 px
@@ -10076,10 +10178,12 @@ async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress
       // 같은 장면인지 오선 띠만으로 판단하면, 리듬(스트로크 표시)이 같은 다른 페이지가 "같은 장면"으로 묶여 겹쳐 그려진다.
       // 띠 바깥(코드 이름·가사)도 같은 이동량에서 맞아야 같은 장면으로 본다
       let same = v >= MOS_RUN_NCC && !sudden;
+      dv = v; ds = s;
       if (same) {
         const e = mosNcc(prev.ext, fr.ext, W, hf, s);
+        de = e;
         // 정지 장면만 — 움직이는 영상은 제목·로고처럼 화면에 고정된 글자가 띠 바깥에 있어 값이 원래 낮다
-        if (Math.abs(s) < 0.02 * W && e > -1 && e < 0.5) same = false;
+        if (Math.abs(s) < 0.02 * W && e > -1 && e < (strict ? 0.8 : 0.5)) same = false;
       }
       // 출력 해상도(숫자 하나하나가 보이는 해상도)에서도 맞아야 같은 장면. 저해상도에선 리듬 기둥·오선이 같은 다른 페이지가 0.9 넘게 나온다.
       // 실측(소수빈 영상): 같은 페이지 0.90~1.0, 페이지가 바뀐 순간 0.73~0.74
@@ -10089,7 +10193,8 @@ async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress
         const hist = cur.vr || [];
         const medv = hist.length >= 3 ? hist.slice().sort((a, b) => a - b)[hist.length >> 1] : 1;
         // 정지 장면(이동 2% 미만)에서만 적용 — 움직이는 장면은 흔들림·번짐으로 원래 값이 낮다
-        if (Math.abs(ref[1]) < 0.02 * OW && ref[0] < 0.82 && ref[0] < medv - 0.1) same = false;
+        dref = ref[0];
+        if (Math.abs(ref[1]) < 0.02 * OW && (strict ? ref[0] < Math.max(0.88, medv - 0.04) : ref[0] < 0.82 && ref[0] < medv - 0.1)) same = false;
       }
       if (same) {
         const so = ref[1];
@@ -10108,21 +10213,25 @@ async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress
     }
     if (!joined) {
       flushRun(true);
-      cur = { frames: [{ t, x: 0 }], keys: [{ x: 0, t, gray }], pend: null, blocks: new Map(), first: fr, last: fr, nextBlock: null, vel: null };
+      cur = { id: ++mosRunSeq, frames: [{ t, x: 0 }], keys: [{ x: 0, t, gray }], pend: null, blocks: new Map(), first: fr, last: fr, nextBlock: null, vel: null };
     }
+    if (diag) diag.push([D3(t), dv == null ? null : D3(dv), ds, dref == null ? null : D3(dref), de == null ? null : D3(de), joined ? 'J' : 'N']);
     prev = fr;
   };
   await flowPlayPass(video, {
     startT, endT, rate, maxRate: rate, minGap: 1 / MOS_FPS - 0.01, onFrame,
-    onProgress: f => onProgress && onProgress(f), abortRef,
+    onProgress: f => onProgress && onProgress(f), abortRef, stats,
   });
   flushRun(true);
   return { runs, OW, OH, hc, hl, hf, W, kk, rr, dark, bg, nFrames, nBlank, screenBg: mosScreenBackground(bgSamples, OW, OH, dark) };
 }
 
 // 구간 사이 맞대기 → 띠 위 배치
-function mosPlace(col, motion) {
-  const { runs, OW, hc, hl, hf, W, kk, rr } = col;
+// edits(사용자 손질): { excluded: {runId: true}, mode: {runId: 'append' | 'overlap'} } — mode는 "앞 장면과 어떻게 붙일지"
+function mosPlace(col, motion, edits) {
+  const { OW, hc, hl, hf, W, kk, rr } = col;
+  const ex = (edits && edits.excluded) || {}, md = (edits && edits.mode) || {};
+  const runs = col.runs.filter(r => !ex[r.id]);
   // 겹침 8% 미만은 찾지 않는다 — 좁은 띠끼리는 우연히 NCC가 높게 나와 진짜 겹침(30~60%)을 이기고 "이어 붙임 + 중복"이 된다
   const smin = -Math.round(0.02 * W), smax = Math.round(0.92 * W);
   const A = r => ({ low: r.last.low, full: r.last.full, ext: r.last.ext, hl, hf }), Bf = r => ({ low: r.first.low, full: r.first.full, ext: r.first.ext, hl, hf });
@@ -10149,29 +10258,33 @@ function mosPlace(col, motion) {
       // — 반복 페이지가 많은 페이지 전환 영상에서 다른 페이지가 위에 겹쳐 그려지던 문제
       const extOk = e <= -1 || e >= 0.5;
       const strongEnough = overlap < 0.85 || v >= 0.88;
-      if (v >= thr && overlap >= 0.08 && extOk && strongEnough && (motion !== 'page' || (overlap >= 0.95 && v >= 0.9))) {
+      const autoOverlap = v >= thr && overlap >= 0.08 && extOk && strongEnough && (motion !== 'page' || (overlap >= 0.95 && v >= 0.9));
+      const want = md[r.id] === 'overlap' ? true : md[r.id] === 'append' ? false : autoOverlap;
+      if (want) {
         const so = mosRefine(p.last.zf, r.first.zf, OW, hc, Math.round(s * kk), rr);
         off = place[ri - 1] + p.frames[p.frames.length - 1].x + so;
-        joins.push({ type: 'overlap', ncc: v, overlap, x: off });
+        joins.push({ type: 'overlap', ncc: v, overlap, x: off, runId: r.id, manual: !!md[r.id], auto: autoOverlap ? 'overlap' : 'append' });
       } else {
         off = end;
         // 앞뒤 장면이 전혀 다르면(0.2초 사이에 바뀜) 페이지 전환 — 이어 붙이는 게 정상.
         // 점프 스크롤(공통 폭이 있는 영상)이거나, 움직이는 구간 사이에 장면이 0.6초 넘게 비면 누락 의심
         const moving = q => q.hi - q.lo - OW >= OW * 0.25;
         const gapT = r.frames[0].t - p.frames[p.frames.length - 1].t;
-        joins.push({ type: 'append', ncc: v, x: off, suspect: D != null || ((moving(p) || moving(r)) && gapT > 0.6) });
+        joins.push({ type: 'append', ncc: v, x: off, runId: r.id, manual: !!md[r.id], auto: autoOverlap ? 'overlap' : 'append',
+          suspect: !md[r.id] && (D != null || ((moving(p) || moving(r)) && gapT > 0.6)) });
       }
     }
     place.push(off);
     end = Math.max(end, off + r.hi);
   });
   const lo = Math.min(0, ...runs.map((r, i) => place[i] + r.lo));
-  return { place: place.map(p => p - lo), joins: joins.map(j => ({ ...j, x: j.x - lo })), total: Math.max(1, Math.ceil(end - lo)), D };
+  return { runs, place: place.map(p => p - lo), joins: joins.map(j => ({ ...j, x: j.x - lo })), total: Math.max(1, Math.ceil(end - lo)), D };
 }
 
 // 띠 그리기 → 청크(≤6000px) + 스트립 좌표↔시각 트랙
 function mosRender(col, pl, preproc) {
-  const { runs, OW, OH, dark, bg } = col;
+  const { OW, OH, dark, bg } = col;
+  const runs = pl.runs || col.runs;
   const total = pl.total, B = MOS_BLOCK;
   const CH = 6000, chunks = [], sb = col.screenBg;
   for (let c0 = 0; c0 < total; c0 += CH) {
@@ -10229,6 +10342,27 @@ function mosRender(col, pl, preproc) {
   return { chunks, totalW: total, H: OH, stats: {}, tFirst: T[0], track };
 }
 
+// 장면 하나의 미리보기(가로로 긴 작은 그림) — 장면 목록에서 손으로 고칠 때 쓴다
+function mosRunThumb(col, r, h) {
+  const B = MOS_BLOCK, OH = col.OH, sc = h / OH;
+  const b0 = Math.floor(r.lo / B), b1 = Math.ceil(r.hi / B), w = (b1 - b0) * B;
+  const c = document.createElement('canvas'); c.width = w; c.height = OH;
+  const g = c.getContext('2d'), im = g.createImageData(w, OH);
+  im.data.fill(255);
+  for (const [bi, blk] of r.blocks) {
+    const x0 = (bi - b0) * B;
+    if (x0 < 0 || x0 >= w) continue;
+    for (let y = 0; y < OH; y++) for (let xx = 0; xx < B; xx++) {
+      let v = blk[y * B + xx]; if (col.dark) v = 255 - v;
+      const i = (y * w + x0 + xx) * 4; im.data[i] = im.data[i + 1] = im.data[i + 2] = v;
+    }
+  }
+  g.putImageData(im, 0, 0);
+  const o = document.createElement('canvas'); o.width = Math.max(1, Math.round(w * sc)); o.height = Math.round(h);
+  const og = o.getContext('2d'); og.imageSmoothingQuality = 'high'; og.drawImage(c, 0, 0, o.width, o.height);
+  return o.toDataURL('image/png');
+}
+
 // 마디 삭제: 스트립 [a, b) 열을 잘라내고 트랙도 당긴다
 function mosCutStrip(result, a, b) {
   a = Math.max(0, Math.round(a)); b = Math.min(result.totalW, Math.round(b));
@@ -10275,6 +10409,12 @@ function MosaicStep({ videoRef, onModeBack }) {
   const [hist, setHist] = useState({ past: [], future: [] });
   const abortRef = useRef(false);
   const bgSeekRef = useRef(false);
+  // 손으로 고치기: 마지막 분석 결과(장면 목록)와 사용자 손질
+  const colRef = useRef(null);
+  const [edits, setEdits] = useState({ excluded: {}, mode: {} });
+  const [sceneList, setSceneList] = useState(null); // [{id, t0, t1, thumb, join, auto, excluded}]
+  const [paused, setPaused] = useState(false);
+  const diagRef = useRef(null);
   const [seekT, setSeekT] = useState(0);
   const seekTRef = useRef(0), seekPendingRef = useRef(false), runningRef = useRef(false);
   useEffect(() => { runningRef.current = running; }, [running]);
@@ -10304,6 +10444,8 @@ function MosaicStep({ videoRef, onModeBack }) {
     setVideoFile(file);
     video.onloadedmetadata = async () => {
       setVideoLoaded(true);
+      // 4K처럼 큰 영상은 브라우저가 빠른 재생을 따라가지 못해 장면을 놓친다 → 2배로 시작 (분석 중에도 못 따라가면 자동으로 더 낮춘다)
+      if (video.videoHeight > 1300) setRate(2);
       setDuration(video.duration);
       setRangeStart(0); setRangeEnd(video.duration);
       setSeekT(0); seekTRef.current = 0;
@@ -10313,46 +10455,135 @@ function MosaicStep({ videoRef, onModeBack }) {
     };
   }
 
+  // 장면 목록 + 사용자 손질 → 배치 → 띠 그리기 → 화면 갱신
+  function build(col, ed, timing) {
+    const pl = mosPlace(col, askMotion, ed);
+    const res = mosRender(col, pl, cleanBg ? DEFAULT_PREPROC : null);
+    const nAppend = pl.joins.filter(j => j.type === 'append').length, nSuspect = pl.joins.filter(j => j.suspect).length;
+    setInfo(prev => ({
+      ...(prev || {}), ...(timing || {}),
+      frames: col.nFrames, blank: col.nBlank, runs: pl.runs.length, overlap: pl.joins.length - nAppend, append: nAppend, suspect: nSuspect,
+      width: res.totalW, H: res.H, screenBg: col.screenBg ? Math.round(col.screenBg.busyFrac * 100) : 0, D: pl.D, dark: col.dark,
+      seams: pl.joins.map((j, i) => ({
+        j: i + 1, x: Math.round(j.x), suspect: !!j.suspect, manual: !!j.manual,
+        tip: (j.manual ? '[직접 지정] ' : '') + (j.type === 'overlap' ? '겹쳐 붙임 (겹침 ' + Math.round(j.overlap * 100) + '%' : j.suspect ? '이어 붙임 — 앞뒤 장면이 맞지 않음, 누락 의심 (' : '이어 붙임 — 페이지 전환 (') + ' · NCC ' + j.ncc.toFixed(2) + ')',
+      })),
+    }));
+    setResult(res);
+    setHist({ past: [], future: [] });
+    const jById = {};
+    pl.joins.forEach(j => { jById[j.runId] = j; });
+    setSceneList(col.runs.map(r => ({
+      id: r.id, t0: r.frames[0].t, t1: r.frames[r.frames.length - 1].t,
+      thumb: r._thumb || (r._thumb = mosRunThumb(col, r, 64)),
+      join: jById[r.id] ? jById[r.id].type : null, auto: jById[r.id] ? jById[r.id].auto : null,
+      excluded: !!(ed.excluded || {})[r.id], mode: (ed.mode || {})[r.id] || 'auto',
+    })));
+    if (window.__mosDbg) window.__mosResult = { res, joins: pl.joins, runs: pl.runs.map(r => ({ t0: r.frames[0].t, t1: r.frames[r.frames.length - 1].t, lo: r.lo, hi: r.hi })) };
+    if (diagRef.current) diagRef.current.result = {
+      runs: col.runs.map(r => ({ id: r.id, t0: r.frames[0].t, t1: r.frames[r.frames.length - 1].t, n: r.frames.length, lo: r.lo, hi: r.hi, static: r.static })),
+      joins: pl.joins.map(j => ({ runId: j.runId, type: j.type, auto: j.auto, ncc: Math.round(j.ncc * 1000) / 1000, overlap: j.overlap, manual: j.manual })),
+      D: pl.D, width: res.totalW, H: res.H, edits: ed,
+    };
+    return res;
+  }
+
   async function run() {
     const video = videoRef.current;
     if (!video || !roi) return;
     abortRef.current = false;
-    setRunning(true); setPct(0); setResult(null); setInfo(null); setHist({ past: [], future: [] });
+    setRunning(true); setPct(0); setResult(null); setInfo(null); setSceneList(null); setHist({ past: [], future: [] });
+    const ed0 = { excluded: {}, mode: {} };
+    setEdits(ed0); colRef.current = null;
     bgSeekRef.current = true;
     const t0 = performance.now();
+    const stats = {}, diag = [];
+    diagRef.current = {
+      app: 'video-tab-extractor 자동(신규)', when: new Date().toISOString(), ua: navigator.userAgent,
+      video: { name: videoFile && videoFile.name, size: videoFile && videoFile.size, w: video.videoWidth, h: video.videoHeight, dur: video.duration },
+      roi, rate, range: [rangeStart, rangeEnd], answers: { above: askAbove, below: askBelow, motion: askMotion }, cleanBg,
+      play: stats, frames: diag,
+    };
+    const baseTitle = document.title;
     try {
-      setMsg('영상을 한 번 재생하며 장면을 맞추는 중...');
+      setMsg('영상을 한 번 재생하며 장면을 맞추는 중... (이 탭을 열어 두세요 — 다른 탭으로 가면 일시정지됩니다)');
       const col = await mosCollect(video, roi, {
-        rate, startT: rangeStart, endT: Math.max(rangeStart, rangeEnd - 0.02), abortRef, motion: askMotion,
-        onProgress: f => setPct(Math.round(f * 90)),
+        rate, startT: rangeStart, endT: Math.max(rangeStart, rangeEnd - 0.02), abortRef, motion: askMotion, diag, stats,
+        onProgress: f => { const p = Math.round(f * 90); setPct(p); document.title = '(' + p + '%) ' + baseTitle; },
       });
-      if (abortRef.current) { setMsg('중단됨'); return; }
+      diagRef.current.collect = { frames: col.nFrames, blank: col.nBlank, runs: col.runs.length, OW: col.OW, OH: col.OH, dark: col.dark, screenBg: !!col.screenBg, ms: Math.round(performance.now() - t0) };
+      if (abortRef.current) { setMsg('중단됨 — "진단 파일 받기"로 지금까지의 기록을 받을 수 있습니다'); return; }
       if (!col.runs.length) { setMsg('악보 장면을 찾지 못했습니다 — TAB 영역을 다시 지정해 보세요.'); return; }
       const t1 = performance.now();
-      const pl = mosPlace(col, askMotion);
       setPct(95);
       await new Promise(r => setTimeout(r, 0));
-      const res = mosRender(col, pl, cleanBg ? DEFAULT_PREPROC : null);
-      const t2 = performance.now();
-      const nAppend = pl.joins.filter(j => j.type === 'append').length, nSuspect = pl.joins.filter(j => j.suspect).length;
-      setInfo({
-        frames: col.nFrames, blank: col.nBlank, runs: col.runs.length, overlap: pl.joins.length - nAppend, append: nAppend, suspect: nSuspect,
-        width: res.totalW, H: res.H, screenBg: col.screenBg ? Math.round(col.screenBg.busyFrac * 100) : 0, collectS: (t1 - t0) / 1000, buildS: (t2 - t1) / 1000, D: pl.D, dark: col.dark,
-        seams: pl.joins.map((j, i) => ({
-          j: i + 1, x: Math.round(j.x), suspect: !!j.suspect, manual: false,
-          tip: (j.type === 'overlap' ? '겹쳐 붙임 (겹침 ' + Math.round(j.overlap * 100) + '%' : j.suspect ? '이어 붙임 — 앞뒤 장면이 맞지 않음, 누락 의심 (' : '이어 붙임 — 페이지 전환 (') + ' · NCC ' + j.ncc.toFixed(2) + ')',
-        })),
-      });
-      setResult(res);
-      if (window.__mosDbg) window.__mosResult = { res, joins: pl.joins, runs: col.runs.map(r => ({ t0: r.frames[0].t, t1: r.frames[r.frames.length - 1].t, lo: r.lo, hi: r.hi })) };
+      colRef.current = col;
+      build(col, ed0, { collectS: (t1 - t0) / 1000 });
+      const buildS = (performance.now() - t1) / 1000;
+      setInfo(prev => ({ ...(prev || {}), buildS }));
       setPct(100);
-      setMsg('완료: ' + ((t2 - t0) / 1000).toFixed(1) + '초');
+      const slow = stats.rateChanges && stats.rateChanges.length > 1 ? ' · 영상이 커서 배속을 ' + stats.rateChanges[stats.rateChanges.length - 1].rate + '배로 낮춤' : '';
+      const pz = stats.pauses ? ' · 일시정지 ' + stats.pauses + '번' : '';
+      setMsg('완료: ' + ((performance.now() - t0) / 1000).toFixed(1) + '초' + slow + pz);
     } catch (err) {
-      setMsg('오류: ' + (err && err.message ? err.message : err));
+      setMsg('오류: ' + (err && err.message ? err.message : err) + ' — "진단 파일 받기"로 기록을 받아 보내주세요');
+      if (diagRef.current) diagRef.current.error = String(err && err.stack || err);
     } finally {
+      document.title = baseTitle;
       bgSeekRef.current = false;
       setRunning(false);
     }
+  }
+
+  // 손으로 고치기
+  function applyEdits(next) {
+    setEdits(next);
+    if (colRef.current) build(colRef.current, next);
+  }
+  function toggleExclude(id) {
+    const ex = { ...edits.excluded };
+    if (ex[id]) delete ex[id]; else ex[id] = true;
+    applyEdits({ ...edits, excluded: ex });
+  }
+  function setJoinMode(id, m) {
+    const mode = { ...edits.mode };
+    if (m === 'auto') delete mode[id]; else mode[id] = m;
+    applyEdits({ ...edits, mode });
+  }
+  // 장면 나누기: 그 시간만 다시 재생하며, 조금만 달라져도 새 장면으로 나눈다 (두 페이지가 한 장면으로 묶였을 때)
+  async function splitScene(id) {
+    const col = colRef.current, video = videoRef.current;
+    if (!col || !video) return;
+    const idx = col.runs.findIndex(r => r.id === id);
+    if (idx < 0) return;
+    const r = col.runs[idx];
+    abortRef.current = false;
+    setRunning(true); bgSeekRef.current = true;
+    setMsg('장면 ' + (idx + 1) + ' 다시 읽는 중...');
+    try {
+      const sub = await mosCollect(video, roi, {
+        rate: Math.min(rate, 2), startT: Math.max(0, r.frames[0].t - 0.05), endT: r.frames[r.frames.length - 1].t + 0.05,
+        abortRef, motion: askMotion, strict: true, forceDark: col.dark,
+      });
+      if (sub.runs.length < 2) { setMsg('장면 ' + (idx + 1) + '은 더 나눌 수 없었습니다 (한 장면으로 보입니다)'); return; }
+      col.runs.splice(idx, 1, ...sub.runs);
+      build(col, edits);
+      setMsg('장면 ' + (idx + 1) + '을 ' + sub.runs.length + '개로 나눴습니다');
+    } catch (err) {
+      setMsg('나누기 오류: ' + (err && err.message ? err.message : err));
+    } finally {
+      bgSeekRef.current = false; setRunning(false);
+    }
+  }
+  function downloadDiag() {
+    const d = diagRef.current;
+    if (!d) return;
+    const blob = new Blob([JSON.stringify(d)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'tab-auto-diagnostic-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   }
 
   // 마디 삭제 · 되돌리기 — 스냅샷 = { result, seams }
@@ -10435,6 +10666,7 @@ function MosaicStep({ videoRef, onModeBack }) {
         <button className="icon-btn" onClick={onModeBack} disabled={running}>← 모드</button>
         <button onClick={run} disabled={!videoLoaded || !roi || running}>{running ? '추출 중...' : '자동 추출'}</button>
         {running && <button className="icon-btn" onClick={() => { abortRef.current = true; }}>중단</button>}
+        {!running && diagRef.current && <button className="icon-btn" onClick={downloadDiag} title="문제가 있을 때 이 파일을 보내주시면 같은 상황을 재현할 수 있습니다">진단 파일 받기</button>}
         <span className="save-msg">{running ? msg + ' — ' + pct + '%' : msg}</span>
       </div>
       {running && (
@@ -10448,8 +10680,41 @@ function MosaicStep({ videoRef, onModeBack }) {
           <p className="hint-text">
             장면 {info.frames}개 · 안정 구간 {info.runs}개 · 겹쳐 붙임 {info.overlap}곳 · 이어 붙임 {info.append}곳{info.suspect ? ' (그중 누락 의심 ' + info.suspect + '곳 — 띠 위 빨간 표시를 확인하세요)' : ''}
             {info.D != null ? ' · 점프 폭 ' + Math.round(info.D / MOS_REG_W * 100) + '%' : ''}{info.screenBg ? ' · 화면 배경(그림) 제거' : ''} · {result.totalW}×{result.H}px ·
-            재생 {info.collectS.toFixed(1)}초 + 합치기 {info.buildS.toFixed(1)}초
+            재생 {(info.collectS || 0).toFixed(1)}초 + 합치기 {(info.buildS || 0).toFixed(1)}초
           </p>
+          {sceneList && (
+            <details className="mos-scenes" open={sceneList.length <= 60}>
+              <summary>장면 목록 — 손으로 고치기 ({sceneList.filter(x => !x.excluded).length}/{sceneList.length}개 사용)</summary>
+              <p className="hint-text" style={{ margin: '6px 0' }}>
+                자동 판단이 틀렸을 때 고칩니다. <b>빼기</b>: 필요 없는 장면(제목·광고·흐린 잔상) 제외 ·
+                <b> 앞과 붙이기</b>: 앞 장면과 같은 내용이 겹치면 "겹치기", 새 페이지면 "이어 붙이기" ·
+                <b> 나누기</b>: 서로 다른 페이지가 한 장면으로 묶였을 때(글자가 겹쳐 보임) 그 시간만 다시 읽어 나눕니다. 바꾸면 띠가 바로 다시 만들어집니다.
+              </p>
+              <div className="mos-scene-grid">
+                {sceneList.map((sc, i) => (
+                  <div key={sc.id} className={'mos-scene' + (sc.excluded ? ' off' : '')}>
+                    <div className="mos-scene-head">
+                      <b>#{i + 1}</b> <span>{sc.t0.toFixed(1)}–{sc.t1.toFixed(1)}초</span>
+                      <button className="icon-btn" disabled={running} onClick={() => userSeek(sc.t0 + 0.1)} title="위 영상 화면을 이 장면으로">보기</button>
+                    </div>
+                    <img src={sc.thumb} alt="" />
+                    <div className="mos-scene-ctl">
+                      <label><input type="checkbox" checked={!sc.excluded} disabled={running} onChange={() => toggleExclude(sc.id)} /> 사용</label>
+                      {i > 0 && (
+                        <select value={sc.mode} disabled={running || sc.excluded} onChange={e => setJoinMode(sc.id, e.target.value)}
+                          title="앞 장면과 어떻게 붙일지">
+                          <option value="auto">앞과: 자동({sc.auto === 'overlap' ? '겹치기' : '이어 붙이기'})</option>
+                          <option value="append">앞과: 이어 붙이기</option>
+                          <option value="overlap">앞과: 겹치기</option>
+                        </select>
+                      )}
+                      <button className="icon-btn" disabled={running || sc.excluded} onClick={() => splitScene(sc.id)}>나누기</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
           <UniStage2 result={result} videoFile={videoFile} flowDefaults={DEFAULT_PREPROC}
             editCtx={{ onDeleteMeasure, canUndo: hist.past.length > 0, onUndo: undo, canRedo: hist.future.length > 0, onRedo: redo, seams: info.seams }} />
         </div>
