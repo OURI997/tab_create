@@ -4310,8 +4310,15 @@ function tabRoiFromGray(g, w, h, opts) {
     return n ? ok / n : 0;
   };
   let L = { x: xs0, wall: false }, R = { x: xs1, wall: false };
-  for (let x = xs1; x > Math.max(xs0, 0.75 * w); x--) if (isWall(x) && colOk(x - 3) && staffBeyond(x, 1) < 0.3) { R = { x: x - 1, wall: true }; break; }
-  for (let x = xs0; x < Math.min(xs1, 0.25 * w); x++) if (isWall(x) && colOk(x + 3) && staffBeyond(x, -1) < 0.3) { L = { x: x + 1, wall: true }; break; }
+  // 벽(굵은 세로줄)은 몇 픽셀 두께라 벽 기둥 전체를 넘어 안쪽 + 1px 여유까지 물러난다 — 창 가장자리에 고정된 선이 남으면 장면 맞대기가 그 선에 붙잡힌다
+  for (let x = xs1; x > Math.max(xs0, 0.75 * w); x--) if (isWall(x) && staffBeyond(x, 1) < 0.3) {
+    let xx = x; while (xx > xs0 && isWall(xx)) xx--;
+    if (colOk(xx - 2)) { R = { x: xx - 2, wall: true }; break; }
+  }
+  for (let x = xs0; x < Math.min(xs1, 0.25 * w); x++) if (isWall(x) && staffBeyond(x, -1) < 0.3) {
+    let xx = x; while (xx < xs1 && isWall(xx)) xx++;
+    if (colOk(xx + 2)) { L = { x: xx + 2, wall: true }; break; }
+  }
   const lx = L.x, rx = R.x;
   const padL = L.wall ? 0 : 0.02 * w, padR = R.wall ? 0 : 0.02 * w;
   return {
@@ -9886,23 +9893,24 @@ function mosRegister2(A, B, W, smin, smax) {
   let best = [-2, 0];
   for (const s of [...cands].sort((a, b) => a - b)) {
     if (s < smin || s > smax || W - Math.abs(s) < 16) continue;
-    let v = 0.5 * (mosNcc(A.low, B.low, W, A.hl, s) + mosNcc(A.full, B.full, W, A.hf, s));
+    let v = 0.5 * (mosNcc(A.low, B.low, W, A.hl, s) + mosNcc(A.full, B.full, W, A.hf, s)), e = -1;
     // 띠 바깥 글자가 겹침 영역에 있으면 같은 비중으로 — 반복 마디에 한 마디 어긋나 붙는 것을 막는다
-    if (A.ext) { const e = mosNcc(A.ext, B.ext, W, A.hf, s); if (e > -1) v = (2 * v + e) / 3; }
-    if (v > best[0] + 1e-6) best = [v, s];
+    if (A.ext) { e = mosNcc(A.ext, B.ext, W, A.hf, s); if (e > -1) v = (2 * v + e) / 3; }
+    if (v > best[0] + 1e-6) best = [v, s, e];
   }
   return best;
 }
 // 출력 해상도에서 이동량 다듬기 (저해상도 이동량 × 배율의 누적 오차가 띠를 번지게 하는 것을 막는다)
-function mosRefine(fa, fb, OW, h, sc, r) {
+function mosRefineV(fa, fb, OW, h, sc, r) {
   let best = [-2, sc];
   for (let s = sc - r; s <= sc + r; s++) {
     if (OW - Math.abs(s) < 16) continue;
     const v = mosNcc(fa, fb, OW, h, s);
     if (v > best[0] + 1e-6) best = [v, s];
   }
-  return best[1];
+  return best; // [NCC, 이동량]
 }
+function mosRefine(fa, fb, OW, h, sc, r) { return mosRefineV(fa, fb, OW, h, sc, r)[1]; }
 function mosMedianSmall(a, n) { // n ≤ 7, 삽입 정렬
   for (let i = 1; i < n; i++) { const v = a[i]; let j = i - 1; while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; j--; } a[j + 1] = v; }
   return n & 1 ? a[n >> 1] : ((a[(n >> 1) - 1] + a[n >> 1]) >> 1);
@@ -10065,8 +10073,27 @@ async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress
       // 사용자가 "페이지 전환형"이라고 답했으면 장면 안에서 악보가 움직이지 않는다 — 3% 넘게 움직이면 새 장면으로 본다
       const sudden = motion === 'page' ? Math.abs(s) > 0.03 * W
         : pred != null ? Math.abs(s - pred) > jumpLim : Math.abs(s) > Math.min(0.35 * W, 0.2 * W * gapK);
-      if (v >= MOS_RUN_NCC && !sudden) {
-        const so = mosRefine(prev.zf, fr.zf, OW, hc, Math.round(s * kk), rr);
+      // 같은 장면인지 오선 띠만으로 판단하면, 리듬(스트로크 표시)이 같은 다른 페이지가 "같은 장면"으로 묶여 겹쳐 그려진다.
+      // 띠 바깥(코드 이름·가사)도 같은 이동량에서 맞아야 같은 장면으로 본다
+      let same = v >= MOS_RUN_NCC && !sudden;
+      if (same) {
+        const e = mosNcc(prev.ext, fr.ext, W, hf, s);
+        // 정지 장면만 — 움직이는 영상은 제목·로고처럼 화면에 고정된 글자가 띠 바깥에 있어 값이 원래 낮다
+        if (Math.abs(s) < 0.02 * W && e > -1 && e < 0.5) same = false;
+      }
+      // 출력 해상도(숫자 하나하나가 보이는 해상도)에서도 맞아야 같은 장면. 저해상도에선 리듬 기둥·오선이 같은 다른 페이지가 0.9 넘게 나온다.
+      // 실측(소수빈 영상): 같은 페이지 0.90~1.0, 페이지가 바뀐 순간 0.73~0.74
+      let ref = null;
+      if (same) {
+        ref = mosRefineV(prev.zf, fr.zf, OW, hc, Math.round(s * kk), rr);
+        const hist = cur.vr || [];
+        const medv = hist.length >= 3 ? hist.slice().sort((a, b) => a - b)[hist.length >> 1] : 1;
+        // 정지 장면(이동 2% 미만)에서만 적용 — 움직이는 장면은 흔들림·번짐으로 원래 값이 낮다
+        if (Math.abs(ref[1]) < 0.02 * OW && ref[0] < 0.82 && ref[0] < medv - 0.1) same = false;
+      }
+      if (same) {
+        const so = ref[1];
+        if (Math.abs(so) < 0.02 * OW) { (cur.vr = cur.vr || []).push(ref[0]); if (cur.vr.length > 25) cur.vr.shift(); }
         const x = cur.frames[cur.frames.length - 1].x + so;
         cur.frames.push({ t, x });
         cur.vel = (so / kk) / dt;
@@ -10094,7 +10121,7 @@ async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress
 }
 
 // 구간 사이 맞대기 → 띠 위 배치
-function mosPlace(col) {
+function mosPlace(col, motion) {
   const { runs, OW, hc, hl, hf, W, kk, rr } = col;
   // 겹침 8% 미만은 찾지 않는다 — 좁은 띠끼리는 우연히 NCC가 높게 나와 진짜 겹침(30~60%)을 이기고 "이어 붙임 + 중복"이 된다
   const smin = -Math.round(0.02 * W), smax = Math.round(0.92 * W);
@@ -10111,14 +10138,18 @@ function mosPlace(col) {
     if (ri === 0) off = 0;
     else {
       const p = runs[ri - 1];
-      let [v, s] = cand[ri - 1];
+      let [v, s, e] = cand[ri - 1];
       if (D != null && Math.abs(s - D) > 0.03 * W) {
-        const [vD, sD] = mosRegister2(A(p), Bf(r), W, Math.max(smin, D - Math.round(0.03 * W)), Math.min(smax, D + Math.round(0.03 * W)));
-        if (vD >= 0.6 && vD >= v - 0.08) { v = vD; s = sD; }
+        const [vD, sD, eD] = mosRegister2(A(p), Bf(r), W, Math.max(smin, D - Math.round(0.03 * W)), Math.min(smax, D + Math.round(0.03 * W)));
+        if (vD >= 0.6 && vD >= v - 0.08) { v = vD; s = sD; e = eD; }
       }
       const overlap = (W - s) / W;
       const thr = D != null && Math.abs(s - D) <= 0.03 * W ? 0.6 : 0.65;
-      if (v >= thr && overlap >= 0.08) {
+      // 겹쳐 붙이려면 코드 이름·가사도 맞아야 한다(있을 때). 거의 같은 자리(겹침 85%+)는 "같은 페이지가 다시 나온 것"이므로 아주 높은 일치만 인정
+      // — 반복 페이지가 많은 페이지 전환 영상에서 다른 페이지가 위에 겹쳐 그려지던 문제
+      const extOk = e <= -1 || e >= 0.5;
+      const strongEnough = overlap < 0.85 || v >= 0.88;
+      if (v >= thr && overlap >= 0.08 && extOk && strongEnough && (motion !== 'page' || (overlap >= 0.95 && v >= 0.9))) {
         const so = mosRefine(p.last.zf, r.first.zf, OW, hc, Math.round(s * kk), rr);
         off = place[ri - 1] + p.frames[p.frames.length - 1].x + so;
         joins.push({ type: 'overlap', ncc: v, overlap, x: off });
@@ -10298,7 +10329,7 @@ function MosaicStep({ videoRef, onModeBack }) {
       if (abortRef.current) { setMsg('중단됨'); return; }
       if (!col.runs.length) { setMsg('악보 장면을 찾지 못했습니다 — TAB 영역을 다시 지정해 보세요.'); return; }
       const t1 = performance.now();
-      const pl = mosPlace(col);
+      const pl = mosPlace(col, askMotion);
       setPct(95);
       await new Promise(r => setTimeout(r, 0));
       const res = mosRender(col, pl, cleanBg ? DEFAULT_PREPROC : null);
