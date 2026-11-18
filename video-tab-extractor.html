@@ -131,6 +131,12 @@
   }
   .preview-modal-body{overflow:auto;padding:12px;background:#f4f2ea;}
   .preview-modal-body img{width:100%;display:block;background:#fff;}
+.mos-ask-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; padding: 5px 0; border-bottom: 1px dashed var(--border); font-size: 13px; }
+.mos-ask-row .seg { display: inline-flex; gap: 0; }
+.mos-ask-row .seg-btn { padding: 4px 10px; border: 1px solid var(--border); background: var(--panel, #fff); color: inherit; border-radius: 0; margin: 0 -1px 0 0; font-size: 12px; cursor: pointer; }
+.mos-ask-row .seg-btn:first-child { border-radius: 6px 0 0 6px; }
+.mos-ask-row .seg-btn:last-child { border-radius: 0 6px 6px 0; }
+.mos-ask-row .seg-btn.on { background: var(--accent); color: #fff; border-color: var(--accent); position: relative; z-index: 1; }
 </style>
 </head>
 <body>
@@ -4206,7 +4212,8 @@ function tabRoiStaves(lines) {
   for (const r of res) if (fin.every(f => r.bottom < f.top - 2 || r.top > f.bottom + 2)) fin.push(r);
   return fin.sort((a, b) => a.top - b.top);
 }
-function tabRoiFromGray(g, w, h) {
+function tabRoiFromGray(g, w, h, opts) {
+  opts = opts || {};
   let st = tabRoiStaves(tabRoiLinesIn(g, w, h, false));
   if (!st.some(x => x.n >= 6)) st = tabRoiStaves(tabRoiLinesIn(g, w, h, true));
   const six = st.filter(x => x.n >= 6);
@@ -4240,15 +4247,16 @@ function tabRoiFromGray(g, w, h) {
   for (let y = Math.round(s.top); y <= Math.round(s.bottom); y++) bandBg.push(bgFrac[y]);
   bandBg.sort((p, q) => p - q);
   const plainPanel = bandBg.length && bandBg[bandBg.length >> 1] >= 0.8;
-  const walk = (start, step, maxd, mind) => {
+  const walk = (start, step, maxd, mind, gapK) => {
     let y = start, last = start, gap = 0, wall = 0, wallAt = null;
+    gapK = gapK || 0.6;
     while (y + step >= 0 && y + step < h && Math.abs(y + step - start) <= maxd) {
       y += step;
       const p = prof[y];
       if (p > 0.45 || (plainPanel && bgFrac[y] < 0.3)) { if (!wall) wallAt = y; wall++; } else wall = 0;
       if (wall >= 3) break;
       if (p > 0.005) { if (!wall) last = y; gap = 0; }
-      else if (++gap > 0.6 * hs) break;
+      else if (++gap > gapK * hs) break;
     }
     // 잉크가 꽉 찬 영역(연주 영상 등)에 막혀 멈췄으면 그 경계 바로 안쪽까지만 — 여유를 더 주면 영상 띠가 섞인다
     if (wall >= 3 && wallAt != null) return Math.max(0, Math.min(h - 1, wallAt - step));
@@ -4258,8 +4266,13 @@ function tabRoiFromGray(g, w, h) {
   };
   // 오선 자체(굵은 선)를 "꽉 찬 영역"으로 오인하지 않도록 선 간격의 0.35배 바깥에서부터 걷는다
   const sp = hs / Math.max(1, s.n - 1), off = Math.max(2, Math.round(0.35 * sp));
-  let y0 = walk(Math.round(s.top) - off, -1, 2.6 * hs, 0.9 * hs - off); // 위쪽 최소 0.9배 — 오선에서 조금 떨어진 코드 이름도 잘리지 않게
-  let y1 = walk(Math.round(s.bottom) + off, 1, 1.9 * hs, 0.6 * hs - off);
+  // 사용자 답(opts.above/below: 'yes' | 'no' | 자동)에 따라 위·아래로 넓히는 한도를 바꾼다.
+  //  위 'yes'(코드 이름·다이어그램 있음): 최대 3.6배, 빈 줄 1.2배까지 건너뜀 / 'no': 마디 번호만 — 0.9배
+  //  아래 'yes'(가사 있음): 최대 3.2배, 빈 줄 1.2배까지 건너뜀 / 'no': 리듬 기둥만 — 0.9배
+  const up = opts.above === 'yes' ? [3.6, 1.2] : opts.above === 'no' ? [0.9, 0.6] : [2.6, 0.6];
+  const dn = opts.below === 'yes' ? [3.2, 1.2] : opts.below === 'no' ? [0.9, 0.6] : [1.9, 0.6];
+  let y0 = walk(Math.round(s.top) - off, -1, up[0] * hs, Math.min(up[0], 0.9) * hs - off, up[1]); // 위쪽 최소 0.9배 — 오선에서 조금 떨어진 코드 이름도 잘리지 않게
+  let y1 = walk(Math.round(s.bottom) + off, 1, dn[0] * hs, Math.min(dn[0], 0.6) * hs - off, dn[1]);
   // 다른 오선(위의 오선보 5줄, 아래의 다음 단)을 넘어가지 않는다 — TAB만 남기고, 두 단이 섞이면 이어 붙이기·마디 검출이 틀어진다
   for (const o of st) {
     if (o === s) continue;
@@ -4289,18 +4302,16 @@ function tabRoiFromGray(g, w, h) {
     for (let y = wy0; y <= wy1; y++) if (isInk(g[y * w + x])) c++;
     return c > 0.9 * (wy1 - wy0 + 1);
   };
-  const walkX = (from, step, lim) => {
-    let x = from, last = from, fail = 0;
-    while (x + step >= 0 && x + step < w && (x + step - lim) * step <= 0) {
-      x += step;
-      if (isWall(x)) return { x: last, wall: true };
-      if (colOk(x)) { last = x; fail = 0; } else if (++fail > 5) break;
-    }
-    return { x: last, wall: false };
+  // 좌우는 오선이 검출된 범위(xs0~xs1)를 그대로 쓰되, 바깥쪽 25% 안에 "세로 벽 + 그 너머엔 오선 없음"이 있으면
+  // (옆에 붙은 코드 다이어그램 패널) 벽 안쪽까지만 자른다. 재생바·마디선은 너머에도 오선이 이어지므로 자르지 않는다.
+  const staffBeyond = (x, step) => {
+    let ok = 0, n = 0;
+    for (let k = 3; k <= 14; k++) { const xx = x + step * k; if (xx < 0 || xx >= w) break; n++; if (colOk(xx)) ok++; }
+    return n ? ok / n : 0;
   };
-  const xc = Math.round((xs0 + xs1) / 2);
   let L = { x: xs0, wall: false }, R = { x: xs1, wall: false };
-  if (colOk(xc) || colOk(xc - 2) || colOk(xc + 2)) { L = walkX(xc, -1, 0); R = walkX(xc, 1, w - 1); }
+  for (let x = xs1; x > Math.max(xs0, 0.75 * w); x--) if (isWall(x) && colOk(x - 3) && staffBeyond(x, 1) < 0.3) { R = { x: x - 1, wall: true }; break; }
+  for (let x = xs0; x < Math.min(xs1, 0.25 * w); x++) if (isWall(x) && colOk(x + 3) && staffBeyond(x, -1) < 0.3) { L = { x: x + 1, wall: true }; break; }
   const lx = L.x, rx = R.x;
   const padL = L.wall ? 0 : 0.02 * w, padR = R.wall ? 0 : 0.02 * w;
   return {
@@ -4321,7 +4332,7 @@ function canvasHasTabStaff(canvas) {
   if (tabRoiStaves(tabRoiLinesIn(g, W, H, false)).some(s => s.n >= 5)) return true;
   return tabRoiStaves(tabRoiLinesIn(g, W, H, true)).some(s => s.n >= 5);
 }
-async function autoFindTabRoi(srcUrl) {
+async function autoFindTabRoi(srcUrl, opts) {
   if (!srcUrl) return null;
   const v = document.createElement('video');
   v.muted = true; v.preload = 'auto'; v.playsInline = true; v.src = srcUrl;
@@ -4340,12 +4351,14 @@ async function autoFindTabRoi(srcUrl) {
       ctx.drawImage(v, 0, 0, W, H);
       const d = ctx.getImageData(0, 0, W, H).data, g = new Int16Array(W * H);
       for (let i = 0, p = 0; i < d.length; i += 4, p++) g[p] = (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]) | 0;
-      const r = tabRoiFromGray(g, W, H);
+      const r = tabRoiFromGray(g, W, H, opts);
       if (r) found.push(r);
     }
     if (found.length < 2) return null;
     const med = key => { const a = found.map(f => f[key]).sort((x, y) => x - y); return a[Math.floor((a.length - 1) / 2)]; };
-    const r = { x0: med('x0'), y0: med('y0'), x1: med('x1'), y1: med('y1'), frames: found.length };
+    // 가장자리는 중앙값이 아니라 "두 번째로 넓은 값" — 가사·코드가 일부 장면에만 있어도 잘리지 않게 (가장 넓은 1장은 이상치로 버린다)
+    const outer = (key, wide) => { const a = found.map(f => f[key]).sort((x, y) => (wide === 'min' ? x - y : y - x)); return a[Math.min(1, a.length - 1)]; };
+    const r = { x0: outer('x0', 'min'), y0: outer('y0', 'min'), x1: outer('x1', 'max'), y1: outer('y1', 'max'), frames: found.length };
     r.core = { y0: Math.max(r.y0, med('coreY0')), y1: Math.min(r.y1, med('coreY1')) };
     return r;
   } catch (e) {
@@ -4355,17 +4368,23 @@ async function autoFindTabRoi(srcUrl) {
   }
 }
 
-function ScrollRoiPicker({ videoRef, videoLoaded, roi, setRoi, suppressRef }) {
+function ScrollRoiPicker({ videoRef, videoLoaded, roi, setRoi, suppressRef, roiOpts }) {
   const roiCanvasRef = useRef(null);
   const [autoMsg, setAutoMsg] = useState('');
   const [autoBusy, setAutoBusy] = useState(false);
   const autoDoneSrcRef = useRef(null);
+  const roiOptsRef = useRef(roiOpts);
+  roiOptsRef.current = roiOpts;
+  // 질문 답이 바뀌면 다시 찾는다
+  const optsKey = JSON.stringify(roiOpts || {});
+  const firstOptsRef = useRef(optsKey);
+  useEffect(() => { if (optsKey !== firstOptsRef.current && videoLoaded) { firstOptsRef.current = optsKey; runAutoRoi(true); } }, [optsKey]);
   async function runAutoRoi(manual) {
     const video = videoRef.current;
     const src = video && (video.currentSrc || video.src);
     if (!src) return;
     setAutoBusy(true); setAutoMsg('TAB 영역을 찾는 중...');
-    const r = await autoFindTabRoi(src);
+    const r = await autoFindTabRoi(src, roiOptsRef.current);
     setAutoBusy(false);
     if (r) { setRoi({ x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1, core: r.core }); setAutoMsg('TAB 오선을 찾아 영역을 자동으로 지정했습니다 (' + r.frames + '/5 장면). 다르면 드래그로 다시 지정하세요.'); }
     else setAutoMsg(manual ? 'TAB 오선을 찾지 못했습니다 — 드래그로 직접 지정하세요.' : '');
@@ -9958,7 +9977,7 @@ function mosTopHatClean(buf, w, h, k) {
 }
 
 // 한 번 재생하면서 장면을 모으고 구간(run)을 만든다. 반환: 구간 목록 + 렌더된 블록
-async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress }) {
+async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress, motion }) {
   const vw = video.videoWidth, vh = video.videoHeight;
   const { rx0, ry0, rw, rh } = roiRectPx(video, roi);
   const OW = Math.max(64, Math.min(MOS_OUT_W, Math.round(rw)));
@@ -10043,7 +10062,9 @@ async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress
       // 갑자기 크게 넘어간 장면은 같은 구간으로 잇지 않는다 — 반복 마디 때문에 "한 마디 덜 간" 위치가 맞는 것처럼 보이기 쉬워서,
       // 큰 점프는 구간 사이 맞대기(코드 이름·마디 번호까지 보는 비교 + 공통 점프 폭)에 맡긴다
       const jumpLim = 0.12 * W * gapK;
-      const sudden = pred != null ? Math.abs(s - pred) > jumpLim : Math.abs(s) > Math.min(0.35 * W, 0.2 * W * gapK);
+      // 사용자가 "페이지 전환형"이라고 답했으면 장면 안에서 악보가 움직이지 않는다 — 3% 넘게 움직이면 새 장면으로 본다
+      const sudden = motion === 'page' ? Math.abs(s) > 0.03 * W
+        : pred != null ? Math.abs(s - pred) > jumpLim : Math.abs(s) > Math.min(0.35 * W, 0.2 * W * gapK);
       if (v >= MOS_RUN_NCC && !sudden) {
         const so = mosRefine(prev.zf, fr.zf, OW, hc, Math.round(s * kk), rr);
         const x = cur.frames[cur.frames.length - 1].x + so;
@@ -10210,6 +10231,11 @@ function MosaicStep({ videoRef, onModeBack }) {
   const [roi, setRoi] = useState(null);
   const [rate, setRate] = useState(4);
   const [cleanBg, setCleanBg] = useState(true);
+  // 영상만으로 헷갈리는 부분은 사용자에게 묻는다 (모르면 '자동')
+  const [askAbove, setAskAbove] = useState('auto');   // 악보 위 코드 이름·다이어그램
+  const [askBelow, setAskBelow] = useState('auto');   // 악보 아래 가사
+  const [askMotion, setAskMotion] = useState('auto'); // 흐름 / 페이지 전환
+  const roiOpts = useMemo(() => ({ above: askAbove, below: askBelow }), [askAbove, askBelow]);
   const [running, setRunning] = useState(false);
   const [pct, setPct] = useState(0);
   const [msg, setMsg] = useState('영상 파일을 선택하세요. TAB 영역은 자동으로 찾습니다.');
@@ -10266,7 +10292,7 @@ function MosaicStep({ videoRef, onModeBack }) {
     try {
       setMsg('영상을 한 번 재생하며 장면을 맞추는 중...');
       const col = await mosCollect(video, roi, {
-        rate, startT: rangeStart, endT: Math.max(rangeStart, rangeEnd - 0.02), abortRef,
+        rate, startT: rangeStart, endT: Math.max(rangeStart, rangeEnd - 0.02), abortRef, motion: askMotion,
         onProgress: f => setPct(Math.round(f * 90)),
       });
       if (abortRef.current) { setMsg('중단됨'); return; }
@@ -10337,7 +10363,24 @@ function MosaicStep({ videoRef, onModeBack }) {
           <label><input type="checkbox" checked={cleanBg} onChange={e => setCleanBg(e.target.checked)} disabled={running} /> 배경 정리(흑백)</label>
         </div>
         <div className="slider-label" style={{ marginTop: '8px' }}>TAB 영역 — 자동으로 찾습니다(코드 다이어그램·가사 포함). 다르면 드래그로 다시 지정</div>
-        <ScrollRoiPicker videoRef={videoRef} videoLoaded={videoLoaded} roi={roi} setRoi={setRoi} suppressRef={bgSeekRef} />
+        <div className="mos-ask">
+          <div className="slider-label" style={{ marginTop: '8px' }}>영상에 대해 알려주세요 — 모르면 '자동'으로 두면 됩니다</div>
+          {[
+            ['악보 위에 코드 이름이나 코드 다이어그램이 있나요?', askAbove, setAskAbove, [['auto', '자동'], ['yes', '있음'], ['no', '없음']]],
+            ['악보 아래에 가사가 있나요?', askBelow, setAskBelow, [['auto', '자동'], ['yes', '있음'], ['no', '없음']]],
+            ['악보가 어떻게 넘어가나요?', askMotion, setAskMotion, [['auto', '자동/섞임'], ['flow', '흘러감(스크롤)'], ['page', '페이지가 바뀜']]],
+          ].map(([q, val, set, opts]) => (
+            <div key={q} className="mos-ask-row">
+              <span>{q}</span>
+              <span className="seg">
+                {opts.map(([k, label]) => (
+                  <button key={k} className={'seg-btn' + (val === k ? ' on' : '')} disabled={running} onClick={() => set(k)}>{label}</button>
+                ))}
+              </span>
+            </div>
+          ))}
+        </div>
+        <ScrollRoiPicker videoRef={videoRef} videoLoaded={videoLoaded} roi={roi} setRoi={setRoi} suppressRef={bgSeekRef} roiOpts={roiOpts} />
         {videoLoaded && (
           <>
             <div className="toolbar">
