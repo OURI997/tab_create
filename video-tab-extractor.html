@@ -10218,6 +10218,25 @@ function MosaicStep({ videoRef, onModeBack }) {
   const [hist, setHist] = useState({ past: [], future: [] });
   const abortRef = useRef(false);
   const bgSeekRef = useRef(false);
+  const [seekT, setSeekT] = useState(0);
+  const seekTRef = useRef(0), seekPendingRef = useRef(false), runningRef = useRef(false);
+  useEffect(() => { runningRef.current = running; }, [running]);
+  // 영상 넘겨보기: 슬라이더를 빠르게 움직여도 마지막 위치만 seek (ROI 선택 화면은 'seeked' 때마다 다시 그려진다)
+  function userSeek(t) {
+    t = Math.max(0, Math.min(duration || t, t));
+    seekTRef.current = t; setSeekT(t);
+    if (seekPendingRef.current) return;
+    seekPendingRef.current = true;
+    (async () => {
+      let done;
+      do {
+        done = seekTRef.current;
+        const v = videoRef.current;
+        if (v && v.videoWidth && !runningRef.current) await seekSafe(v, done);
+      } while (done !== seekTRef.current);
+      seekPendingRef.current = false;
+    })();
+  }
 
   function handleFileChange(e) {
     const file = e.target.files && e.target.files[0];
@@ -10230,6 +10249,7 @@ function MosaicStep({ videoRef, onModeBack }) {
       setVideoLoaded(true);
       setDuration(video.duration);
       setRangeStart(0); setRangeEnd(video.duration);
+      setSeekT(0); seekTRef.current = 0;
       setMsg('영상 로드됨: ' + video.duration.toFixed(1) + '초, ' + video.videoWidth + 'x' + video.videoHeight + '. TAB 영역을 찾는 중입니다 — 찾으면 "자동 추출"을 누르세요.');
       await seekSafe(video, 0.001);
       await seekTo(video, 0);
@@ -10320,8 +10340,20 @@ function MosaicStep({ videoRef, onModeBack }) {
         <ScrollRoiPicker videoRef={videoRef} videoLoaded={videoLoaded} roi={roi} setRoi={setRoi} suppressRef={bgSeekRef} />
         {videoLoaded && (
           <>
+            <div className="toolbar">
+              <button className="icon-btn" disabled={running} onClick={() => userSeek(seekT - 5)}>◀ 5초</button>
+              <button className="icon-btn" disabled={running} onClick={() => userSeek(seekT - 1)}>◀ 1초</button>
+              <label style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <input type="range" min="0" max={duration || 0} step="0.05" value={seekT} disabled={running} style={{ flex: 1 }}
+                  onChange={e => userSeek(parseFloat(e.target.value))} />
+                <span className="slider-label" style={{ margin: 0, whiteSpace: 'nowrap' }}>{seekT.toFixed(1)}s / {duration.toFixed(1)}s</span>
+              </label>
+              <button className="icon-btn" disabled={running} onClick={() => userSeek(seekT + 1)}>1초 ▶</button>
+              <button className="icon-btn" disabled={running} onClick={() => userSeek(seekT + 5)}>5초 ▶</button>
+            </div>
+            <p className="hint-text" style={{ margin: '2px 0 0' }}>슬라이더로 영상을 넘겨 TAB이 잘 보이는 장면을 찾은 뒤, 영상 위에서 드래그해 TAB 영역을 지정하세요.</p>
             <div className="slider-label" style={{ marginTop: '8px' }}>추출 구간 — {rangeStart.toFixed(1)}s ~ {rangeEnd.toFixed(1)}s</div>
-            <MiniRangeTimeline duration={duration} start={rangeStart} end={rangeEnd} onChange={(a, b) => { if (!running) { setRangeStart(a); setRangeEnd(b); } }} />
+            <MiniRangeTimeline duration={duration} start={rangeStart} end={rangeEnd} onChange={(a, b, which) => { if (!running) { setRangeStart(a); setRangeEnd(b); userSeek(which === 'end' ? b : a); } }} />
           </>
         )}
       </div>
