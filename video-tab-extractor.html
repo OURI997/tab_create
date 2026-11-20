@@ -9213,7 +9213,24 @@ function UniStage2({ result, videoFile, flowDefaults, editCtx }) {
   async function detect() {
     setDetecting(true); setDetProgress(0); setSelIdx(null); setEditIdx(null);
     try {
-      const r = await flowDetectBars(chunks, nativeW, f => setDetProgress(f));
+      // 높이가 큰 띠(자동 모드가 페이지를 원본 해상도로 다시 잡은 경우)는 마디선 검출만 높이 ~320px 축소본에서 하고 위치를 되돌린다.
+      // 원본 해상도에선 마디선이 1px로 가늘어 연속도 검사에서 빠졌다 (소수빈 4K: 62개 중 56개만 잡힘)
+      const k = H > 420 ? 320 / H : 1;
+      let r;
+      if (k < 1) {
+        const small = chunks.map(c => {
+          const o = document.createElement('canvas');
+          o.width = Math.max(1, Math.round(c.width * k)); o.height = Math.round(H * k);
+          const g = o.getContext('2d'); g.imageSmoothingQuality = 'high'; g.drawImage(c, 0, 0, o.width, o.height);
+          return o;
+        });
+        const rs = await flowDetectBars(small, Math.round(nativeW * k), f => setDetProgress(f));
+        const blank = new Uint8Array(totalW);
+        for (let x = 0; x < totalW; x++) blank[x] = rs.blank[Math.min(rs.blank.length - 1, Math.floor(x * k))] || 0;
+        r = { ...rs, bars: rs.bars.map(b => Math.min(totalW - 1, Math.round(b / k))), blank, space: rs.space / k, total: totalW };
+      } else {
+        r = await flowDetectBars(chunks, nativeW, f => setDetProgress(f));
+      }
       setDet(r); setBars(r.bars);
     } finally { setDetecting(false); }
   }
@@ -10256,6 +10273,15 @@ async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress
     if (final) {
       if (r.pend) { keys.push(r.pend); r.pend = null; }
       if (r.frames.length < 2) { cur = null; return; }
+      // 멈춰 있는 장면: 앞뒤 0.6초(페이지가 바뀌며 앞 페이지와 겹쳐 보이는 순간)는 그리기에서 뺀다 — 코드 이름이 흐리게 겹쳐 나왔다
+      {
+        const ft0 = r.frames[0].t, ft1 = r.frames[r.frames.length - 1].t;
+        const xsK = keys.map(q => q.x);
+        if (r.nextBlock == null && Math.max(...xsK) - Math.min(...xsK) <= 4 && ft1 - ft0 > 2) {
+          const mid = keys.filter(q => q.t >= ft0 + 0.6 && q.t <= ft1 - 0.6);
+          if (mid.length >= 2) { keys.length = 0; keys.push(...mid); }
+        }
+      }
       let lo = Infinity, hi = -Infinity;
       for (const f of r.frames) { lo = Math.min(lo, f.x); hi = Math.max(hi, f.x + OW); }
       const b0 = r.nextBlock != null ? r.nextBlock : Math.floor(lo / MOS_BLOCK), b1 = Math.ceil(hi / MOS_BLOCK);
@@ -10414,53 +10440,117 @@ function mosPlace(col, motion, edits) {
 }
 
 // 띠 그리기 → 청크(≤6000px) + 스트립 좌표↔시각 트랙
+// 멈춰 있는 장면(페이지)을 원본 해상도로 다시 잡는다 — 페이지 전환형과 같은 방식(정답 악보 7곡으로 검증).
+// 분석(맞대기)은 1280px로 하지만, 그대로 그리면 4K 영상에서 숫자·코드 이름이 작아지고 흐려졌다.
+// 장면마다 가운데 두 시점(40%·60%, 페이지가 바뀌는 앞뒤 0.6초 제외)을 잡아 픽셀 중앙값(2장이면 평균).
+async function mosCaptureNative(video, roi, col, runs, onProg) {
+  const { rw, rh, rx0, ry0 } = roiRectPx(video, roi);
+  if (!col.native) {
+    const NW = Math.min(2560, Math.round(rw));
+    if (NW < col.OW * 1.15) return false; // 원본이 분석 해상도와 비슷하면 다시 잡을 이유가 없다
+    const sc = NW / col.OW;
+    col.native = { sc, NW, NH: Math.round(col.OH * sc) };
+  }
+  const { NW, NH } = col.native;
+  const cv = document.createElement('canvas'); cv.width = NW; cv.height = NH;
+  const g = cv.getContext('2d', { willReadFrequently: true });
+  g.imageSmoothingQuality = 'high';
+  const todo = runs.filter(r => r.static && !r.native);
+  for (let i = 0; i < todo.length; i++) {
+    const r = todo[i], t0 = r.frames[0].t, t1 = r.frames[r.frames.length - 1].t;
+    const a = t1 - t0 > 2 ? t0 + 0.6 : t0, b = t1 - t0 > 2 ? t1 - 0.6 : t1;
+    const grays = [];
+    for (const f of [0.4, 0.6]) {
+      await seekTo(video, a + (b - a) * f);
+      g.drawImage(video, rx0, ry0, rw, rh, 0, 0, NW, NH);
+      const d = g.getImageData(0, 0, NW, NH).data, gr = new Uint8Array(NW * NH);
+      for (let p = 0, k = 0; p < gr.length; p++, k += 4) gr[p] = (0.299 * d[k] + 0.587 * d[k + 1] + 0.114 * d[k + 2]) | 0;
+      grays.push(gr);
+    }
+    const out = grays[0];
+    if (grays.length > 1) for (let p = 0; p < out.length; p++) out[p] = (out[p] + grays[1][p]) >> 1;
+    r.native = out;
+    if (onProg) onProg(i + 1, todo.length);
+  }
+  return true;
+}
+
+// 띠 그리기 → 청크(≤6000px) + 스트립 좌표↔시각 트랙.
+// col.native가 있으면 원본 해상도 배율(sc)로 그린다: 다시 잡은 장면은 그 그림을, 나머지(움직이는 장면)는 블록을 확대해서.
 function mosRender(col, pl, preproc) {
-  const { OW, OH, dark, bg } = col;
+  const { OW, OH, dark } = col;
   const runs = pl.runs || col.runs;
-  const total = pl.total, B = MOS_BLOCK;
-  const CH = 6000, chunks = [], sb = col.screenBg;
-  for (let c0 = 0; c0 < total; c0 += CH) {
-    const cw = Math.min(CH, total - c0);
-    const buf = new Uint8Array(cw * OH).fill(bg);
-    runs.forEach((r, ri) => {
-      const base = Math.round(pl.place[ri]);
-      const clean = sb && r.static; // 정지 구간: 블록 좌표 → 화면 좌표가 고정이라 배경을 뺄 수 있다 (움직이는 구간은 중앙값이 이미 지움)
+  const B = MOS_BLOCK, sc = col.native ? col.native.sc : 1;
+  const H = col.native ? col.native.NH : OH;
+  const total = Math.max(1, Math.ceil(pl.total * sc));
+  const lightOf = v => (dark ? 255 - v : v);
+  // 장면별 그림(밝은 바탕 기준)을 한 번만 만든다
+  const runCanvas = r => {
+    if (r._cv && r._cvSc === sc) return r._cv;
+    let c;
+    if (r.native && col.native) {
+      const { NW, NH } = col.native;
+      c = document.createElement('canvas'); c.width = NW; c.height = NH;
+      const im = c.getContext('2d').createImageData(NW, NH);
+      for (let p = 0, i = 0; p < r.native.length; p++, i += 4) { const v = lightOf(r.native[p]); im.data[i] = im.data[i + 1] = im.data[i + 2] = v; im.data[i + 3] = 255; }
+      c.getContext('2d').putImageData(im, 0, 0);
+      c._x0 = r.xr;
+    } else {
+      let b0 = Infinity, b1 = -Infinity;
+      for (const bi of r.blocks.keys()) { b0 = Math.min(b0, bi); b1 = Math.max(b1, bi + 1); }
+      if (!isFinite(b0)) return null;
+      const w = (b1 - b0) * B;
+      c = document.createElement('canvas'); c.width = w; c.height = OH;
+      const im = c.getContext('2d').createImageData(w, OH);
+      im.data.fill(255);
       for (const [bi, blk] of r.blocks) {
-        const gx0 = base + bi * B;
-        if (gx0 + B <= c0 || gx0 >= c0 + cw) continue;
-        for (let xx = 0; xx < B; xx++) {
-          const lx = gx0 + xx - c0;
-          if (lx < 0 || lx >= cw) continue;
-          const wx = bi * B + xx - r.xr; // 화면(창) 안 x
-          for (let y = 0; y < OH; y++) {
-            let v = blk[y * B + xx];
-            if (clean && wx >= 0 && wx < OW && !sb.lineRow[y]) {
-              const vv = dark ? 255 - v : v, b = sb.bg[y * OW + wx];
-              if (Math.abs(vv - b) < 32 || vv > 200) v = bg; // 배경과 같은 픽셀 → 종이색
-            }
-            buf[y * cw + lx] = v;
-          }
+        const x0 = (bi - b0) * B;
+        for (let y = 0; y < OH; y++) for (let xx = 0; xx < B; xx++) {
+          const v = lightOf(blk[y * B + xx]), i = (y * w + x0 + xx) * 4;
+          im.data[i] = im.data[i + 1] = im.data[i + 2] = v;
         }
       }
-    });
-    if (dark) for (let p = 0; p < buf.length; p++) buf[p] = 255 - buf[p];
-    if (sb) mosTopHatClean(buf, cw, OH, Math.max(7, Math.round(col.hc / 6.6 * 1.2) | 1));
-    const c = document.createElement('canvas'); c.width = cw; c.height = OH;
+      c.getContext('2d').putImageData(im, 0, 0);
+      c._x0 = b0 * B;
+    }
+    r._cv = c; r._cvSc = sc;
+    return c;
+  };
+  const CH = 6000, chunks = [];
+  for (let c0 = 0; c0 < total; c0 += CH) {
+    const cw = Math.min(CH, total - c0);
+    const c = document.createElement('canvas'); c.width = cw; c.height = H;
     const g = c.getContext('2d');
-    const im = g.createImageData(cw, OH);
-    for (let p = 0, i = 0; p < buf.length; p++, i += 4) { const v = buf[p]; im.data[i] = im.data[i + 1] = im.data[i + 2] = v; im.data[i + 3] = 255; }
-    g.putImageData(im, 0, 0);
-    if (preproc) scrollApplyPreprocInPlace(c, { ...preproc, invertMode: 'off', playheadRemove: false });
+    g.fillStyle = '#fff'; g.fillRect(0, 0, cw, H);
+    g.imageSmoothingQuality = 'high';
+    runs.forEach((r, ri) => {
+      const rc = runCanvas(r);
+      if (!rc) return;
+      const isNative = !!(r.native && col.native);
+      const gx = Math.round((pl.place[ri] + rc._x0) * sc) - c0;
+      const gw = isNative ? rc.width : Math.round(rc.width * sc);
+      if (gx + gw <= 0 || gx >= cw) return;
+      g.drawImage(rc, gx, 0, gw, H);
+    });
+    // 흑백 처리는 정답 악보 7곡으로 검증된 페이지 전환형과 같은 방식: 임계값 + 그림 배경 지우기(얼룩이 있을 때만) + 잡티 제거.
+    // 예전 방식(화면 배경 빼기·오선 복원·탑햇 전체 적용)은 숫자를 배경으로 지우거나, 오선을 굵게 칠해 줄 위 숫자를 덮었다
+    if (preproc) {
+      const P = VIDEO_DEFAULTS_INIT, im2 = g.getImageData(0, 0, cw, H);
+      // 부드러운 경계(softness)는 0 — 원본 해상도의 가는 오선·마디선이 연회색으로 남아 마디선 검출(밝기 140 미만만 선으로 봄)이 실패했다
+      applyThreshold(im2, P.threshold, false, 0);
+      cleanPictureBackground(im2, cw, H);
+      if (P.despeckle) despeckleBinary(im2, cw, H, P.despeckleSize);
+      g.putImageData(im2, 0, 0);
+    }
     chunks.push(c);
   }
   // 시간: 정지 구간은 창 전체를 구간 시간에 비례 분배, 움직이는 구간은 창 가운데가 지나가는 시각
   const pts = [];
   runs.forEach((r, ri) => {
     const base = pl.place[ri], f = r.frames, t0 = f[0].t, t1 = f[f.length - 1].t;
-    const s0 = base + r.lo, s1 = base + r.hi;
-    pts.push([s0, t0]);
-    if (r.hi - r.lo - OW >= OW * 0.25) for (const q of f) pts.push([base + q.x + OW / 2, q.t]);
-    pts.push([s1, t1]);
+    pts.push([(base + r.lo) * sc, t0]);
+    if (r.hi - r.lo - OW >= OW * 0.25) for (const q of f) pts.push([(base + q.x + OW / 2) * sc, q.t]);
+    pts.push([(base + r.hi) * sc, t1]);
   });
   pts.sort((a, b) => a[0] - b[0]);
   const T = [], S = [];
@@ -10470,8 +10560,8 @@ function mosRender(col, pl, preproc) {
     T.push(t); S.push(s);
   }
   if (!T.length) { T.push(0); S.push(0); }
-  const track = { t: T, X: S, k0: 0, k1: T.length - 1, totalW: total, nativeW: OW, barCols: [0, 0], staticRanges: [] };
-  return { chunks, totalW: total, H: OH, stats: {}, tFirst: T[0], track };
+  const track = { t: T, X: S, k0: 0, k1: T.length - 1, totalW: total, nativeW: Math.round(OW * sc), barCols: [0, 0], staticRanges: [] };
+  return { chunks, totalW: total, H, stats: {}, tFirst: T[0], track, scale: sc };
 }
 
 // 장면 하나의 미리보기(가로로 긴 작은 그림) — 장면 목록에서 손으로 고칠 때 쓴다
@@ -10595,9 +10685,9 @@ function MosaicStep({ videoRef, onModeBack }) {
     setInfo(prev => ({
       ...(prev || {}), ...(timing || {}),
       frames: col.nFrames, blank: col.nBlank, runs: pl.runs.length, overlap: pl.joins.length - nAppend, append: nAppend, suspect: nSuspect,
-      width: res.totalW, H: res.H, screenBg: col.screenBg ? Math.round(col.screenBg.busyFrac * 100) : 0, D: pl.D, dark: col.dark,
+      width: res.totalW, H: res.H, screenBg: 0, native: col.native ? Math.round(col.native.NW) : 0, D: pl.D, dark: col.dark,
       seams: pl.joins.map((j, i) => ({
-        j: i + 1, x: Math.round(j.x), suspect: !!j.suspect, manual: !!j.manual,
+        j: i + 1, x: Math.round(j.x * (res.scale || 1)), suspect: !!j.suspect, manual: !!j.manual,
         tip: (j.manual ? '[직접 지정] ' : '') + (j.type === 'overlap' ? '겹쳐 붙임 (겹침 ' + Math.round(j.overlap * 100) + '%' : j.suspect ? '이어 붙임 — 앞뒤 장면이 맞지 않음, 누락 의심 (' : '이어 붙임 — 페이지 전환 (') + ' · NCC ' + j.ncc.toFixed(2) + ')',
       })),
     }));
@@ -10646,6 +10736,11 @@ function MosaicStep({ videoRef, onModeBack }) {
       diagRef.current.collect = { frames: col.nFrames, blank: col.nBlank, runs: col.runs.length, OW: col.OW, OH: col.OH, dark: col.dark, screenBg: !!col.screenBg, ms: Math.round(performance.now() - t0) };
       if (abortRef.current) { setMsg('중단됨 — "진단 파일 받기"로 지금까지의 기록을 받을 수 있습니다'); return; }
       if (!col.runs.length) { setMsg('악보 장면을 찾지 못했습니다 — TAB 영역을 다시 지정해 보세요.'); return; }
+      // 페이지처럼 멈춰 있는 장면이 대부분이면 그 장면들을 원본 해상도로 다시 잡는다 (4K에서 숫자가 깨지던 문제)
+      const nStatic = col.runs.filter(r => r.static).length;
+      if (nStatic && nStatic >= col.runs.length * 0.5) {
+        await mosCaptureNative(video, roi, col, col.runs, (i, n) => { setMsg('페이지를 원본 해상도로 다시 잡는 중... ' + i + '/' + n); setPct(90 + Math.round(5 * i / n)); });
+      }
       const t1 = performance.now();
       setPct(95);
       await new Promise(r => setTimeout(r, 0));
@@ -10699,6 +10794,7 @@ function MosaicStep({ videoRef, onModeBack }) {
       });
       if (sub.runs.length < 2) { setMsg('장면 ' + (idx + 1) + '은 더 나눌 수 없었습니다 (한 장면으로 보입니다)'); return; }
       col.runs.splice(idx, 1, ...sub.runs);
+      if (col.native) await mosCaptureNative(video, roi, col, sub.runs);
       build(col, edits);
       setMsg('장면 ' + (idx + 1) + '을 ' + sub.runs.length + '개로 나눴습니다');
     } catch (err) {
@@ -10809,7 +10905,7 @@ function MosaicStep({ videoRef, onModeBack }) {
           <div className="block-head"><span>합쳐진 악보 띠</span></div>
           <p className="hint-text">
             장면 {info.frames}개 · 안정 구간 {info.runs}개 · 겹쳐 붙임 {info.overlap}곳 · 이어 붙임 {info.append}곳{info.suspect ? ' (그중 누락 의심 ' + info.suspect + '곳 — 띠 위 빨간 표시를 확인하세요)' : ''}
-            {info.D != null ? ' · 점프 폭 ' + Math.round(info.D / MOS_REG_W * 100) + '%' : ''}{info.screenBg ? ' · 화면 배경(그림) 제거' : ''} · {result.totalW}×{result.H}px ·
+            {info.D != null ? ' · 점프 폭 ' + Math.round(info.D / MOS_REG_W * 100) + '%' : ''}{info.native ? ' · 페이지를 원본 해상도(가로 ' + info.native + 'px)로 다시 잡음' : ''} · {result.totalW}×{result.H}px ·
             재생 {(info.collectS || 0).toFixed(1)}초 + 합치기 {(info.buildS || 0).toFixed(1)}초
           </p>
           {sceneList && (
