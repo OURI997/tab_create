@@ -1435,6 +1435,7 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
       // 빠른 재생(8배속)으로 흘려보내며 step 간격의 프레임만 집는다 — 샘플마다 seek하던 방식(샘플당 0.1~0.3초)보다 몇 배 빠르다.
       // 프레임 시각은 실제 표시된 프레임의 mediaTime을 쓴다. rVFC가 없는 브라우저는 flowPlayPass가 seek 방식으로 대신한다.
       let lastLog = -1;
+      const pageStats = {};
       await flowPlayPass(video, {
         startT: rangeS, endT: Math.max(rangeS, rangeE - 0.02), rate: PAGE_ANALYZE_RATE, maxRate: PAGE_ANALYZE_RATE, minGap: step,
         onFrame: t => {
@@ -1443,6 +1444,9 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
           if (samples.length - lastLog >= 10) { lastLog = samples.length; log('분석 중... ' + t.toFixed(1) + 's / ' + rangeE.toFixed(1) + 's'); }
         },
         onProgress: p => setAnalyzeProgress(Math.min(100, Math.round(p * 100))),
+        onRestart: () => { times.length = 0; samples.length = 0; lastLog = -1; },
+        onNotice: m => log(m),
+        stats: pageStats,
       });
       // 빠른 재생 중 디코더가 따라가지 못해 프레임이 건너뛰어진 구간(샘플 간격 > 2.5×step)은 seek로 채운다 —
       // 건너뛴 곳에 페이지 전환이 있으면 통째로 놓치기 때문(실측: 1080p 영상에서 18초 구멍).
@@ -6194,17 +6198,33 @@ function flowPauseNotice(on) {
     clearTimeout(el._t); el._t = setTimeout(() => { el.style.display = 'none'; }, 2500);
   }
 }
-async function flowPlayPass(video, { startT, endT, rate, minGap, onFrame, onProgress, abortRef, maxRate, onPause, stats }) {
+// 화면 지문: 영상 전체를 16×9로 줄인 밝기 값을 숫자 하나로 — "같은 그림이 다시 나왔는지"만 본다
+const flowFpCanvas = typeof document !== 'undefined' ? document.createElement('canvas') : null;
+function flowFrameFingerprint(video) {
+  const c = flowFpCanvas; c.width = 16; c.height = 9;
+  const g = c.getContext('2d', { willReadFrequently: true });
+  g.drawImage(video, 0, 0, 16, 9);
+  const d = g.getImageData(0, 0, 16, 9).data;
+  let h = 2166136261;
+  for (let i = 0; i < d.length; i += 4) { h ^= (d[i] + d[i + 1] + d[i + 2]); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+// 한 장씩 이동하며 읽기 (빠른 재생을 못 쓰는 브라우저·상황용) — 느리지만 확실하다
+async function flowSeekPass(video, { startT, endT, minGap, onFrame, onProgress, abortRef, st }) {
+  const span = Math.max(0.001, endT - startT);
+  for (let t = startT; t <= endT && !(abortRef && abortRef.current); t += minGap) {
+    await seekRobust(video, t);
+    onFrame(t); st.frames++;
+    if (onProgress) onProgress((t - startT) / span);
+  }
+}
+async function flowPlayPass(video, { startT, endT, rate, minGap, onFrame, onProgress, abortRef, maxRate, onPause, stats, onRestart, onNotice }) {
   onPause = onPause || flowPauseNotice;
   const span = Math.max(0.001, endT - startT);
   const st = stats || {};
-  st.pauses = 0; st.stalls = 0; st.rateChanges = []; st.frames = 0;
+  st.pauses = 0; st.stalls = 0; st.rateChanges = []; st.frames = 0; st.staleFallback = false;
   if (!flowRvfcSupported(video)) {
-    for (let t = startT; t <= endT && !(abortRef && abortRef.current); t += minGap) {
-      await seekTo(video, t);
-      onFrame(t); st.frames++;
-      if (onProgress) onProgress((t - startT) / span);
-    }
+    await flowSeekPass(video, { startT, endT, minGap, onFrame, onProgress, abortRef, st });
     return;
   }
   video.muted = true;
@@ -6220,6 +6240,11 @@ async function flowPlayPass(video, { startT, endT, rate, minGap, onFrame, onProg
       let last = -Infinity, done = false, hiddenPaused = false, resuming = false;
       let lastCbWall = performance.now(), stallTries = 0, pending = false;
       const gaps = [];
+      // 사파리(4K 등)는 빠른 재생 중 화면을 읽으면 대부분 '예전에 그려 둔 같은 장면'을 돌려주고 가끔만 진짜 장면을 준다
+      // (진단: 7초마다 바뀌는 페이지가 10초에 한 번만 바뀐 것으로 읽힘 → 대표 프레임 1장). 지문이 A→B→A로 정확히 되돌아가는 일이
+      // 두 번 생기면 이 상태로 보고, 빠른 재생을 멈춘 뒤 처음부터 한 장씩 이동하며 읽는다
+      const fps = [];
+      let aba = 0;
       const req = () => { if (!pending && !done) { pending = true; video.requestVideoFrameCallback(cb); } };
       const finish = () => {
         if (done) return;
@@ -6284,6 +6309,13 @@ async function flowPlayPass(video, { startT, endT, rate, minGap, onFrame, onProg
           }
           last = t;
           stallTries = 0;
+          try {
+            const fp = flowFrameFingerprint(video);
+            fps.push(fp);
+            const n = fps.length;
+            if (n >= 3 && fps[n - 3] === fps[n - 1] && fps[n - 2] !== fps[n - 1]) aba++;
+            if (aba >= 2) { st.staleFallback = true; finish(); return; }
+          } catch (e) { /* 지문 실패는 무시 */ }
           try { onFrame(t); st.frames++; } catch (err) { failure = err; finish(); return; }
           if (onProgress) onProgress(Math.min(1, (t - startT) / span));
         }
@@ -6302,6 +6334,13 @@ async function flowPlayPass(video, { startT, endT, rate, minGap, onFrame, onProg
     video.pause(); video.muted = true; video.playbackRate = 1;
   }
   if (failure) throw failure;
+  if (st.staleFallback && !(abortRef && abortRef.current)) {
+    const note = '이 브라우저는 빠르게 재생하는 영상의 화면을 제대로 읽지 못해(사파리·4K에서 생김) 한 장씩 이동하며 다시 읽습니다 — 시간이 더 걸립니다';
+    if (onNotice) onNotice(note); else console.warn(note);
+    if (onRestart) onRestart();
+    st.frames = 0;
+    await flowSeekPass(video, { startT, endT, minGap, onFrame, onProgress, abortRef, st });
+  }
 }
 
 // ---- 1패스: ROI를 저해상도 그레이로 수집 ----
@@ -10268,7 +10307,7 @@ function mosTopHatClean(buf, w, h, k) {
 let mosRunSeq = 0;
 // strict: 장면 나누기(사용자가 "이 장면 나누기")용 — 정지 장면에서 조금만 달라져도 새 장면으로 본다
 // diag: 진단 기록 배열 — 장면마다 [시각, 저해상도 일치, 이동, 고해상도 일치, 코드줄 일치, 판정] (판정: J 이어짐, N 새 장면, B 빈 화면)
-async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress, motion, strict, forceDark, diag, stats }) {
+async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress, motion, strict, forceDark, diag, stats, onNotice }) {
   const vw = video.videoWidth, vh = video.videoHeight;
   const { rx0, ry0, rw, rh } = roiRectPx(video, roi);
   const OW = Math.max(64, Math.min(MOS_OUT_W, Math.round(rw)));
@@ -10412,6 +10451,8 @@ async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress
   await flowPlayPass(video, {
     startT, endT, rate, maxRate: rate, minGap: 1 / MOS_FPS - 0.01, onFrame,
     onProgress: f => onProgress && onProgress(f), abortRef, stats,
+    onRestart: () => { runs.length = 0; cur = null; prev = null; nFrames = 0; nBlank = 0; bgSamples = []; if (diag) diag.length = 0; },
+    onNotice,
   });
   flushRun(true);
   return { runs, OW, OH, hc, hl, hf, W, kk, rr, dark, bg, nFrames, nBlank, screenBg: mosScreenBackground(bgSamples, OW, OH, dark) };
@@ -10764,6 +10805,7 @@ function MosaicStep({ videoRef, onModeBack }) {
       setMsg('영상을 한 번 재생하며 장면을 맞추는 중... (이 탭을 열어 두세요 — 다른 탭으로 가면 일시정지됩니다)');
       const col = await mosCollect(video, roi, {
         rate, startT: rangeStart, endT: Math.max(rangeStart, rangeEnd - 0.02), abortRef, motion: askMotion, diag, stats,
+        onNotice: m => setMsg(m),
         onProgress: f => { const p = Math.round(f * 90); setPct(p); document.title = '(' + p + '%) ' + baseTitle; },
       });
       diagRef.current.collect = { frames: col.nFrames, blank: col.nBlank, runs: col.runs.length, OW: col.OW, OH: col.OH, dark: col.dark, screenBg: !!col.screenBg, ms: Math.round(performance.now() - t0) };
