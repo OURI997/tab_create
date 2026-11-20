@@ -962,8 +962,9 @@ function seekTo(video, t) {
   if (isFinite(d) && d > 0.1) t = Math.min(t, d - 0.05);
   return new Promise(resolve => {
     let done = false;
-    const end = () => { if (done) return; done = true; video.removeEventListener('seeked', onSeeked); resolve(); };
-    const onSeeked = () => { waitForFramePresented(video).then(end); };
+    let ok = false;
+    const end = () => { if (done) return; done = true; video.removeEventListener('seeked', onSeeked); resolve(ok); };
+    const onSeeked = () => { ok = true; waitForFramePresented(video).then(end); };
     video.addEventListener('seeked', onSeeked);
     setTimeout(end, 4000);
     video.currentTime = t;
@@ -1274,7 +1275,7 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
 
   async function showFrameAt(t) {
     const video = videoRef.current;
-    await seekTo(video, Math.min(t, Math.max(0, video.duration - 0.05)));
+    await seekRobust(video, Math.min(t, Math.max(0, video.duration - 0.05)));
     const canvas = roiCanvasRef.current;
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
@@ -1300,12 +1301,17 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
     if (seekBusyRef.current) return;
     seekBusyRef.current = true;
     (async () => {
-      while (pendingSeekRef.current != null) {
-        const target = pendingSeekRef.current;
-        pendingSeekRef.current = null;
-        await showFrameAt(target);
+      try {
+        while (pendingSeekRef.current != null) {
+          const target = pendingSeekRef.current;
+          pendingSeekRef.current = null;
+          await showFrameAt(target);
+        }
+      } catch (err) {
+        console.warn('미리보기 이동 실패', err);
+      } finally {
+        seekBusyRef.current = false; // 한 번 실패해도 슬라이더·구간 핸들이 계속 동작하게
       }
-      seekBusyRef.current = false;
     })();
   }
 
@@ -1445,10 +1451,13 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
         const edges = [rangeS - step, ...times, rangeE];
         for (let i = 1; i < edges.length; i++) if (edges[i] - edges[i - 1] > step * 2.5) gaps.push([edges[i - 1], edges[i]]);
         let filled = 0;
+        let need = 0;
+        for (const [g0, g1] of gaps) need += Math.max(0, Math.ceil((Math.min(g1, rangeE) - g0) / step) - 1);
         for (const [g0, g1] of gaps) {
           for (let t = Math.max(rangeS, g0 + step); t < g1 - step * 0.5 && t < rangeE; t += step) {
-            await seekTo(video, t);
+            await seekRobust(video, t);
             times.push(t); samples.push(cap(t)); filled++;
+            if (filled % 5 === 0) log('빠른 재생 중 건너뛴 곳을 채우는 중... ' + filled + '/' + need + '장');
           }
         }
         if (filled) {
@@ -1502,7 +1511,8 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
       for (let s = 0; s < segments.length; s++) {
         const g = segments[s];
         const repTime = times[g.rep];
-        await seekTo(video, repTime);
+        log('대표 프레임 뽑는 중... ' + (s + 1) + '/' + segments.length);
+        await seekRobust(video, repTime);
         const captured = captureRoiNative(video, (A.roi !== undefined ? A.roi : roiRef.current));
         newFrames.push({
           id: 'f_' + Date.now() + '_' + s,
@@ -5205,7 +5215,30 @@ function drawVideoFrameWithRoi(canvasEl, video, roi) {
 }
 // seeked가 안 오는 극단적인 경우에도 큐가 멈추지 않도록 시간 제한을 둔 seek
 function seekSafe(video, t) {
-  return Promise.race([seekTo(video, t), new Promise(r => setTimeout(r, 2500))]);
+  return Promise.race([seekRobust(video, t), new Promise(r => setTimeout(r, 9000))]);
+}
+// 사파리는 한동안 멈춰 있던 (작게 숨긴) 영상의 디코더를 쉬게 한다 — 그 뒤로는 이동(seek)해도 'seeked'가 늦거나 오지 않고 새 화면이 그려지지 않았다
+// (증상: 영상을 넣고 잠시 두면 영상 확인·구간 선택 화면이 굳음, 분석 100% 뒤 대표 프레임 뽑기에서 멈춘 것처럼 보임).
+// 이동이 4초 안에 끝나지 않았거나 그릴 프레임이 없으면, 소리 없이 아주 잠깐 재생했다 멈춰 디코더를 깨운 뒤 다시 이동한다.
+async function wakeVideoDecoder(video) {
+  const was = flowInternalPlayRef.current;
+  flowInternalPlayRef.current = true; // 앱의 '자동 재생 막기'가 이 재생을 끊지 않게
+  try {
+    video.muted = true;
+    await Promise.race([video.play().catch(() => {}), new Promise(r => setTimeout(r, 1500))]);
+    await new Promise(r => setTimeout(r, 60));
+  } finally {
+    video.pause();
+    flowInternalPlayRef.current = was;
+  }
+}
+async function seekRobust(video, t) {
+  let ok = await seekTo(video, t);
+  if (!ok || video.readyState < 2) {
+    await wakeVideoDecoder(video);
+    ok = await seekTo(video, t);
+  }
+  return ok;
 }
 
 // 전체 영상 미니 타임라인 — CaptureStep 트림 UI(.range-slider-*)와 같은 구조·같은 포인터 드래그 패턴.
