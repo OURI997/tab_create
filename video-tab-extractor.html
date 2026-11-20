@@ -386,9 +386,32 @@ function drawProcessed(canvas, img, s) {
   if (s.removeBg) {
     const imageData = ctx.getImageData(0, 0, sw, sh);
     applyThreshold(imageData, s.threshold, s.invert, s.softness || 0);
+    if (s.cleanPicture !== false) cleanPictureBackground(imageData, sw, sh);
     if (s.despeckle) despeckleBinary(imageData, sw, sh, s.despeckleSize || 0);
     ctx.putImageData(imageData, 0, 0);
   }
+}
+
+// 그림 배경 지우기 (페이지 전환형): 반투명 악보 뒤로 비친 연주 영상(기타 몸통·마이크 등)이 흑백 처리 뒤 회색 얼룩으로 남는 문제.
+// 검은 탑햇(닫힘 − 원본)은 커널보다 가는 구조(오선·숫자·글자·마디선)만 남기고 넓은 얼룩을 지운다.
+// 지워지는 양이 화면의 1.5% 미만이면(흰 바탕 영상 — 지울 얼룩이 없음) 원본을 그대로 둔다 → 깨끗한 영상의 결과는 바뀌지 않는다.
+function cleanPictureBackground(imageData, w, h) {
+  const d = imageData.data, n = w * h, buf = new Uint8Array(n);
+  for (let p = 0, i = 0; p < n; p++, i += 4) buf[p] = (d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114) | 0;
+  // 어두운 바탕 그대로인 결과(반전 안 함)는 대상이 아니다
+  let sum = 0;
+  for (let p = 0; p < n; p++) sum += buf[p];
+  if (sum / n < 150) return false;
+  const out = buf.slice();
+  const k = Math.max(7, Math.round(h * 0.06) | 1); // 오선 간격의 약 1.2배 (영역 높이 ≈ 오선 간격 × 17~20)
+  mosTopHatClean(out, w, h, k);
+  // 얼룩 = 탑햇이 바탕으로 판정한 연한~중간 회색. 옅은 그라데이션 얼룩도 잡도록 235 미만까지 센다
+  let removed = 0;
+  for (let p = 0; p < n; p++) if (buf[p] < 235 && out[p] > 245) removed++;
+  if (removed / n < 0.01) return false;
+  // 탑햇 결과와 원본 중 밝은 쪽: 넓은 얼룩은 종이색이 되고, 가는 선·숫자(회색 오선 포함)는 원래 밝기 그대로 남는다
+  for (let p = 0, i = 0; p < n; p++, i += 4) { const v = Math.max(buf[p], out[p]); d[i] = d[i + 1] = d[i + 2] = v; }
+  return true;
 }
 
 // Same shape/logic as tab-score-builder.html's effectiveImageSettings — crop and playhead removal
@@ -399,14 +422,14 @@ function effectiveImageSettings(item, defaults) {
   if (o) {
     return {
       removeBg: o.removeBg, invert: o.invert, threshold: o.threshold, softness: o.softness,
-      despeckle: o.despeckle, despeckleSize: o.despeckleSize,
+      despeckle: o.despeckle, despeckleSize: o.despeckleSize, cleanPicture: o.cleanPicture !== false,
       playheadRemove: false, playheadColor: null,
       cropTop: 0, cropBottom: 0, cropLeft: 0, cropRight: 0,
     };
   }
   return {
     removeBg: defaults.removeBg, invert: item.invert, threshold: defaults.threshold, softness: defaults.softness,
-    despeckle: defaults.despeckle, despeckleSize: defaults.despeckleSize,
+    despeckle: defaults.despeckle, despeckleSize: defaults.despeckleSize, cleanPicture: defaults.cleanPicture !== false,
     playheadRemove: false, playheadColor: null,
     cropTop: 0, cropBottom: 0, cropLeft: 0, cropRight: 0,
   };
@@ -415,6 +438,7 @@ function effectiveImageSettings(item, defaults) {
 const VIDEO_DEFAULTS_INIT = {
   removeBg: true, invertMode: 'auto', threshold: 170, softness: 60, // 다른 모드의 DEFAULT_PREPROC와 같은 값
   despeckle: true, despeckleSize: 3,
+  cleanPicture: true, // 그림 배경 지우기 (얼룩이 있을 때만 작동)
 };
 
 // ==== new for this page: video capture / ROI diff detection ====
@@ -1265,17 +1289,10 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
     setAutoRoiBusy(true); setAutoRoiMsg('TAB 영역을 찾는 중...');
     const r = await autoFindTabRoi(src);
     setAutoRoiBusy(false);
-    if (r) { setRoi({ x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1 }); setAutoRoiMsg('TAB 오선을 찾아 영역을 자동으로 지정했습니다 (' + r.frames + '/5 장면). 다르면 드래그로 다시 지정하세요.'); }
+    if (r) { setRoi({ x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1, core: r.core }); setAutoRoiMsg('TAB 오선을 찾아 영역을 자동으로 지정했습니다 (' + r.frames + '/5 장면). 다르면 드래그로 다시 지정하세요.'); }
     else setAutoRoiMsg(manual ? 'TAB 오선을 찾지 못했습니다 — 드래그로 직접 지정하세요.' : '');
   }
-  useEffect(() => {
-    if (!videoLoaded) return;
-    const video = videoRef.current;
-    const src = video && (video.currentSrc || video.src);
-    if (!src || autoRoiSrcRef.current === src || roiRef.current) return;
-    autoRoiSrcRef.current = src;
-    runAutoRoi(false);
-  }, [videoLoaded]);
+  // TAB 영역 자동 찾기는 없앴다 — 정답 악보 7곡 채점에서 코드 패널·자막 줄을 잘못 포함해 페이지를 놓쳤다. 영역은 항상 사용자가 지정한다
 
   function requestScrub(t) {
     if (busyRef.current) return; // 분석·추출 중 seek 금지 — 분석 루프가 엉뚱한 시점의 프레임을 읽게 된다
@@ -1402,7 +1419,11 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
     // diffs[i] = times[i]와 times[i+1] 사이의 변화 점수(1 − NCC), meanDiffs[i] = 같은 쌍의 평균 밝기 차이(참고용)
     const times = [], diffs = [], meanDiffs = [], samples = [];
     const roiAtStart = roiRef.current; // 분석 도중 영역이 바뀌어도 이 값으로 끝까지 분석
-    const cap = pageMakeCapture(video, roiAtStart);
+    // 비교는 오선 띠 위쪽(코드 이름·연주 영상이 비치는 곳)을 빼고, 오선부터 영역 아래 끝(리듬·가사)까지만 한다.
+    // 위쪽에 연주 영상이 조금만 들어와도 그 움직임이 잡음이 되어, 첫 마디 숫자 몇 개만 다른 페이지 전환을 놓쳤다(Deja vu 채점에서 확인).
+    // 영역을 손으로 지정하면(core 없음) 영역 전체를 그대로 비교한다
+    const cmpRoi = roiAtStart && roiAtStart.core ? { ...roiAtStart, y0: Math.max(roiAtStart.y0, roiAtStart.core.y0) } : roiAtStart;
+    const cap = pageMakeCapture(video, cmpRoi);
     busyRef.current = true;
     try {
       // 빠른 재생(8배속)으로 흘려보내며 step 간격의 프레임만 집는다 — 샘플마다 seek하던 방식(샘플당 0.1~0.3초)보다 몇 배 빠르다.
@@ -1487,10 +1508,21 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
           id: 'f_' + Date.now() + '_' + s,
           dataUrl: captured.dataUrl, w: captured.w, h: captured.h,
           segStartT: times[g.s], segEndT: times[g.e], repT: repTime,
+          hasStaff: canvasHasTabStaff(roiCaptureCanvas) || !!uniFindBand(roiCaptureCanvas, DEFAULT_PREPROC),
         });
+      }
+      // 맨 앞·맨 뒤의 TAB 없는 짧은 장면(제목 화면 등)은 뺀다.
+      // 오선 판정 두 가지가 모두 실패하고 6초 이하일 때만 — 어두운 반투명 바탕(4K 등)에선 오선 판정이 실제 페이지에서도 틀려,
+      // 판정만 믿고 빼면 첫·마지막 페이지가 사라졌다(정답 악보 채점에서 확인). 가운데 장면은 건드리지 않는다
+      let noStaffEdge = 0;
+      const dropable = f => !f.hasStaff && f.segEndT - f.segStartT <= 6;
+      if (newFrames.some(f => f.hasStaff)) {
+        while (newFrames.length > 1 && dropable(newFrames[0])) { newFrames.shift(); noStaffEdge++; }
+        while (newFrames.length > 1 && dropable(newFrames[newFrames.length - 1])) { newFrames.pop(); noStaffEdge++; }
       }
       setFrames(newFrames);
       const notes = [];
+      if (noStaffEdge) notes.push('앞뒤 TAB 없는 화면(제목 등) ' + noStaffEdge + '개');
       if (removed.short) notes.push('전환 도중 프레임 ' + removed.short + '개');
       if (removed.blank) notes.push('빈 화면 ' + removed.blank + '개');
       if (removed.dup) notes.push('바로 앞과 같은 페이지 ' + removed.dup + '개');
@@ -1541,7 +1573,7 @@ function CaptureStep({ videoRef, frames, setFrames, onsets, setOnsets, videoFile
         </div>
         {videoLoaded && (
           <div className="toolbar" style={{ marginTop: 6 }}>
-            <button className="icon-btn" onClick={() => runAutoRoi(true)} disabled={autoRoiBusy || analyzing || extracting}>{autoRoiBusy ? '찾는 중...' : 'TAB 영역 자동 찾기'}</button>
+
             {autoRoiMsg && <span className="hint-text">{autoRoiMsg}</span>}
           </div>
         )}
@@ -2159,6 +2191,10 @@ function PreprocessStep({ items, setItems, defaults, setDefaults, videoFile, ons
                   <label>
                     <input type="checkbox" checked={defaults.removeBg} onChange={e => update({ removeBg: e.target.checked })} />
                     배경 제거 기본 사용
+                  </label>
+                  <label title="반투명 악보 뒤로 비친 연주 영상이 회색 얼룩으로 남을 때 지웁니다. 얼룩이 없는 영상은 결과가 바뀌지 않습니다.">
+                    <input type="checkbox" checked={defaults.cleanPicture !== false} onChange={e => update({ cleanPicture: e.target.checked })} />
+                    그림 배경 지우기 (회색 얼룩)
                   </label>
                   <div>
                     <div className="slider-label">어두운 배경 처리</div>
@@ -4283,10 +4319,71 @@ function tabRoiFromGray(g, w, h, opts) {
   // 사용자 답(opts.above/below: 'yes' | 'no' | 자동)에 따라 위·아래로 넓히는 한도를 바꾼다.
   //  위 'yes'(코드 이름·다이어그램 있음): 최대 3.6배, 빈 줄 1.2배까지 건너뜀 / 'no': 마디 번호만 — 0.9배
   //  아래 'yes'(가사 있음): 최대 3.2배, 빈 줄 1.2배까지 건너뜀 / 'no': 리듬 기둥만 — 0.9배
-  const up = opts.above === 'yes' ? [3.6, 1.2] : opts.above === 'no' ? [0.9, 0.6] : [2.6, 0.6];
-  const dn = opts.below === 'yes' ? [3.2, 1.2] : opts.below === 'no' ? [0.9, 0.6] : [1.9, 0.6];
+  // 자동·'있음'은 넉넉하게(코드 다이어그램·가사까지) 잡고, 아래의 "악보 패널 경계"로 자른다 — 정답 악보 7곡 모두 패널 전체를 잡았다
+  const up = opts.above === 'no' ? [0.9, 0.6] : [3.6, 1.2];
+  const dn = opts.below === 'no' ? [0.9, 0.6] : [3.2, 1.2];
   let y0 = walk(Math.round(s.top) - off, -1, up[0] * hs, Math.min(up[0], 0.9) * hs - off, up[1]); // 위쪽 최소 0.9배 — 오선에서 조금 떨어진 코드 이름도 잘리지 않게
   let y1 = walk(Math.round(s.bottom) + off, 1, dn[0] * hs, Math.min(dn[0], 0.6) * hs - off, dn[1]);
+  // 악보 패널 경계: 행마다 "바탕 밝기"(행의 중앙값 — 글자·선은 소수라 무시된다)를 보고, 오선 띠의 바탕과 다른 행이
+  // 오선 높이의 0.12배 넘게 이어지는 곳을 패널 끝(연주 영상·자막이 있는 곳)으로 본다. 그 바깥으로는 넓히지 않는다
+  {
+    const rm = new Float32Array(h), tmp = [];
+    for (let y = 0; y < h; y++) {
+      tmp.length = 0;
+      for (let x = xs0; x <= xs1; x += 3) tmp.push(g[y * w + x]);
+      tmp.sort((p, q) => p - q);
+      rm[y] = tmp[tmp.length >> 1];
+    }
+    const band = [];
+    for (let y = Math.round(s.top); y <= Math.round(s.bottom); y++) band.push(rm[y]);
+    band.sort((p, q) => p - q);
+    const B = band[band.length >> 1];
+    const tol = 16, runMax = Math.max(3, Math.round(0.12 * hs));
+    const edge = (start, step, maxd) => {
+      let y = start, run = 0, firstOut = null;
+      while (y + step >= 0 && y + step < h && Math.abs(y + step - start) <= maxd) {
+        y += step;
+        if (Math.abs(rm[y] - B) > tol) {
+          if (!run) firstOut = y;
+          if (++run > runMax) {
+            // 뚜렷한 경계(3행 안에 밝기가 25 넘게 바뀜)일 때만 패널 끝으로 인정 — 어두운 반투명 패널은 위로 갈수록 서서히 밝아지는
+            // 그라데이션이라 경계가 없다(그대로 두면 코드 이름을 자른다)
+            const a = rm[Math.max(0, Math.min(h - 1, firstOut - 2 * step))], b = rm[Math.max(0, Math.min(h - 1, firstOut + 2 * step))];
+            return Math.abs(a - b) >= 25 ? firstOut - step : null;
+          }
+        } else run = 0;
+      }
+      return null; // 한도 안에서 경계가 없다 — 화면 전체가 악보 바탕
+    };
+    const pTop = edge(Math.round(s.top), -1, 4 * hs), pBot = edge(Math.round(s.bottom), 1, 3.5 * hs);
+    // 영상에 박힌 자막 줄 빼기: 위쪽 가장자리의 글자 덩어리가 크고(오선 높이의 0.33배 이상) 화면 가운데 정렬이면 자막.
+    // 코드 이름은 작고(0.2배 안팎) 왼쪽부터 퍼져 있다. 자막과 그 아래 줄 사이 빈 곳의 가운데에서 자른다
+    if (opts.above !== 'yes') {
+      const isInkV = v => (dark ? v > 180 : v < 150);
+      const bands = [];
+      let b = null, blank = 0;
+      for (let y = Math.max(0, Math.round(y0)); y < Math.round(s.top) - off; y++) {
+        let L = -1, R = -1, c = 0;
+        for (let x = xs0; x <= xs1; x++) if (isInkV(g[y * w + x])) { c++; if (L < 0) L = x; R = x; }
+        if (c > 0 && c / (xs1 - xs0 + 1) > 0.002) {
+          if (b && blank <= 1) { b.y1 = y; b.L = Math.min(b.L, L); b.R = Math.max(b.R, R); }
+          else { b = { y0: y, y1: y, L, R }; bands.push(b); }
+          blank = 0;
+        } else blank++;
+      }
+      const W = xs1 - xs0 + 1, mid = (xs0 + xs1) / 2;
+      while (bands.length >= 2) {
+        const t = bands[0], nx = bands[1], gapBelow = nx.y0 - t.y1;
+        const tall = t.y1 - t.y0 + 1 >= 0.33 * hs, centered = Math.abs((t.L + t.R) / 2 - mid) < 0.12 * W && t.L - xs0 > 0.12 * W && xs1 - t.R > 0.12 * W;
+        if (tall && centered && gapBelow >= 0.15 * hs) { y0 = Math.round(t.y1 + gapBelow / 2); break; }
+        // 위쪽 가장자리의 작은 점·잡티(2행 이하, 아래와 멀리 떨어짐)는 버리고 다음 덩어리를 본다
+        if (t.y1 - t.y0 <= 1 && gapBelow >= 0.3 * hs) { y0 = Math.round(t.y1 + gapBelow / 2); bands.shift(); continue; }
+        break;
+      }
+    }
+    if (pTop != null && opts.above !== 'no') y0 = Math.max(y0, pTop);
+    if (pBot != null && opts.below !== 'no') y1 = Math.min(y1, pBot);
+  }
   // 다른 오선(위의 오선보 5줄, 아래의 다음 단)을 넘어가지 않는다 — TAB만 남기고, 두 단이 섞이면 이어 붙이기·마디 검출이 틀어진다
   for (const o of st) {
     if (o === s) continue;
@@ -4333,8 +4430,48 @@ function tabRoiFromGray(g, w, h, opts) {
     let xx = x; while (xx < xs1 && isWall(xx)) xx++;
     if (colOk(xx + 2)) { L = { x: xx + 2, wall: true }; break; }
   }
+  // 벽이 없으면: 가운데에서 바깥으로 오선을 따라가다 오선이 끊긴 빈 틈(폭의 1.2% 이상)이 나오면 거기가 오선 끝.
+  // 그 너머(오른쪽 코드 다이어그램 패널 등)는 빼고, 여유도 빈 틈의 절반을 넘지 않게 한다
+  const gapLim = Math.max(4, Math.round(0.012 * w));
+  const trimGap = (from, step, lim) => {
+    let x = from, last = from, fail = 0;
+    while ((x + step - lim) * step <= 0) {
+      x += step;
+      if (colOk(x)) { last = x; fail = 0; }
+      else if (++fail > gapLim) {
+        // 빈 틈 너머에 오선이 다시 이어지면(마디 사이 여백·큰 숫자 칸) 끝이 아니다 — 너머 3% 안에 오선이 절반 넘게 있으면 계속
+        let ok = 0, n = 0;
+        for (let k = 1; k <= Math.round(0.03 * w); k++) { const xx = x + step * k; if ((xx - lim) * step > 0) break; n++; if (colOk(xx)) ok++; }
+        if (n && ok / n > 0.5) { fail = 0; continue; }
+        let free = 0;
+        for (let xx = last + step; (xx - lim) * step <= 0 && !colOk(xx) && free < 0.05 * w; xx += step) free++;
+        return { x: last, pad: Math.min(0.02 * w, free * 0.4) };
+      }
+    }
+    return null;
+  };
+  const xc = Math.round((xs0 + xs1) / 2);
+  let padR = R.wall ? 0 : 0.02 * w, padL = L.wall ? 0 : 0.02 * w;
+  if (colOk(xc) || colOk(xc - 2) || colOk(xc + 2)) {
+    if (!R.wall) { const t = trimGap(xc, 1, R.x); if (t && t.x < R.x) { R = { x: t.x, wall: false }; padR = t.pad; } }
+    if (!L.wall) { const t = trimGap(xc, -1, L.x); if (t && t.x > L.x) { L = { x: t.x, wall: false }; padL = t.pad; } }
+  }
+  // 여유(pad)는 오선 끝 바깥의 "빈 열"(오선 띠에 잉크가 전혀 없는 열) 폭의 절반까지만 — 바로 옆에 코드 패널이 붙어 있으면 그 테두리를 먹지 않게
+  const blankRun = (x, step) => {
+    let n = 0;
+    for (let xx = x + step; xx >= 0 && xx < w && n < 0.05 * w; xx += step) {
+      let ink = false;
+      for (let y = Math.round(s.top); y <= Math.round(s.bottom) && !ink; y++) if (isInk(g[y * w + xx])) ink = true;
+      if (ink) break;
+      n++;
+    }
+    return n;
+  };
+  if (!R.wall) padR = Math.min(padR, blankRun(R.x, 1) * 0.5 + 1);
+  if (!L.wall) padL = Math.min(padL, blankRun(L.x, -1) * 0.5 + 1);
+  if (R.x + padR >= w - 2) padR = w - 1 - R.x; // 화면 끝까지 오선이면 끝까지
+  if (L.x - padL <= 1) padL = L.x;
   const lx = L.x, rx = R.x;
-  const padL = L.wall ? 0 : 0.02 * w, padR = R.wall ? 0 : 0.02 * w;
   return {
     x0: Math.max(0, (lx - padL) / w), x1: Math.min(1, (rx + 1 + padR) / w),
     y0: Math.max(0, y0 / h), y1: Math.min(1, (y1 + 1) / h),
@@ -4379,7 +4516,10 @@ async function autoFindTabRoi(srcUrl, opts) {
     const med = key => { const a = found.map(f => f[key]).sort((x, y) => x - y); return a[Math.floor((a.length - 1) / 2)]; };
     // 가장자리는 중앙값이 아니라 "두 번째로 넓은 값" — 가사·코드가 일부 장면에만 있어도 잘리지 않게 (가장 넓은 1장은 이상치로 버린다)
     const outer = (key, wide) => { const a = found.map(f => f[key]).sort((x, y) => (wide === 'min' ? x - y : y - x)); return a[Math.min(1, a.length - 1)]; };
-    const r = { x0: outer('x0', 'min'), y0: outer('y0', 'min'), x1: outer('x1', 'max'), y1: outer('y1', 'max'), frames: found.length };
+    // 좌우는 중앙값(한 장면에서 옆 패널까지 잡혀도 따라가지 않게), 위아래는 두 번째로 넓은 값(가사·코드가 일부 장면에만 있어도 포함)
+    // 위아래도 중앙값 — "두 번째로 넓은 값"은 자막이 섞인 장면 하나를 따라가 영역에 자막 줄이 들어갔고,
+    // 자막이 페이지 중간에 바뀌며 페이지가 쪼개졌다(정답 악보 채점에서 확인). 코드·가사는 패널 기준으로 이미 넉넉히 잡는다
+    const r = { x0: med('x0'), y0: med('y0'), x1: med('x1'), y1: med('y1'), frames: found.length };
     r.core = { y0: Math.max(r.y0, med('coreY0')), y1: Math.min(r.y1, med('coreY1')) };
     return r;
   } catch (e) {
@@ -4399,7 +4539,7 @@ function ScrollRoiPicker({ videoRef, videoLoaded, roi, setRoi, suppressRef, roiO
   // 질문 답이 바뀌면 다시 찾는다
   const optsKey = JSON.stringify(roiOpts || {});
   const firstOptsRef = useRef(optsKey);
-  useEffect(() => { if (optsKey !== firstOptsRef.current && videoLoaded) { firstOptsRef.current = optsKey; runAutoRoi(true); } }, [optsKey]);
+
   async function runAutoRoi(manual) {
     const video = videoRef.current;
     const src = video && (video.currentSrc || video.src);
@@ -4410,14 +4550,6 @@ function ScrollRoiPicker({ videoRef, videoLoaded, roi, setRoi, suppressRef, roiO
     if (r) { setRoi({ x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1, core: r.core }); setAutoMsg('TAB 오선을 찾아 영역을 자동으로 지정했습니다 (' + r.frames + '/5 장면). 다르면 드래그로 다시 지정하세요.'); }
     else setAutoMsg(manual ? 'TAB 오선을 찾지 못했습니다 — 드래그로 직접 지정하세요.' : '');
   }
-  useEffect(() => {
-    if (!videoLoaded) return;
-    const video = videoRef.current;
-    const src = video && (video.currentSrc || video.src);
-    if (!src || autoDoneSrcRef.current === src || roi) return;
-    autoDoneSrcRef.current = src;
-    runAutoRoi(false);
-  }, [videoLoaded]);
   const roiBoxRef = useRef(null);
   const dragStartRef = useRef(null);
   const roiRef = useRef(null);
@@ -4522,7 +4654,7 @@ function ScrollRoiPicker({ videoRef, videoLoaded, roi, setRoi, suppressRef, roiO
       </div>
       {videoLoaded && (
         <div className="toolbar" style={{ marginTop: 6 }}>
-          <button className="icon-btn" onClick={() => runAutoRoi(true)} disabled={autoBusy}>{autoBusy ? '찾는 중...' : 'TAB 영역 자동 찾기'}</button>
+
           {autoMsg && <span className="hint-text">{autoMsg}</span>}
         </div>
       )}
@@ -10403,7 +10535,7 @@ function MosaicStep({ videoRef, onModeBack }) {
   const roiOpts = useMemo(() => ({ above: askAbove, below: askBelow }), [askAbove, askBelow]);
   const [running, setRunning] = useState(false);
   const [pct, setPct] = useState(0);
-  const [msg, setMsg] = useState('영상 파일을 선택하세요. TAB 영역은 자동으로 찾습니다.');
+  const [msg, setMsg] = useState('영상 파일을 선택하세요.');
   const [result, setResult] = useState(null);
   const [info, setInfo] = useState(null);
   const [hist, setHist] = useState({ past: [], future: [] });
@@ -10449,7 +10581,7 @@ function MosaicStep({ videoRef, onModeBack }) {
       setDuration(video.duration);
       setRangeStart(0); setRangeEnd(video.duration);
       setSeekT(0); seekTRef.current = 0;
-      setMsg('영상 로드됨: ' + video.duration.toFixed(1) + '초, ' + video.videoWidth + 'x' + video.videoHeight + '. TAB 영역을 찾는 중입니다 — 찾으면 "자동 추출"을 누르세요.');
+      setMsg('영상 로드됨: ' + video.duration.toFixed(1) + '초, ' + video.videoWidth + 'x' + video.videoHeight + '. TAB이 잘 보이는 장면에서 영상 위를 드래그해 TAB 영역(코드 이름·가사 포함)을 지정한 뒤 "자동 추출"을 누르세요.');
       await seekSafe(video, 0.001);
       await seekTo(video, 0);
     };
@@ -10624,12 +10756,10 @@ function MosaicStep({ videoRef, onModeBack }) {
           </label>
           <label><input type="checkbox" checked={cleanBg} onChange={e => setCleanBg(e.target.checked)} disabled={running} /> 배경 정리(흑백)</label>
         </div>
-        <div className="slider-label" style={{ marginTop: '8px' }}>TAB 영역 — 자동으로 찾습니다(코드 다이어그램·가사 포함). 다르면 드래그로 다시 지정</div>
+        <div className="slider-label" style={{ marginTop: '8px' }}>TAB 영역 — 영상 위를 드래그해 지정하세요 (코드 이름·가사까지 포함, 옆의 코드 다이어그램 상자·자막은 빼기)</div>
         <div className="mos-ask">
           <div className="slider-label" style={{ marginTop: '8px' }}>영상에 대해 알려주세요 — 모르면 '자동'으로 두면 됩니다</div>
           {[
-            ['악보 위에 코드 이름이나 코드 다이어그램이 있나요?', askAbove, setAskAbove, [['auto', '자동'], ['yes', '있음'], ['no', '없음']]],
-            ['악보 아래에 가사가 있나요?', askBelow, setAskBelow, [['auto', '자동'], ['yes', '있음'], ['no', '없음']]],
             ['악보가 어떻게 넘어가나요?', askMotion, setAskMotion, [['auto', '자동/섞임'], ['flow', '흘러감(스크롤)'], ['page', '페이지가 바뀜']]],
           ].map(([q, val, set, opts]) => (
             <div key={q} className="mos-ask-row">

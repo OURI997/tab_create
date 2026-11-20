@@ -749,11 +749,61 @@ function drawProcessed(canvas, img, s) {
   if (s.removeBg) {
     const imageData = ctx.getImageData(0, 0, sw, sh);
     applyThreshold(imageData, s.threshold, s.invert, s.softness || 0);
+    // 영상 추출 페이지에서 "그림 배경 지우기"를 켜고 넘긴 블록만 (예전에 저장한 악보는 이 값이 없어 그대로)
+    if (s.cleanPicture === true) cleanPictureBackground(imageData, sw, sh);
     if (s.despeckle) despeckleBinary(imageData, sw, sh, s.despeckleSize || 0);
     ctx.putImageData(imageData, 0, 0);
   }
   return { playheadRuns };
 }
+
+// ---- video-tab-extractor.html과 같은 코드 (그림 배경 지우기) ----
+function mosTopHatClean(buf, w, h, k) {
+  const r = k >> 1, tmp = new Uint8Array(w * h), clo = new Uint8Array(w * h);
+  const pass = (src, dst, horiz, useMax) => {
+    const n = horiz ? w : h, m = horiz ? h : w;
+    for (let j = 0; j < m; j++) {
+      for (let i = 0; i < n; i++) {
+        let v = useMax ? 0 : 255;
+        const a = Math.max(0, i - r), b = Math.min(n - 1, i + r);
+        for (let q = a; q <= b; q++) {
+          const x = horiz ? src[j * w + q] : src[q * w + j];
+          if (useMax ? x > v : x < v) v = x;
+        }
+        if (horiz) dst[j * w + i] = v; else dst[i * w + j] = v;
+      }
+    }
+  };
+  pass(buf, tmp, true, true); pass(tmp, clo, false, true);   // 팽창(밝은 쪽 최대)
+  pass(clo, tmp, true, false); pass(tmp, clo, false, false); // 침식 → 닫힘
+  for (let p = 0; p < buf.length; p++) {
+    const ink = clo[p] - buf[p];
+    buf[p] = 255 - Math.min(255, Math.max(0, (ink - 25) * 2.2)) | 0;
+  }
+}
+
+// 그림 배경 지우기 (페이지 전환형): 반투명 악보 뒤로 비친 연주 영상(기타 몸통·마이크 등)이 흑백 처리 뒤 회색 얼룩으로 남는 문제.
+// 검은 탑햇(닫힘 − 원본)은 커널보다 가는 구조(오선·숫자·글자·마디선)만 남기고 넓은 얼룩을 지운다.
+// 지워지는 양이 화면의 1.5% 미만이면(흰 바탕 영상 — 지울 얼룩이 없음) 원본을 그대로 둔다 → 깨끗한 영상의 결과는 바뀌지 않는다.
+function cleanPictureBackground(imageData, w, h) {
+  const d = imageData.data, n = w * h, buf = new Uint8Array(n);
+  for (let p = 0, i = 0; p < n; p++, i += 4) buf[p] = (d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114) | 0;
+  // 어두운 바탕 그대로인 결과(반전 안 함)는 대상이 아니다
+  let sum = 0;
+  for (let p = 0; p < n; p++) sum += buf[p];
+  if (sum / n < 150) return false;
+  const out = buf.slice();
+  const k = Math.max(7, Math.round(h * 0.06) | 1); // 오선 간격의 약 1.2배 (영역 높이 ≈ 오선 간격 × 17~20)
+  mosTopHatClean(out, w, h, k);
+  // 얼룩 = 탑햇이 바탕으로 판정한 연한~중간 회색. 옅은 그라데이션 얼룩도 잡도록 235 미만까지 센다
+  let removed = 0;
+  for (let p = 0; p < n; p++) if (buf[p] < 235 && out[p] > 245) removed++;
+  if (removed / n < 0.01) return false;
+  // 탑햇 결과와 원본 중 밝은 쪽: 넓은 얼룩은 종이색이 되고, 가는 선·숫자(회색 오선 포함)는 원래 밝기 그대로 남는다
+  for (let p = 0, i = 0; p < n; p++, i += 4) { const v = Math.max(buf[p], out[p]); d[i] = d[i + 1] = d[i + 2] = v; }
+  return true;
+}
+
 
 function loadImage(src) {
   return new Promise((resolve, reject) => {
@@ -771,7 +821,7 @@ function effectiveImageSettings(item, defaults) {
     return {
       removeBg: o.removeBg, invert: o.invert,
       threshold: o.threshold, softness: o.softness,
-      despeckle: o.despeckle, despeckleSize: o.despeckleSize,
+      despeckle: o.despeckle, despeckleSize: o.despeckleSize, cleanPicture: o.cleanPicture === true,
       playheadRemove: o.playheadRemove, playheadColor: o.playheadColor, playheadExcluded,
       cropTop: o.cropTop, cropBottom: o.cropBottom, cropLeft: o.cropLeft, cropRight: o.cropRight,
     };
@@ -2525,6 +2575,10 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
                   onChange={e => updateOverride({ despeckleSize: Number(e.target.value) })} />
               </div>
             )}
+            <label title="반투명 악보 뒤로 비친 연주 영상(기타 몸통·마이크)이 회색 얼룩으로 남을 때 지웁니다. 얼룩이 없으면 결과가 바뀌지 않습니다">
+              <input type="checkbox" checked={!!eff.cleanPicture} onChange={e => updateOverride({ cleanPicture: e.target.checked })} />
+              그림 배경 지우기 (회색 얼룩)
+            </label>
             <label>
               <input type="checkbox" checked={!!eff.playheadRemove} onChange={e => updateOverride({ playheadRemove: e.target.checked })} />
               재생 표시줄 제거 (세로로 긴 색상 커서 줄 감지 후 제거)
