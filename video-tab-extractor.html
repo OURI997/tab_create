@@ -1727,6 +1727,36 @@ function SelectStep({ frames, selectedFrameIds, setSelectedFrameIds, onBack, onN
   );
 }
 
+// 정수 입력칸: 숫자를 지우고 새로 칠 수 있게 입력 중에는 빈칸·범위 밖 값을 그대로 둔다.
+// 예전엔 지우는 순간 1로 바뀌어(빈칸 → 1) "4"를 치면 "14"가 되고, 위아래 화살표로만 바꿀 수 있었다.
+// 범위 안의 정수가 되면 바로 반영하고, 칸을 벗어날 때(또는 Enter) 범위 밖이면 가장 가까운 값으로 맞춘다.
+function IntInput({ value, min, max, onCommit, disabled, style }) {
+  const [draft, setDraft] = useState(String(value));
+  const focusRef = useRef(false);
+  useEffect(() => { if (!focusRef.current) setDraft(String(value)); }, [value]);
+  const clamp = n => Math.max(min, Math.min(max, n));
+  function finish() {
+    focusRef.current = false;
+    const n = parseInt(draft, 10);
+    if (isNaN(n)) { setDraft(String(value)); return; }
+    const c = clamp(n);
+    setDraft(String(c));
+    if (c !== value) onCommit(c);
+  }
+  return (
+    <input type="number" inputMode="numeric" min={min} max={max} step="1" value={draft} disabled={disabled} style={style}
+      onFocus={e => { focusRef.current = true; e.target.select(); }}
+      onChange={e => {
+        const v = e.target.value;
+        setDraft(v);
+        const n = parseInt(v, 10);
+        if (!isNaN(n) && String(n) === v.trim() && n >= min && n <= max) onCommit(n);
+      }}
+      onBlur={finish}
+      onKeyDown={e => { if (e.key === 'Enter') e.target.blur(); }} />
+  );
+}
+
 const FrameCard = React.memo(function FrameCard({ item, index, defaults, onChange, onRecrop }) {
   const canvasRef = useRef(null);
   const imgRef = useRef(null);
@@ -6311,10 +6341,8 @@ function ScrollResultStep({ videoRef, scrollCapture, scrollDefaults, onBack, onM
 
         <div className="hr" />
         <div className="toolbar">
-          <label>몇 마디씩 묶기(목표): <input type="number" min="1" max="16" value={groupSize} disabled={effectiveFallback}
-            onChange={e => setGroupSizeUser(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
-          <label>그룹당 최대 마디수: <input type="number" min="1" max="20" value={maxBarsPerGroup} disabled={effectiveFallback}
-            onChange={e => setMaxBarsUser(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
+          <label>몇 마디씩 묶기(목표): <IntInput min={1} max={16} value={groupSize} disabled={effectiveFallback} onCommit={setGroupSizeUser} style={{ width: '4em' }} /></label>
+          <label>그룹당 최대 마디수: <IntInput min={1} max={20} value={maxBarsPerGroup} disabled={effectiveFallback} onCommit={setMaxBarsUser} style={{ width: '4em' }} /></label>
           <span className="hint-text" style={{ margin: 0 }}>자동 기준: 화면 1장 분량{groupSizeUser == null ? ' (목표 ' + autoGroupSize + '마디, 최대 ' + (autoGroupSize + 2) + ')' : ''}</span>
           <label>그룹 기준:
             <select value={groupBasis} onChange={e => setGroupBasis(e.target.value)} disabled={effectiveFallback} style={{ width: 'auto', marginLeft: '6px' }}>
@@ -7970,10 +7998,8 @@ function FlowStage2({ result, videoFile, flowDefaults }) {
 
       <div className="hr" />
       <div className="toolbar">
-        <label>몇 마디씩 묶기(목표): <input type="number" min="1" max="16" value={groupSize}
-          onChange={e => setGroupSizeUser(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
-        <label>그룹당 최대 마디수: <input type="number" min="1" max="20" value={maxBarsPerGroup}
-          onChange={e => setMaxBarsUser(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
+        <label>몇 마디씩 묶기(목표): <IntInput min={1} max={16} value={groupSize} onCommit={setGroupSizeUser} style={{ width: '4em' }} /></label>
+        <label>그룹당 최대 마디수: <IntInput min={1} max={20} value={maxBarsPerGroup} onCommit={setMaxBarsUser} style={{ width: '4em' }} /></label>
         <label>그룹 기준:
           <select value={groupBasis} onChange={e => setGroupBasis(e.target.value)} style={{ width: 'auto', marginLeft: '6px' }}>
             <option value="auto">자동 (신뢰도 낮으면 폭 기준)</option>
@@ -9816,10 +9842,8 @@ function UniStage2({ result, videoFile, flowDefaults, editCtx }) {
 
       <div className="hr" />
       <div className="toolbar">
-        <label>몇 마디씩 묶기(목표): <input type="number" min="1" max="16" value={groupSize}
-          onChange={e => setGroupSizeUser(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
-        <label>그룹당 최대 마디수: <input type="number" min="1" max="20" value={maxBarsPerGroup}
-          onChange={e => setMaxBarsUser(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '4em' }} /></label>
+        <label>몇 마디씩 묶기(목표): <IntInput min={1} max={16} value={groupSize} onCommit={setGroupSizeUser} style={{ width: '4em' }} /></label>
+        <label>그룹당 최대 마디수: <IntInput min={1} max={20} value={maxBarsPerGroup} onCommit={setMaxBarsUser} style={{ width: '4em' }} /></label>
         <label>그룹 기준:
           <select value={groupBasis} onChange={e => setGroupBasis(e.target.value)} style={{ width: 'auto', marginLeft: '6px' }}>
             <option value="auto">자동 (신뢰도 낮으면 폭 기준)</option>
