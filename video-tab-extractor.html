@@ -1757,6 +1757,47 @@ function IntInput({ value, min, max, onCommit, disabled, style }) {
   );
 }
 
+// ---- 미리보기 다시 그리기 지연·분산 ----
+// 설정 슬라이더를 움직일 때마다 모든 그림을 한꺼번에 다시 그려(흑백 처리는 그림 한 장에 수십 ms) 슬라이더가 끊기듯 움직였다.
+// → 화면에 보이는 그림만, 마지막 변경 후 잠깐 기다렸다가 한 장씩 차례로(사이사이 입력 처리) 다시 그린다.
+//   화면 밖 그림은 보일 때 그린다.
+const lazyDrawQ = { q: new Map(), timer: null };
+function lazyDrawRun() {
+  lazyDrawQ.timer = null;
+  const it = lazyDrawQ.q.entries().next();
+  if (it.done) return;
+  const [id, fn] = it.value;
+  lazyDrawQ.q.delete(id);
+  try { fn(); } catch (e) { console.error(e); }
+  if (lazyDrawQ.q.size) lazyDrawQ.timer = setTimeout(lazyDrawRun, 0);
+}
+function scheduleLazyDraw(id, fn, delay) {
+  lazyDrawQ.q.delete(id);
+  lazyDrawQ.q.set(id, fn);
+  if (!lazyDrawQ.timer) lazyDrawQ.timer = setTimeout(lazyDrawRun, delay == null ? 60 : delay);
+}
+function useLazyRedraw(elRef, deps, draw) {
+  const idRef = useRef(null);
+  if (!idRef.current) idRef.current = {};
+  const visRef = useRef(true), dirtyRef = useRef(false), drawRef = useRef(draw);
+  drawRef.current = draw;
+  useEffect(() => {
+    const el = elRef.current;
+    if (!el || typeof IntersectionObserver === 'undefined') return;
+    const io = new IntersectionObserver(ents => {
+      const v = ents[ents.length - 1].isIntersecting;
+      visRef.current = v;
+      if (v && dirtyRef.current) { dirtyRef.current = false; scheduleLazyDraw(idRef.current, () => drawRef.current(), 0); }
+    }, { rootMargin: '600px 0px' });
+    io.observe(el);
+    return () => { io.disconnect(); lazyDrawQ.q.delete(idRef.current); };
+  }, []);
+  useEffect(() => {
+    if (visRef.current) scheduleLazyDraw(idRef.current, () => drawRef.current());
+    else dirtyRef.current = true;
+  }, deps);
+}
+
 const FrameCard = React.memo(function FrameCard({ item, index, defaults, onChange, onRecrop }) {
   const canvasRef = useRef(null);
   const imgRef = useRef(null);
@@ -1773,7 +1814,8 @@ const FrameCard = React.memo(function FrameCard({ item, index, defaults, onChang
     return () => { active = false; };
   }, [item.src]);
 
-  useEffect(() => { redraw(); });
+  const rootRef = useRef(null);
+  useLazyRedraw(rootRef, [item.src, JSON.stringify(eff)], redraw);
 
   function redraw() {
     if (!imgRef.current || !canvasRef.current) return;
@@ -1794,7 +1836,7 @@ const FrameCard = React.memo(function FrameCard({ item, index, defaults, onChang
   }
 
   return (
-    <div className="block">
+    <div className="block" ref={rootRef}>
       <div className="block-head">
         <span>프레임 {index + 1}{item.recropped ? ' · 영역 다시 잡음' : ''}</span>
         {onRecrop && item.repT != null && (

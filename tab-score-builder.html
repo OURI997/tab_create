@@ -149,6 +149,10 @@
     font-family:Georgia,"Noto Serif KR",serif;font-size:inherit;color:#1a1a1a;padding:0;
   }
   .tag-del{border:none;background:transparent;color:var(--text2);font-size:13px;padding:0 2px;cursor:pointer;}
+  .verse-toggle-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:4px 0;}
+  .verse-btn.active{background:var(--text, #1a1a1a);color:#fff;border-color:var(--text, #1a1a1a);}
+  .click-tag-chunk.inactive-verse{opacity:.55;}
+  .verse-row-label{position:absolute;left:2px;transform:translateY(-50%);font-size:10px;color:var(--text2, #888);pointer-events:none;}
   .lane-resize-handle{
     position:absolute;left:50%;bottom:2px;transform:translateX(-50%);
     width:40px;height:11px;border-radius:4px;background:var(--border-strong);
@@ -1174,8 +1178,10 @@ async function buildScoreLayout(items, title, targetW, opts) {
     const scaledH = Math.round(off.height * imageW / off.width);
     const tags = ((it.lyrics && it.lyrics.tags) || []).filter(t => (t.text || '').trim() !== '');
     const ratio = (it.lyrics && it.lyrics.areaHeightRatio != null) ? it.lyrics.areaHeightRatio : defaultLyricRatio;
-    const laneH = tags.length > 0 ? Math.max(lyricLineH, Math.round(ratio * contentW)) : 0;
-    return { canvas: off, scaledH, tags, laneH, groupH: scaledH + laneH };
+    const laneBaseH = tags.length > 0 ? Math.max(lyricLineH, Math.round(ratio * contentW)) : 0;
+    const v2 = lyricHasVerse2(tags);
+    const laneH = laneBaseH + (v2 ? Math.round(lyricLineH * LYRIC_VERSE2_GAP) : 0);
+    return { canvas: off, scaledH, tags, laneH, laneBaseH, v2, groupH: scaledH + laneH };
   });
 
   let totalH = PAD + titleH;
@@ -1265,9 +1271,16 @@ function drawScoreItem(ctx, p, y, layout, scale) {
     // row width, same font/letter-spacing at this export's scale) so a merged "word1 word2" label
     // renders identically in the export instead of the two words drawing independently and
     // overlapping into unreadable mashed text.
-    const clickTags = p.tags.filter(t => t.viaClick).sort((a, b) => a.xPct - b.xPct);
-    const chunks = mergeOverlappingLabels(clickTags, rowW, lyricFontPx, lyricLetterSpacingPx);
-    for (const c of chunks) drawAt(c.text, c.xPct, CLICK_LYRIC_Y_PCT);
+    // 1절은 기본 영역 가운데 행, 2절은 그 아래 한 줄(LYRIC_VERSE2_GAP × 줄 높이)
+    const baseH = Math.round((p.laneBaseH != null ? p.laneBaseH : p.laneH) * scale);
+    const v2Gap = Math.round(lyricLineH * LYRIC_VERSE2_GAP);
+    for (const v of [1, 2]) {
+      const clickTags = p.tags.filter(t => t.viaClick && lyricVerseOf(t) === v).sort((a, b) => a.xPct - b.xPct);
+      if (!clickTags.length) continue;
+      const chunks = mergeOverlappingLabels(clickTags, rowW, lyricFontPx, lyricLetterSpacingPx);
+      const rowY = baseH * CLICK_LYRIC_Y_PCT / 100 + (v === 2 ? v2Gap : 0);
+      for (const c of chunks) drawAt(c.text, c.xPct, (rowY / Math.max(1, laneH)) * 100);
+    }
     ctx.textBaseline = 'alphabetic';
     y += laneH;
   }
@@ -1710,6 +1723,59 @@ function MergeSeamEditor({ item, onChange, onSplit }) {
   );
 }
 
+// ---- 미리보기 다시 그리기 지연·분산 ----
+// 설정 슬라이더를 움직일 때마다 모든 그림을 한꺼번에 다시 그려(흑백 처리는 그림 한 장에 수십 ms) 슬라이더가 끊기듯 움직였다.
+// → 화면에 보이는 그림만, 마지막 변경 후 잠깐 기다렸다가 한 장씩 차례로(사이사이 입력 처리) 다시 그린다.
+//   화면 밖 그림은 보일 때 그린다.
+const lazyDrawQ = { q: new Map(), timer: null };
+function lazyDrawRun() {
+  lazyDrawQ.timer = null;
+  const it = lazyDrawQ.q.entries().next();
+  if (it.done) return;
+  const [id, fn] = it.value;
+  lazyDrawQ.q.delete(id);
+  try { fn(); } catch (e) { console.error(e); }
+  if (lazyDrawQ.q.size) lazyDrawQ.timer = setTimeout(lazyDrawRun, 0);
+}
+function scheduleLazyDraw(id, fn, delay) {
+  lazyDrawQ.q.delete(id);
+  lazyDrawQ.q.set(id, fn);
+  if (!lazyDrawQ.timer) lazyDrawQ.timer = setTimeout(lazyDrawRun, delay == null ? 60 : delay);
+}
+function useLazyRedraw(elRef, deps, draw) {
+  const idRef = useRef(null);
+  if (!idRef.current) idRef.current = {};
+  const visRef = useRef(true), dirtyRef = useRef(false), drawRef = useRef(draw);
+  drawRef.current = draw;
+  useEffect(() => {
+    const el = elRef.current;
+    if (!el || typeof IntersectionObserver === 'undefined') return;
+    const io = new IntersectionObserver(ents => {
+      const v = ents[ents.length - 1].isIntersecting;
+      visRef.current = v;
+      if (v && dirtyRef.current) { dirtyRef.current = false; scheduleLazyDraw(idRef.current, () => drawRef.current(), 0); }
+    }, { rootMargin: '600px 0px' });
+    io.observe(el);
+    return () => { io.disconnect(); lazyDrawQ.q.delete(idRef.current); };
+  }, []);
+  useEffect(() => {
+    if (visRef.current) scheduleLazyDraw(idRef.current, () => drawRef.current());
+    else dirtyRef.current = true;
+  }, deps);
+}
+
+// ImageBlock은 부모가 매번 새 함수(onChange 등)를 넘겨 React.memo가 소용없었다 — 가사 한 칸을 옮겨도 모든 줄이 다시 그려짐.
+// 넘기는 함수들은 모두 id 기준의 함수형 setState라 최신 값이 필요 없으므로 함수가 아닌 값만 비교한다.
+function imageBlockPropsEqual(a, b) {
+  for (const k in a) { if (typeof a[k] === 'function') continue; if (a[k] !== b[k]) return false; }
+  for (const k in b) { if (!(k in a)) return false; }
+  return true;
+}
+// 2절 가사: 클릭 배치 단어에 verse: 2를 붙여 같은 줄 아래 두 번째 행에 그린다
+function lyricVerseOf(t) { return t.verse === 2 ? 2 : 1; }
+function lyricHasVerse2(tags) { return (tags || []).some(t => t.viaClick && t.verse === 2 && (t.text || '').trim() !== ''); }
+const LYRIC_VERSE2_GAP = 1.15; // 2절 행이 1절 행보다 아래로 떨어지는 거리(가사 줄 높이 배수)
+
 const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults, lyricFontSize, lyricLetterSpacing, defaultLyricAreaHeight, onChange, onDelete, onMove, mergeSelected, onToggleMergeSelect, nextItemId, onReplaceWith }) {
   const canvasRef = useRef(null);
   const imgRef = useRef(null);
@@ -1744,6 +1810,9 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   const [lineText, setLineTextRaw] = useState(() => (item.lyrics && item.lyrics.lineText) || '');
   const extLineText = item.lyrics ? item.lyrics.lineText : undefined;
   useEffect(() => { if (extLineText != null) setLineTextRaw(prev => (prev === extLineText ? prev : extLineText)); }, [extLineText]);
+  // 2절: 같은 TAB 줄 아래 두 번째 가사 행. 1절/2절 중 지금 배치 중인 쪽(activeVerse)만 클릭·Enter·방향키 대상이 된다
+  const [lineText2, setLineText2Raw] = useState(() => (item.lyrics && item.lyrics.lineText2) || '');
+  const [activeVerse, setActiveVerse] = useState(1);
   const [pendingXPct, setPendingXPct] = useState(null);
   const [pendingSnapped, setPendingSnapped] = useState(false);
   const [selectedTagId, setSelectedTagId] = useState(null);
@@ -1793,7 +1862,9 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     return () => { active = false; };
   }, [resolvedItemSrc]);
 
-  useEffect(() => { redraw(); }, [item, defaults]);
+  const blockRootRef = useRef(null);
+  // 가사만 바뀔 때는 그림을 다시 그리지 않는다(예전엔 방향키 한 번마다 흑백 처리+PNG 변환+음표 열 검출을 다시 해 끊겼다)
+  useLazyRedraw(blockRootRef, [resolvedItemSrc, JSON.stringify(eff)], redraw);
 
   useEffect(() => {
     const el = laneRef.current;
@@ -1998,7 +2069,13 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   placementRef.current.pendingXPct = pendingXPct;
   placementRef.current.chainActive = chainActive;
   const laneHeightRatio = lyricsObj.areaHeightRatio != null ? lyricsObj.areaHeightRatio : (defaultLyricAreaHeight / (laneWidth || 700));
-  const laneHeight = Math.round(laneHeightRatio * (laneWidth || 700));
+  const laneBaseHeight = Math.round(laneHeightRatio * (laneWidth || 700));
+  const isAct = t => t.viaClick && lyricVerseOf(t) === activeVerse;
+  const verseTag = activeVerse === 2 ? { verse: 2 } : {};
+  const showVerse2 = activeVerse === 2 || lyricHasVerse2(tags) || (lineText2 || '').trim() !== '';
+  const verse2GapPx = Math.round(Math.round(lyricFontSize * 1.3) * LYRIC_VERSE2_GAP);
+  const laneHeight = laneBaseHeight + (showVerse2 ? verse2GapPx : 0);
+  const rowTopPx = v => Math.round(laneBaseHeight * CLICK_LYRIC_Y_PCT / 100) + (v === 2 ? verse2GapPx : 0);
   // Left/right margin reserved on the click-placement track (and, so the reference image above it
   // stays x-aligned with it, on that image's own row too) — applied uniformly for every block now,
   // since the image+click-track structure itself no longer depends on whether audio is linked.
@@ -2013,6 +2090,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     onChange({ ...item, lyrics: { ...lyricsObj, ...patch } });
   }
   function setLineText(v) {
+    if (activeVerse === 2) { setLineText2Raw(v); updateLyrics({ lineText2: v }); return; }
     setLineTextRaw(v);
     updateLyrics({ lineText: v });
   }
@@ -2041,7 +2119,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   // "piecewise" a no-op (every point would always land exactly back on that same line).
   function addClickTag(text, xPct, time) {
     const id = Date.now() + '_' + Math.random().toString(36).slice(2);
-    updateLyrics({ tags: [...tags, { id, text, xPct, time, yPct: CLICK_LYRIC_Y_PCT, viaClick: true }] });
+    updateLyrics({ tags: [...tags, { id, text, xPct, time, yPct: CLICK_LYRIC_Y_PCT, viaClick: true, ...verseTag }] });
   }
   function updateClickTagText(id, text) {
     updateLyrics({ tags: tags.map(t => t.id === id ? { ...t, text } : t) });
@@ -2072,23 +2150,6 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
   }
-  function startResize(e) {
-    e.preventDefault();
-    e.stopPropagation();
-    const startY = e.clientY;
-    const startH = laneHeight;
-    const w = (laneRef.current && laneRef.current.offsetWidth) || laneWidth || 700;
-    function onMove(ev) {
-      const newH = Math.max(20, Math.round(startH + (ev.clientY - startY)));
-      updateLyrics({ areaHeightRatio: newH / w });
-    }
-    function onUp() {
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-    }
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
-  }
   function sizeInput(el, text) {
     if (!el) return;
     if (!measureCtxRef.current) measureCtxRef.current = document.createElement('canvas').getContext('2d');
@@ -2100,8 +2161,8 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   }
 
   // ---- click placement (video-extraction blocks only) ----
-  const clickTags = tags.filter(t => t.viaClick).sort((a, b) => a.xPct - b.xPct);
-  const words = tokenizeWords(lineText);
+  const clickTags = tags.filter(isAct).sort((a, b) => a.xPct - b.xPct);
+  const words = tokenizeWords(activeVerse === 2 ? lineText2 : lineText);
   // How many of the FRONT of `words` already have a matching placed tag, in the same order —
   // deliberately NOT just clickTags.length, which silently diverges from the actual current line
   // text whenever the two fall out of sync: deleting some already-placed tags and then typing
@@ -2123,6 +2184,8 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   }
   const lastPlacedXPct = clickTags.length > 0 ? clickTags[clickTags.length - 1].xPct : -LYRIC_MARGIN_PCT - 1;
   const chunks = mergeOverlappingLabels(clickTags, laneWidth, lyricFontSize, lyricLetterSpacing);
+  const otherVerse = activeVerse === 2 ? 1 : 2;
+  const otherChunks = mergeOverlappingLabels(tags.filter(t => t.viaClick && lyricVerseOf(t) === otherVerse).sort((a, b) => a.xPct - b.xPct), laneWidth, lyricFontSize, lyricLetterSpacing);
   const selectedTag = selectedTagId ? tags.find(t => t.id === selectedTagId) : null;
 
   // Calibration points for xPct<->time conversion — each already-confirmed click-placed word is a
@@ -2140,7 +2203,8 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   // is precisely the range where xPctToTime falls back to that same flat line), making "piecewise"
   // a no-op. Falls back to the flat-line formula only for legacy tags saved before this field
   // existed. clickTags is sorted by xPct ascending; time is expected to follow the same order.
-  const calibPoints = clickTags.map(t => ({
+  // 시각 기준점은 1절 단어만 쓴다(2절은 같은 TAB 줄에 붙인 다른 가사라 이 영상 구간의 시각과 맞지 않는다)
+  const calibPoints = tags.filter(t => t.viaClick && lyricVerseOf(t) === 1).sort((a, b) => a.xPct - b.xPct).map(t => ({
     xPct: t.xPct,
     time: t.time != null ? t.time : start + (t.xPct / 100) * (end - start),
   }));
@@ -2171,10 +2235,10 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     chipUnits.forEach((u, i) => {
       const x = Math.max(xs[i], lastX + 0.5);
       const id = Date.now() + '_' + i + '_' + Math.random().toString(36).slice(2);
-      cur = [...cur, { id, text: words[u[0]], xPct: x, time: xPctToTime(x), yPct: CLICK_LYRIC_Y_PCT, viaClick: true }];
+      cur = [...cur, { id, text: words[u[0]], xPct: x, time: xPctToTime(x), yPct: CLICK_LYRIC_Y_PCT, viaClick: true, ...verseTag }];
       // 붙여 둔 칩(여러 단어를 한 덩어리로)은 클릭 배치와 똑같이 앞 단어 바로 뒤에 이어 붙인다
       if (u.length > 1) cur = appendJoinedTags(cur, u.slice(1).map(k => words[k])).tags;
-      lastX = Math.max(...cur.filter(t => t.viaClick).map(t => t.xPct));
+      lastX = Math.max(...cur.filter(isAct).map(t => t.xPct));
     });
     placementRef.current.tags = cur;
     updateLyrics({ tags: cur });
@@ -2189,9 +2253,9 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     return () => window.removeEventListener('tab-lyrics-autoplace-all', h);
   }, []);
   function clearClickTags() {
-    updateLyrics({ tags: tags.filter(t => !t.viaClick) });
+    updateLyrics({ tags: tags.filter(t => !isAct(t)) });
     setPendingXPct(null);
-    setGuidance('이 줄의 배치를 지웠습니다.');
+    setGuidance(activeVerse === 2 ? '이 줄의 2절 배치를 지웠습니다.' : '이 줄의 배치를 지웠습니다.');
   }
   function xPctToTime(xPct) {
     if (calibPoints.length < 2 || xPct < calibPoints[0].xPct || xPct > calibPoints[calibPoints.length - 1].xPct) {
@@ -2312,6 +2376,8 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   }
 
   function selectTag(id) {
+    const tg = tags.find(t => t.id === id);
+    if (tg && tg.viaClick && lyricVerseOf(tg) !== activeVerse) setActiveVerse(lyricVerseOf(tg));
     placementRef.current.chainActive = false;
     placementRef.current.pendingXPct = null;
     setChainActive(false);
@@ -2335,7 +2401,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   // no render in between, both closures read the pre-placement tags array).
   function computePlacementState() {
     const curTags = placementRef.current.tags;
-    const curClickTags = curTags.filter(t => t.viaClick).sort((a, b) => a.xPct - b.xPct);
+    const curClickTags = curTags.filter(isAct).sort((a, b) => a.xPct - b.xPct);
     let curPlacedCount = 0;
     while (curPlacedCount < curClickTags.length && curPlacedCount < words.length && curClickTags[curPlacedCount].text === words[curPlacedCount]) {
       curPlacedCount++;
@@ -2355,7 +2421,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     const times = [];
     const spaceW = measureLyricText(' ', lyricFontSize, lyricLetterSpacing);
     for (const text of texts) {
-      const ordered = cur.filter(t => t.viaClick).sort((a, b) => a.xPct - b.xPct);
+      const ordered = cur.filter(isAct).sort((a, b) => a.xPct - b.xPct);
       const ch = mergeOverlappingLabels(ordered, laneWidth, lyricFontSize, lyricLetterSpacing);
       const tail = ch[ch.length - 1];
       const rawWrapPct = ((tail.rightPx + spaceW) / Math.max(1, laneWidth)) * 100;
@@ -2363,7 +2429,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
       const time = xPctToTime(xPct);
       times.push(time);
       const id = Date.now() + '_' + Math.random().toString(36).slice(2);
-      cur = [...cur, { id, text, xPct, time, yPct: CLICK_LYRIC_Y_PCT, viaClick: true, joined: true }];
+      cur = [...cur, { id, text, xPct, time, yPct: CLICK_LYRIC_Y_PCT, viaClick: true, joined: true, ...verseTag }];
     }
     return { tags: cur, times };
   }
@@ -2380,7 +2446,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     const confirmedTime = xPctToTime(curPendingXPct);
     const unit = curChipUnits[0];
     const anchorId = Date.now() + '_' + Math.random().toString(36).slice(2);
-    let nextTags = [...curTags, { id: anchorId, text: words[unit[0]], xPct: curPendingXPct, time: confirmedTime, yPct: CLICK_LYRIC_Y_PCT, viaClick: true }];
+    let nextTags = [...curTags, { id: anchorId, text: words[unit[0]], xPct: curPendingXPct, time: confirmedTime, yPct: CLICK_LYRIC_Y_PCT, viaClick: true, ...verseTag }];
     if (unit.length > 1) nextTags = appendJoinedTags(nextTags, unit.slice(1).map(i => words[i])).tags;
     placementRef.current.tags = nextTags;
     updateLyrics({ tags: nextTags });
@@ -2464,8 +2530,15 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   // it in the same chunk — off to move independently, leaving the earlier word(s) exactly where
   // they were. No explicit "split" bookkeeping is needed: chunks are recomputed from xPct on every
   // render, so this natural regroups/ungroups itself the next time mergeOverlappingLabels runs.
-  function nudgeSelected(deltaPct) {
+  // 방향키를 누르고 있으면(키 반복) 영상 미리듣기를 매번 다시 시작하지 않고, 손을 뗀 뒤 한 번만 재생한다.
+  // 위치 계산은 화면이 다시 그려지기 전에도 최신 값(placementRef)을 쓴다 — 키 반복이 그리기보다 빠르면 이동이 씹혀 느리게 보였다
+  const nudgePlayTimerRef = useRef(null);
+  function nudgeSelected(deltaPct, quiet) {
+    const curTags = placementRef.current.tags || tags;
+    const selectedTag = selectedTagId ? curTags.find(t => t.id === selectedTagId) : null;
     if (!selectedTag) return;
+    const vSel = lyricVerseOf(selectedTag);
+    const chunks = mergeOverlappingLabels(curTags.filter(t => t.viaClick && lyricVerseOf(t) === vSel).sort((a, b) => a.xPct - b.xPct), laneWidth, lyricFontSize, lyricLetterSpacing);
     const chunk = chunks.find(c => c.ids.includes(selectedTagId));
     let idsToMove;
     if (!chunk || chunk.words[0].id === selectedTagId) {
@@ -2482,7 +2555,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     // A split-off word (first moved word that wasn't the anchor) stops being glued to the word
     // before it — it becomes the anchor of its own chunk; the words after it stay joined to it.
     const splitId = chunk && chunk.words[0].id !== selectedTagId ? selectedTagId : null;
-    const nudgedTags = tags.map(t => idSet.has(t.id)
+    const nudgedTags = curTags.map(t => idSet.has(t.id)
       ? { ...t, xPct: t.xPct + deltaPct, time: xPctToTime(t.xPct + deltaPct), ...(t.id === splitId ? { joined: false } : {}) }
       : t);
     placementRef.current.tags = nudgedTags;
@@ -2490,7 +2563,12 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
     placementRef.current.chainActive = false;
     setChainActive(false);
     const nextXPct = selectedTag.xPct + deltaPct;
-    playSnippetAround(xPctToTime(nextXPct));
+    if (nudgePlayTimerRef.current) clearTimeout(nudgePlayTimerRef.current);
+    if (quiet) {
+      const v = videoElRef.current;
+      if (v && !v.paused) { previewGenRef.current++; v.pause(); }
+      nudgePlayTimerRef.current = setTimeout(() => { nudgePlayTimerRef.current = null; playSnippetAround(xPctToTime(nextXPct)); }, 350);
+    } else playSnippetAround(xPctToTime(nextXPct));
   }
 
   // Before Enter confirms a placement — move the pending (unconfirmed) marker between detected
@@ -2529,8 +2607,8 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
         if (selectedTag) playSnippetAround(xPctToTime(selectedTag.xPct));
         return;
       }
-      if (e.key === 'ArrowLeft') { e.preventDefault(); nudgeSelected(e.shiftKey ? -NUDGE_LARGE_PCT : -NUDGE_SMALL_PCT); return; }
-      if (e.key === 'ArrowRight') { e.preventDefault(); nudgeSelected(e.shiftKey ? NUDGE_LARGE_PCT : NUDGE_SMALL_PCT); return; }
+      if (e.key === 'ArrowLeft') { e.preventDefault(); nudgeSelected(e.shiftKey ? -NUDGE_LARGE_PCT : -NUDGE_SMALL_PCT, e.repeat); return; }
+      if (e.key === 'ArrowRight') { e.preventDefault(); nudgeSelected(e.shiftKey ? NUDGE_LARGE_PCT : NUDGE_SMALL_PCT, e.repeat); return; }
       if (e.key === 'Escape') { e.preventDefault(); setSelectedTagId(null); return; }
       if (e.key === 'Enter') {
         e.preventDefault();
@@ -2570,7 +2648,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
       // at the last render — see computePlacementState()'s comment.
       const curPendingXPct = placementRef.current.pendingXPct;
       const curChainActive = placementRef.current.chainActive;
-      const curClickTagsLen = placementRef.current.tags.filter(t => t.viaClick).length;
+      const curClickTagsLen = placementRef.current.tags.filter(isAct).length;
       if (curPendingXPct === null && curChainActive && curClickTagsLen > 0) appendNextToChain();
       else confirmPlacement();
       return;
@@ -2646,7 +2724,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
   }
 
   return (
-    <div className="block">
+    <div className="block" ref={blockRootRef}>
       <div className="block-head">
         <label className="merge-select-label">
           <input type="checkbox" checked={mergeSelected} onChange={onToggleMergeSelect} />
@@ -2680,6 +2758,14 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
 
       {settingsOpen && (
       <div className="controls">
+        <div>
+          <div className="slider-label">가사 영역 높이 ({laneBaseHeight}px){lyricsObj.areaHeightRatio == null ? ' — 기본값' : ''}</div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <input type="range" min="20" max="300" step="2" value={laneBaseHeight} style={{ flex: 1 }}
+              onChange={e => updateLyrics({ areaHeightRatio: Number(e.target.value) / ((laneRef.current && laneRef.current.offsetWidth) || laneWidth || 700) })} />
+            {lyricsObj.areaHeightRatio != null && <button className="icon-btn" onClick={() => updateLyrics({ areaHeightRatio: null })}>기본값으로</button>}
+          </div>
+        </div>
         {!advanced ? (
           <div className="adv-toggle-row">
             <span>이 이미지: 기본 설정을 따르는 중</span>
@@ -2782,8 +2868,17 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
         <div className="lyric-head-mini">
           <span>이 줄 가사 — 띄어쓰기로 단어가 나뉩니다. 아래 트랙을 클릭해 배치하세요.</span>
         </div>
-        <textarea className="onset-line-input" placeholder="이 줄의 가사를 붙여넣거나 입력하세요 (띄어쓰기 기준으로 단어가 나뉩니다)"
-          value={lineText} onChange={e => setLineText(e.target.value)} rows={2} />
+        <div className="verse-toggle-row">
+          {[1, 2].map(v => (
+            <button key={v} type="button" className={'icon-btn verse-btn' + (activeVerse === v ? ' active' : '')}
+              onClick={() => { setActiveVerse(v); setSelectedTagId(null); setPendingXPct(null); placementRef.current.pendingXPct = null; placementRef.current.chainActive = false; setChainActive(false); setChipJoins({}); setGuidance(''); }}>
+              {v}절{v === 2 && !lyricHasVerse2(tags) && !(lineText2 || '').trim() ? ' 추가' : ''}
+            </button>
+          ))}
+          <span className="hint-text" style={{ margin: 0 }}>{activeVerse === 2 ? '2절 가사는 1절 아래 두 번째 줄에 배치됩니다' : '2절이 있으면 "2절 추가"를 눌러 같은 줄 아래에 한 줄 더 배치하세요'}</span>
+        </div>
+        <textarea className="onset-line-input" placeholder={activeVerse === 2 ? '이 줄의 2절 가사를 입력하세요 (띄어쓰기 기준으로 단어가 나뉩니다)' : '이 줄의 가사를 붙여넣거나 입력하세요 (띄어쓰기 기준으로 단어가 나뉩니다)'}
+          value={activeVerse === 2 ? lineText2 : lineText} onChange={e => setLineText(e.target.value)} rows={2} />
         <div className="onset-syllable-queue">
           {words.length === 0 && <span className="hint-text">위에 가사를 입력하면 단어가 여기 표시됩니다.</span>}
           {chipUnits.map((u, ui) => (
@@ -2861,7 +2956,13 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
                 <div className="lane-margin-zone" style={{ right: 0, width: (marginFrac * 100) + '%' }} />
               </React.Fragment>
             )}
-            {tags.filter(t => !t.viaClick).length === 0 && chunks.length === 0 && (
+            {showVerse2 && (
+              <React.Fragment>
+                <div className="verse-row-label" style={{ top: rowTopPx(1) + 'px' }}>1</div>
+                <div className="verse-row-label" style={{ top: rowTopPx(2) + 'px' }}>2</div>
+              </React.Fragment>
+            )}
+            {tags.filter(t => !t.viaClick).length === 0 && chunks.length === 0 && otherChunks.length === 0 && (
               <div className="lane-empty">
                 위에 가사를 입력하고 트랙을 클릭해 배치하거나, "+ 가사 추가"로 자유롭게 추가하세요.
               </div>
@@ -2879,9 +2980,20 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
                 </div>
               </div>
             ))}
+            {otherChunks.map(c => (
+              <div key={c.ids[0]} className="click-tag-chunk inactive-verse"
+                style={{ left: imageXPctToWrapPct(c.xPct) + '%', top: rowTopPx(otherVerse) + 'px' }}>
+                {c.words.map((w, i) => (
+                  <span key={w.id} className="click-tag-word"
+                    onClick={e => { e.stopPropagation(); selectTag(w.id); }}>
+                    {(i > 0 ? ' ' : '') + w.text}
+                  </span>
+                ))}
+              </div>
+            ))}
             {chunks.map(c => (
               <div key={c.ids[0]} className="click-tag-chunk"
-                style={{ left: imageXPctToWrapPct(c.xPct) + '%', top: CLICK_LYRIC_Y_PCT + '%' }}>
+                style={{ left: imageXPctToWrapPct(c.xPct) + '%', top: rowTopPx(activeVerse) + 'px' }}>
                 {c.words.map((w, i) => (
                   <span key={w.id}
                     className={'click-tag-word' + (w.id === selectedTagId ? ' selected' : '')}
@@ -2895,7 +3007,6 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
               <div className={'click-marker ' + (pendingSnapped ? 'snapped' : 'free')}
                 style={{ left: imageXPctToWrapPct(pendingXPct) + '%' }} />
             )}
-            <div className="lane-resize-handle" onPointerDown={startResize} title="드래그해서 입력 영역 높이 조절" />
           </div>
         </div>
 
@@ -2962,7 +3073,7 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
       )}
     </div>
   );
-});
+}, imageBlockPropsEqual);
 
 
 function GlobalSettings({ defaults, setDefaults, titleFontSize, setTitleFontSize, lyricFontSize, setLyricFontSize, lyricLetterSpacing, setLyricLetterSpacing, onApplyAll, onApplyLyricAreaHeight, hasItems }) {
