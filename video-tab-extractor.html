@@ -7724,8 +7724,14 @@ async function flowDetectBars(chunks, nativeW, onProgress) {
   const starts = [];
   let total = 0;
   for (const c of chunks) { starts.push(total); total += c.width; }
-  const g0 = scrollGetFullGrayData(chunks[0]);
-  const sys0 = detectStaffSystem(g0, 0.3, 140);
+  // 기준 오선은 오선이 보이는 첫 조각에서 찾는다. 예전엔 첫 조각만 봐서, 띠 앞부분이 제목·크레딧 화면이면(FKJ: 첫 6000px)
+  // 오선 없음으로 끝나 마디선이 하나도 안 나왔다
+  let ri = 0, g0 = null, sys0 = null;
+  for (let i = 0; i < chunks.length && !sys0; i++) {
+    const g = scrollGetFullGrayData(chunks[i]);
+    const sy = detectStaffSystem(g, 0.3, 140);
+    if (sy) { ri = i; g0 = g; sys0 = sy; }
+  }
   const blank = new Uint8Array(total);
   if (!sys0) return { bars: [], weak: true, staffFound: false, blank, space: 12, total, T: null };
   const space = sys0.space;
@@ -7735,7 +7741,7 @@ async function flowDetectBars(chunks, nativeW, onProgress) {
     return { canvas: flowCropStrip(chunks, x0, x1), x0 };
   };
   // 연속도 임계 T: 첫 조각에서 0.9부터 0.05씩 낮추며 마디 수가 기대치 이상이 될 때까지 (기존 자동 규칙과 동일), 전체에 동일 적용
-  const e0 = ext(0);
+  const e0 = ri === 0 ? { canvas: ext(0).canvas, x0: 0 } : ext(ri);
   const gE = scrollGetFullGrayData(e0.canvas);
   const sysE = detectStaffSystem(gE, 0.3, 140);
   const leftE = sysE ? staffLeftEdge(gE, sysE) : 0;
@@ -7745,21 +7751,21 @@ async function flowDetectBars(chunks, nativeW, onProgress) {
     let res = null;
     for (const t of [0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5]) {
       T = t;
-      res = detectBarsThroughSystem(gE, sysE, T, leftE, 140, null, FLOW_HEADER_SPACES);
+      res = detectBarsThroughSystem(gE, sysE, T, leftE, 140, null, ri === 0 ? FLOW_HEADER_SPACES : 0);
       if (res.bars.length >= expectMin) break;
     }
     weak = !res || res.bars.length < expectMin;
   } else weak = true;
   const all = [];
   for (let i = 0; i < chunks.length; i++) {
-    const e = i === 0 ? { canvas: e0.canvas, x0: 0 } : ext(i);
-    const g = i === 0 ? gE : scrollGetFullGrayData(e.canvas);
+    const e = i === ri ? e0 : ext(i);
+    const g = i === ri ? gE : scrollGetFullGrayData(e.canvas);
     // 띠는 한 줄이라 오선 위치가 모든 조각에서 같다. 조각마다 다시 찾으면 코드 그림(가로줄 격자)이 많은 조각에서 실패해
     // 그 조각의 마디선을 통째로 놓쳤다(Misty 마지막 2천 px에서 5개) → 못 찾거나 위치가 다르면 첫 조각의 오선을 쓴다
-    let sys = i === 0 ? sysE : detectStaffSystem(g, 0.3, 140);
-    if (i > 0 && sysE && (!sys || Math.abs(sys.main.top - sysE.main.top) > sysE.space || Math.abs(sys.main.bottom - sysE.main.bottom) > sysE.space)) sys = sysE;
+    let sys = i === ri ? sysE : detectStaffSystem(g, 0.3, 140);
+    if (i !== ri && sysE && (!sys || Math.abs(sys.main.top - sysE.main.top) > sysE.space || Math.abs(sys.main.bottom - sysE.main.bottom) > sysE.space)) sys = sysE;
     if (sys) {
-      const r = detectBarsThroughSystem(g, sys, T, i === 0 ? staffLeftEdge(g, sys) : 0, 140, null, i === 0 ? FLOW_HEADER_SPACES : 0);
+      const r = detectBarsThroughSystem(g, sys, T, i === ri ? staffLeftEdge(g, sys) : 0, 140, null, i === 0 ? FLOW_HEADER_SPACES : 0);
       const lo = starts[i], hi = starts[i] + chunks[i].width;
       for (const b of r.bars) {
         const gx = b.x + e.x0;
@@ -7781,7 +7787,7 @@ async function flowDetectBars(chunks, nativeW, onProgress) {
     else merged.push(b);
   }
   const kept = pruneCloseBarObjs(merged);
-  let bars = [staffLeftEdge(g0, sys0), ...kept.map(b => b.x)];
+  let bars = [ri === 0 ? staffLeftEdge(g0, sys0) : 0, ...kept.map(b => b.x)];
   if (total - 1 - bars[bars.length - 1] > space * 4) bars.push(total - 1);
   return { bars, weak, staffFound: true, blank, space, total, T };
 }
@@ -9647,21 +9653,31 @@ function UniStage2({ result, videoFile, flowDefaults, editCtx }) {
     try {
       // 높이가 큰 띠(자동 모드가 페이지를 원본 해상도로 다시 잡은 경우)는 마디선 검출만 높이 ~320px 축소본에서 하고 위치를 되돌린다.
       // 원본 해상도에선 마디선이 1px로 가늘어 연속도 검사에서 빠졌다 (소수빈 4K: 62개 중 56개만 잡힘)
-      const k = H > 420 ? 320 / H : 1;
+      // 자동 모드는 마디선 검출용 띠(원래 크기·단단한 흑백)를 따로 준다 — 보여 주는 띠는 키우고 경계를 부드럽게 해서 가는 선이 옅다
+      const dc = result.detChunks || chunks;
+      const dW = dc.reduce((a, c) => a + c.width, 0), dH = dc[0].height;
+      const f = totalW / Math.max(1, dW);
+      const k = dH > 420 ? 320 / dH : 1;
       let r;
       if (k < 1) {
-        const small = chunks.map(c => {
+        const small = dc.map(c => {
           const o = document.createElement('canvas');
-          o.width = Math.max(1, Math.round(c.width * k)); o.height = Math.round(H * k);
+          o.width = Math.max(1, Math.round(c.width * k)); o.height = Math.round(dH * k);
           const g = o.getContext('2d'); g.imageSmoothingQuality = 'high'; g.drawImage(c, 0, 0, o.width, o.height);
           return o;
         });
-        const rs = await flowDetectBars(small, Math.round(nativeW * k), f => setDetProgress(f));
+        const rs = await flowDetectBars(small, Math.round(nativeW / f * k), p => setDetProgress(p));
+        const kk = k / f;
         const blank = new Uint8Array(totalW);
-        for (let x = 0; x < totalW; x++) blank[x] = rs.blank[Math.min(rs.blank.length - 1, Math.floor(x * k))] || 0;
-        r = { ...rs, bars: rs.bars.map(b => Math.min(totalW - 1, Math.round(b / k))), blank, space: rs.space / k, total: totalW };
+        for (let x = 0; x < totalW; x++) blank[x] = rs.blank[Math.min(rs.blank.length - 1, Math.floor(x * kk))] || 0;
+        r = { ...rs, bars: rs.bars.map(b => Math.min(totalW - 1, Math.round(b / kk))), blank, space: rs.space / kk, total: totalW };
+      } else if (f !== 1) {
+        const rs = await flowDetectBars(dc, Math.round(nativeW / f), p => setDetProgress(p));
+        const blank = new Uint8Array(totalW);
+        for (let x = 0; x < totalW; x++) blank[x] = rs.blank[Math.min(rs.blank.length - 1, Math.floor(x / f))] || 0;
+        r = { ...rs, bars: rs.bars.map(b => Math.min(totalW - 1, Math.round(b * f))), blank, space: rs.space * f, total: totalW };
       } else {
-        r = await flowDetectBars(chunks, nativeW, f => setDetProgress(f));
+        r = await flowDetectBars(dc, nativeW, p => setDetProgress(p));
       }
       setDet(r); setBars(r.bars);
     } finally { setDetecting(false); }
@@ -10957,8 +10973,9 @@ async function mosCaptureNative(video, roi, col, runs, onProg) {
   for (let i = 0; i < todo.length; i++) {
     const r = todo[i], t0 = r.frames[0].t, t1 = r.frames[r.frames.length - 1].t;
     const a = t1 - t0 > 2 ? t0 + 0.6 : t0, b = t1 - t0 > 2 ? t1 - 0.6 : t1;
+    // 5시점 중앙값: 예전엔 2장 평균이라, 페이지 위를 움직이는 재생 커서·강조 상자가 반투명하게 남아 흑백 처리 후 네모난 얼룩이 됐다
     const grays = [];
-    for (const f of [0.4, 0.6]) {
+    for (const f of (b - a > 0.8 ? [0.15, 0.325, 0.5, 0.675, 0.85] : [0.4, 0.6])) {
       await seekTo(video, a + (b - a) * f);
       g.drawImage(video, rx0, ry0, rw, rh, 0, 0, NW, NH);
       const d = g.getImageData(0, 0, NW, NH).data, gr = new Uint8Array(NW * NH);
@@ -10966,7 +10983,13 @@ async function mosCaptureNative(video, roi, col, runs, onProg) {
       grays.push(gr);
     }
     const out = grays[0];
-    if (grays.length > 1) for (let p = 0; p < out.length; p++) out[p] = (out[p] + grays[1][p]) >> 1;
+    if (grays.length === 5) {
+      const v = new Uint8Array(5);
+      for (let p = 0; p < out.length; p++) {
+        for (let k = 0; k < 5; k++) { const x = grays[k][p]; let j = k; while (j > 0 && v[j - 1] > x) { v[j] = v[j - 1]; j--; } v[j] = x; }
+        out[p] = v[2];
+      }
+    } else if (grays.length > 1) for (let p = 0; p < out.length; p++) out[p] = (out[p] + grays[1][p]) >> 1;
     r.native = out;
     if (onProg) onProg(i + 1, todo.length);
   }
@@ -10978,8 +11001,12 @@ async function mosCaptureNative(video, roi, col, runs, onProg) {
 function mosRender(col, pl, preproc) {
   const { OW, OH, dark } = col;
   const runs = pl.runs || col.runs;
-  const B = MOS_BLOCK, sc = col.native ? col.native.sc : 1;
-  const H = col.native ? col.native.NH : OH;
+  // 출력 높이가 낮으면(1080p 영상 아래쪽 1/3에 악보가 있으면 340px 남짓) 그대로 흑백 처리할 때 글자가 계단·뭉개짐으로 보였다
+  // → 높이 ~640px까지(최대 2배) 부드럽게 키운 뒤 처리한다. 원본에 없는 세부가 생기진 않지만 획 가장자리가 매끈해진다
+  const baseSc = col.native ? col.native.sc : 1, baseH = col.native ? col.native.NH : OH;
+  const UP = Math.max(1, Math.min(2, 640 / baseH));
+  const B = MOS_BLOCK, sc = baseSc * UP;
+  const H = Math.round(baseH * UP);
   const total = Math.max(1, Math.ceil(pl.total * sc));
   const lightOf = v => (dark ? 255 - v : v);
   // 장면별 그림(밝은 바탕 기준)을 한 번만 만든다
@@ -11043,34 +11070,41 @@ function mosRender(col, pl, preproc) {
       dys[ri] = bd * (H / rc.height);
     });
   }
-  const CH = 6000, chunks = [];
-  for (let c0 = 0; c0 < total; c0 += CH) {
-    const cw = Math.min(CH, total - c0);
-    const c = document.createElement('canvas'); c.width = cw; c.height = H;
-    const g = c.getContext('2d');
-    g.fillStyle = '#fff'; g.fillRect(0, 0, cw, H);
-    g.imageSmoothingQuality = 'high';
-    runs.forEach((r, ri) => {
-      const rc = runCanvas(r);
-      if (!rc) return;
-      const isNative = !!(r.native && col.native);
-      const gx = Math.round((pl.place[ri] + rc._x0) * sc) - c0;
-      const gw = isNative ? rc.width : Math.round(rc.width * sc);
-      if (gx + gw <= 0 || gx >= cw) return;
-      g.drawImage(rc, gx, Math.round(dys[ri]), gw, H);
-    });
-    // 흑백 처리는 정답 악보 7곡으로 검증된 페이지 전환형과 같은 방식: 임계값 + 그림 배경 지우기(얼룩이 있을 때만) + 잡티 제거.
-    // 예전 방식(화면 배경 빼기·오선 복원·탑햇 전체 적용)은 숫자를 배경으로 지우거나, 오선을 굵게 칠해 줄 위 숫자를 덮었다
-    if (preproc) {
-      const P = VIDEO_DEFAULTS_INIT, im2 = g.getImageData(0, 0, cw, H);
-      // 부드러운 경계(softness)는 0 — 원본 해상도의 가는 오선·마디선이 연회색으로 남아 마디선 검출(밝기 140 미만만 선으로 봄)이 실패했다
-      applyThreshold(im2, P.threshold, false, 0);
-      cleanPictureBackground(im2, cw, H);
-      if (P.despeckle) despeckleBinary(im2, cw, H, P.despeckleSize);
-      g.putImageData(im2, 0, 0);
+  const renderAt = (up, soft) => {
+    const scU = baseSc * up, HU = Math.round(baseH * up), totalU = Math.max(1, Math.ceil(pl.total * scU));
+    const CH = 6000, out = [];
+    for (let c0 = 0; c0 < totalU; c0 += CH) {
+      const cw = Math.min(CH, totalU - c0);
+      const c = document.createElement('canvas'); c.width = cw; c.height = HU;
+      const g = c.getContext('2d');
+      g.fillStyle = '#fff'; g.fillRect(0, 0, cw, HU);
+      g.imageSmoothingQuality = 'high';
+      runs.forEach((r, ri) => {
+        const rc = runCanvas(r);
+        if (!rc) return;
+        const isNative = !!(r.native && col.native);
+        const gx = Math.round((pl.place[ri] + rc._x0) * scU) - c0;
+        const gw = isNative ? Math.round(rc.width * up) : Math.round(rc.width * scU);
+        if (gx + gw <= 0 || gx >= cw) return;
+        g.drawImage(rc, gx, Math.round(dys[ri] * HU / H), gw, HU);
+      });
+      // 흑백 처리는 정답 악보 7곡으로 검증된 페이지 전환형과 같은 방식: 임계값 + 그림 배경 지우기(얼룩이 있을 때만) + 잡티 제거
+      if (preproc) {
+        const P = VIDEO_DEFAULTS_INIT, im2 = g.getImageData(0, 0, cw, HU);
+        // 검출용(soft=false)은 기준을 조금 높여(170→200) 연한 오선·마디선도 끊기지 않게 한다(FKJ 저해상도: 4번째 줄이 점선이 돼 오선 5줄로 오인)
+        applyThreshold(im2, soft ? P.threshold : Math.max(P.threshold, 200), false, soft ? P.softness : 0);
+        cleanPictureBackground(im2, cw, HU);
+        if (P.despeckle) despeckleBinary(im2, cw, HU, P.despeckleSize);
+        g.putImageData(im2, 0, 0);
+      }
+      out.push(c);
     }
-    chunks.push(c);
-  }
+    return out;
+  };
+  // 보여 주고 넘기는 그림: 키운 크기 + 부드러운 경계. 마디선 검출용: 원래 크기 + 단단한 흑백(예전과 같은 결과).
+  // 키운 그림에서 바로 검출하면 가는 오선·마디선이 확대로 옅어져 오선을 못 찾았다(FKJ: 0개)
+  const chunks = renderAt(UP, true);
+  const detChunks = preproc ? renderAt(1, false) : null;
   // 시간: 정지 구간은 창 전체를 구간 시간에 비례 분배, 움직이는 구간은 창 가운데가 지나가는 시각
   const pts = [];
   runs.forEach((r, ri) => {
@@ -11088,7 +11122,7 @@ function mosRender(col, pl, preproc) {
   }
   if (!T.length) { T.push(0); S.push(0); }
   const track = { t: T, X: S, k0: 0, k1: T.length - 1, totalW: total, nativeW: Math.round(OW * sc), barCols: [0, 0], staticRanges: [] };
-  return { chunks, totalW: total, H, stats: {}, tFirst: T[0], track, scale: sc };
+  return { chunks, detChunks, totalW: total, H, stats: {}, tFirst: T[0], track, scale: sc };
 }
 
 // 장면 하나의 미리보기(가로로 긴 작은 그림) — 장면 목록에서 손으로 고칠 때 쓴다
@@ -11133,7 +11167,7 @@ function mosCutStrip(result, a, b) {
     T.push(tr.t[i]); S.push(ns);
   });
   if (!T.length) { T.push(0); S.push(0); }
-  return { ...result, chunks, totalW, track: { ...tr, t: T, X: S, k1: T.length - 1, totalW }, tFirst: T[0], lastCut: { a, b }, cutFrom: result };
+  return { ...result, chunks, totalW, track: { ...tr, t: T, X: S, k1: T.length - 1, totalW }, tFirst: T[0], lastCut: { a, b }, cutFrom: result, detChunks: null };
 }
 
 function MosaicStep({ videoRef, onModeBack }) {
