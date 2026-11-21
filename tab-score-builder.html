@@ -879,152 +879,211 @@ const MERGE_GAP_MAX_PCT = 5;
 // Negative gapPct then intentionally overlaps CONTENT with content (by that literal percentage of the
 // two pieces' average content width), never margin-over-content, since margin was never drawn at all.
 // Shared by the final merge draw and the live preview so both always agree pixel-for-pixel.
-function computeMergeSeamPositions(pieces, gapPct) {
-  const xs = [];
-  let x = 0;
-  for (let i = 0; i < pieces.length; i++) {
-    if (i > 0) {
-      const prev = pieces[i - 1], cur = pieces[i];
-      const refW = (prev.contentRight + cur.contentRight) / 2;
-      x = (xs[i - 1] + prev.contentRight) + Math.round((gapPct / 100) * refW);
+// ---- N장씩 합치기 v2 (video-tab-extractor.html · tab-score-builder.html 공통 — 두 파일에 같은 코드) ----
+// 예전 방식은 흑백 처리된 그림에서 "끊기지 않은 진한 오선 6줄"을 찾았다. 영상 악보는 오선이 연한 회색이라 흑백 처리 뒤
+// 끊기거나 거의 사라져(정답 악보 7곡 중 7곡 모두 실패), 오선 일부만 잡혀 오른쪽 끝을 엉뚱한 곳(폭의 30~60%)으로 보고
+// 다음 장을 그 위에 겹쳐 그리거나, 아예 못 찾아 여백째 이어 붙였다.
+// 새 방식: 처리 전 원본(자르기만 적용)에서 위아래보다 어둡거나(흰 바탕) 밝은(어두운 바탕) 가는 가로줄을 찾고,
+// 같은 간격으로 4~6줄 늘어선 묶음을 오선으로 본다. 오선의 왼쪽·오른쪽 끝 = 그 줄들의 절반 이상이 지나가는 가장 긴 가로 구간.
+function mergeStaffExtent(canvas) {
+  const W = canvas.width, H = canvas.height;
+  if (W < 40 || H < 20) return null;
+  const d0 = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, W, H).data;
+  const g = new Uint8Array(W * H);
+  for (let p = 0, i = 0; p < W * H; p++, i += 4) g[p] = (d0[i] * 77 + d0[i + 1] * 150 + d0[i + 2] * 29) >> 8;
+  const d = Math.max(2, Math.round(H * 0.008));
+  let best = null;
+  for (const pol of [1, -1]) {
+    const L = new Uint8Array(W * H);
+    const R = new Float32Array(H);
+    for (let y = d; y < H - d; y++) {
+      let c = 0;
+      const o = y * W, ou = (y - d) * W, od = (y + d) * W;
+      for (let x = 0; x < W; x++) {
+        const v = g[o + x], a = g[ou + x], b = g[od + x];
+        const hit = pol > 0 ? (Math.min(a, b) - v > 10) : (v - Math.max(a, b) > 10);
+        if (hit) { L[o + x] = 1; c++; }
+      }
+      R[y] = c / W;
     }
-    xs.push(x);
-    x += pieces[i].w;
+    const R2 = new Float32Array(H);
+    for (let y = 0; y < H; y++) R2[y] = Math.max(R[y], y + 1 < H ? R[y + 1] : 0);
+    let pk = [];
+    for (let y = 1; y < H - 1; y++) if (R2[y] >= 0.2 && R2[y] >= R2[y - 1] && R2[y] > R2[y + 1]) pk.push(y);
+    if (pk.length > 60) pk = pk.sort((a, b) => R2[b] - R2[a]).slice(0, 60).sort((a, b) => a - b);
+    for (let i = 0; i < pk.length; i++) {
+      for (let j = i + 1; j < pk.length; j++) {
+        const gap = pk[j] - pk[i];
+        if (gap < 4 || gap > H / 3) continue;
+        const ch = [pk[i]];
+        for (let k = 1; k < 6; k++) {
+          const t = pk[i] + gap * k;
+          let c = -1, cd = Infinity;
+          for (const p of pk) { const dd = Math.abs(p - t); if (dd < cd) { cd = dd; c = p; } }
+          if (cd > Math.max(2, gap * 0.15)) break;
+          ch.push(c);
+        }
+        if (ch.length < 4) continue;
+        let sc = 0; for (const y of ch) sc += R2[y];
+        if (!best || sc > best.sc) best = { sc, ch, gap, L };
+      }
+    }
   }
-  return { xs, totalW: x };
+  if (!best) return null;
+  const { ch, gap, L } = best;
+  const cov = new Uint8Array(W);
+  for (const y of ch) {
+    for (let x = 0; x < W; x++) {
+      let hit = 0;
+      for (let yy = Math.max(0, y - 1); yy <= Math.min(H - 1, y + 2); yy++) if (L[yy * W + x]) { hit = 1; break; }
+      cov[x] += hit;
+    }
+  }
+  const need = Math.max(2, Math.ceil(ch.length / 2));
+  let bestRun = null, s = -1, last = -1;
+  for (let x = 0; x <= W; x++) {
+    const on = x < W && cov[x] >= need;
+    if (on) { if (s < 0) s = x; else if (x - last > gap * 2) { if (!bestRun || last - s > bestRun[1] - bestRun[0]) bestRun = [s, last]; s = x; } last = x; }
+  }
+  if (s >= 0 && (!bestRun || last - s > bestRun[1] - bestRun[0])) bestRun = [s, last];
+  if (!bestRun || bestRun[1] - bestRun[0] < W * 0.3) return null;
+  return { left: bestRun[0], right: bestRun[1] + 1, top: ch[0], gap, lines: ch.length, W, H };
 }
 
-async function mergeImagesIntoRow(sourceItems, defaults, gapPct) {
-  gapPct = gapPct || 0;
-  const processed = [];
-  for (const it of sourceItems) {
-    const img = await loadImage(resolvedSrc(it));
-    const canvas = document.createElement('canvas');
-    drawProcessed(canvas, img, effectiveImageSettings(it, defaults));
-    const imageData = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height);
-    const staff = detectStaffBand(imageData, canvas.width, canvas.height);
-    processed.push({ item: it, canvas, staff });
+// parts: [{ canvas(처리된 그림), ext(mergeStaffExtent 결과 또는 null) }]
+// gapPct: 모든 이음새의 기본 간격(오선 폭의 %), seamGaps[k]: k번째 이음새(조각 k와 k+1 사이)만 따로 정한 간격(%) — null이면 기본값.
+// 간격 0 = 앞 장 오선 끝과 다음 장 오선 시작이 맞닿음. 음수 = 겹침 → 겹치는 폭의 절반씩 앞 장 오른쪽·다음 장 왼쪽을 잘라 맞붙인다
+// (예전처럼 다음 장의 흰 바탕이 앞 장 위를 덮어 지우지 않는다).
+function composeMergedRow(parts, gapPct, seamGaps) {
+  const n = parts.length;
+  const ref = parts[0].ext;
+  const sc = parts.map(p => {
+    if (!ref || !p.ext) return 1;
+    let s = ref.gap / p.ext.gap;
+    if (!isFinite(s) || Math.abs(s - 1) < 0.03) s = 1; // 같은 영상·같은 영역이면 확대·축소하지 않는다(흐려짐 방지)
+    return Math.max(0.5, Math.min(2, s));
+  });
+  const P = parts.map((p, i) => {
+    const s = sc[i], w = Math.max(1, Math.round(p.canvas.width * s)), h = Math.max(1, Math.round(p.canvas.height * s));
+    const L = i > 0 && p.ext ? Math.round(p.ext.left * s) : 0;
+    const R = i < n - 1 && p.ext ? Math.round(p.ext.right * s) : w;
+    return { canvas: p.canvas, s, w, h, L, R: Math.max(L + 1, R), top: p.ext ? p.ext.top * s : null };
+  });
+  // 세로 맞춤: 첫 장은 움직이지 않는다(가사 위치 보존), 오선이 없는 장은 위쪽 맞춤
+  const top0 = P[0].top;
+  let offs = P.map(q => (top0 != null && q.top != null) ? Math.round(top0 - q.top) : 0);
+  const minOff = Math.min(...offs);
+  if (minOff < 0) offs = offs.map(o => o - minOff);
+  const staffWs = P.map(q => q.R - q.L).filter(v => v > 0);
+  const refW = staffWs.reduce((a, b) => a + b, 0) / Math.max(1, staffWs.length);
+  const gapsPx = [];
+  for (let k = 0; k < n - 1; k++) {
+    const pct = seamGaps && seamGaps[k] != null && isFinite(seamGaps[k]) ? Number(seamGaps[k]) : (gapPct || 0);
+    gapsPx.push(Math.round(pct / 100 * refW));
   }
-
-  // Always anchor scale to the FIRST (leftmost) piece specifically — never to some LATER piece
-  // that merely happens to be the first one with a detectable staff. Anchoring to whichever piece
-  // came first with detectable ink meant merging more images onto an already-placed-lyrics image
-  // could rescale THAT image to match a later one, silently moving its lyrics even though nothing
-  // about it changed. If the first piece itself has no detectable staff, refSpacing stays null and
-  // every piece (including the first) keeps scale 1 — the existing safe fallback.
-  const ref = processed[0].staff ? processed[0] : null;
-  const refSpacing = ref ? (ref.staff.staffBottom - ref.staff.staffTop) / 5 : null;
-
-  const scaled = processed.map(p => {
-    let scale = 1;
-    if (refSpacing && p.staff) {
-      const spacing = (p.staff.staffBottom - p.staff.staffTop) / 5;
-      if (spacing > 0) scale = refSpacing / spacing;
-    }
-    const w = Math.max(1, Math.round(p.canvas.width * scale));
-    const h = Math.max(1, Math.round(p.canvas.height * scale));
-    const staffTopScaled = p.staff ? p.staff.staffTop * scale : null;
-    // The staff line span, not raw ink, is what marks real bar content — detectStaffBand already
-    // requires 6 evenly-spaced unbroken lines to match, which decorative shading/watermarks/chord
-    // boxes (common in YouTube captures) don't produce, so this stays reliable where a naive
-    // ink-density scan would mistake those for content. staffLeftNative stays in the ORIGINAL
-    // (pre-scale) canvas's own pixel coordinates since that's what the drawImage source rect below
-    // needs; contentLeft/contentRight are the scaled equivalents used for seam layout math.
-    const staffLeftNative = p.staff ? p.staff.staffLeft : null;
-    const contentLeft = p.staff ? p.staff.staffLeft * scale : null;
-    const contentRight = p.staff ? p.staff.staffRight * scale : null;
-    return { item: p.item, canvas: p.canvas, w, h, staffTopScaled, staffLeftNative, contentLeft, contentRight };
-  });
-
-  // Shift each image down so every (scaled) staff top lands on the same y — images with no detected
-  // staff are simply top-aligned (offsetY 0), since there's nothing to align them to. `refTop` uses
-  // the MAXIMUM staffTopScaled across pieces so nobody ever needs a negative offset (which would
-  // push them above the canvas and clip them) — but that can leave the first piece itself needing a
-  // nonzero offsetY (whenever some OTHER piece's staff sits lower in its own frame), moving the
-  // first piece vertically for a reason that has nothing to do with it. The re-anchor pass below
-  // undoes exactly that: shift everyone uniformly so the first piece's own offsetY is 0 again (their
-  // RELATIVE spacing to each other is unaffected by a uniform shift), then only if that would newly
-  // push someone negative, shift the whole group down by that deficit instead — the first piece
-  // still never moves relative to the others, it just isn't necessarily glued to y=0 in that case.
-  const knownTops = scaled.map(s => s.staffTopScaled).filter(v => v != null);
-  const refTop = knownTops.length ? Math.max(...knownTops) : 0;
-  const rawOffsets = scaled.map(s => ({
-    ...s, offsetY: s.staffTopScaled != null ? Math.round(refTop - s.staffTopScaled) : 0,
-  }));
-  const firstOffset = rawOffsets[0].offsetY;
-  const reAnchored = rawOffsets.map(s => ({ ...s, offsetY: s.offsetY - firstOffset }));
-  const minOffset = Math.min(...reAnchored.map(s => s.offsetY));
-  const withOffsets = minOffset < 0 ? reAnchored.map(s => ({ ...s, offsetY: s.offsetY - minOffset })) : reAnchored;
-
-  // Crop away every non-first piece's own blank lead-in margin (from its left edge to its detected
-  // content start) BEFORE it's ever composited — this is what guarantees that margin can never be
-  // drawn on top of the previous piece's real content, no matter how wide it is or how much overlap
-  // the user dials in. The first piece keeps its own leading margin (nothing precedes it to protect).
-  // Falls back to "no trim, content-right = full width" whenever staff detection failed for a piece,
-  // reproducing the old plain edge-to-edge behavior for exactly that piece.
-  const trimmed = withOffsets.map((s, i) => {
-    const trimNative = (i > 0 && s.staffLeftNative != null) ? s.staffLeftNative : 0;
-    const trimScaled = (i > 0 && s.contentLeft != null) ? s.contentLeft : 0;
-    const w = s.w - trimScaled;
-    const contentRight = s.contentRight != null ? (s.contentRight - trimScaled) : w;
-    return { ...s, fullW: s.w, w, contentRight, trimNative, trimScaled };
-  });
-
-  const { xs, totalW: seamTotalW } = computeMergeSeamPositions(trimmed, gapPct);
-  const totalW = Math.max(1, seamTotalW);
-  const totalH = Math.max(...trimmed.map(s => s.offsetY + s.h));
-
+  // 겹침은 양쪽에서 반씩 잘라낸다(한 장이 너무 좁아지지 않게 각 장 폭의 45%까지만)
+  const cutL = new Array(n).fill(0), cutR = new Array(n).fill(0);
+  for (let k = 0; k < n - 1; k++) {
+    if (gapsPx[k] >= 0) continue;
+    const ov = -gapsPx[k];
+    const a = P[k], b = P[k + 1];
+    const maxA = Math.max(0, Math.floor((a.R - a.L) * 0.45)), maxB = Math.max(0, Math.floor((b.R - b.L) * 0.45));
+    cutR[k] = Math.min(maxA, Math.floor(ov / 2));
+    cutL[k + 1] = Math.min(maxB, ov - cutR[k]);
+    if (cutR[k] + cutL[k + 1] < ov) cutR[k] = Math.min(maxA, ov - cutL[k + 1]);
+  }
+  const place = [];
+  let x = 0;
+  for (let i = 0; i < n; i++) {
+    const q = P[i];
+    const sL = q.L + cutL[i], sR = q.R - cutR[i];
+    if (i > 0 && gapsPx[i - 1] > 0) x += gapsPx[i - 1];
+    place.push({ x, sL, sR, s: q.s, y: offs[i], h: q.h, fullW: q.w });
+    x += Math.max(1, sR - sL);
+  }
   const out = document.createElement('canvas');
-  out.width = totalW;
-  out.height = Math.max(1, totalH);
+  out.width = Math.max(1, x);
+  out.height = Math.max(1, ...place.map(p => p.y + p.h));
   const ctx = out.getContext('2d');
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, out.width, out.height);
+  ctx.imageSmoothingQuality = 'high';
+  place.forEach((p, i) => {
+    const c = P[i].canvas, w = Math.max(1, p.sR - p.sL);
+    ctx.drawImage(c, p.sL / p.s, 0, w / p.s, c.height, p.x, p.y, w, p.h);
+  });
+  const seams = [];
+  for (let k = 0; k < n - 1; k++) seams.push({ x: place[k + 1].x - Math.max(0, gapsPx[k]) / 2, gapPx: gapsPx[k], auto: !(seamGaps && seamGaps[k] != null) });
+  return { canvas: out, place, seams, missing: parts.map((p, i) => (p.ext ? null : i)).filter(i => i !== null) };
+}
 
+// 한 항목을 합치기용 조각으로 만든다: 처리된 그림 + (처리 전 원본에서 찾은) 오선 범위
+async function mergePartFromItem(it, defaults) {
+  const img = await loadImage(resolvedSrc(it));
+  const s = effectiveImageSettings(it, defaults);
+  const canvas = document.createElement('canvas');
+  drawProcessed(canvas, img, s);
+  const raw = document.createElement('canvas');
+  drawProcessed(raw, img, { ...s, removeBg: false, playheadRemove: false });
+  return { canvas, ext: mergeStaffExtent(raw) };
+}
+
+async function mergeImagesIntoRow(sourceItems, defaults, gapPct, seamGaps, partsIn) {
+  gapPct = gapPct || 0;
+  const parts = partsIn || [];
+  if (!partsIn) for (const it of sourceItems) parts.push(await mergePartFromItem(it, defaults));
+  const res = composeMergedRow(parts, gapPct, seamGaps);
+  const totalW = res.canvas.width;
   const mergedTags = [];
-  trimmed.forEach((s, i) => {
-    const x = xs[i];
-    const srcW = s.canvas.width - s.trimNative;
-    ctx.drawImage(s.canvas, s.trimNative, 0, srcW, s.canvas.height, x, s.offsetY, s.w, s.h);
-    // Lyric tag xPct is "% across this item's own ORIGINAL (pre-trim) image width" — remap through
-    // where that original image's x=0 would fall in the merged canvas (conceptually, even though the
-    // cropped-away margin portion of it, if any, is never actually drawn there). yPct is "% down the
-    // lyric lane" (a UI concept shared by whichever single item owns the lane), not tied to image
-    // width, so it carries over unchanged.
-    const conceptualFullX = x - s.trimScaled;
-    const tags = (s.item.lyrics && s.item.lyrics.tags) || [];
+  sourceItems.forEach((it, i) => {
+    const p = res.place[i];
+    const tags = (it.lyrics && it.lyrics.tags) || [];
     for (const t of tags) {
-      const localXPx = (t.xPct / 100) * s.fullW;
-      const globalXPct = ((conceptualFullX + localXPx) / totalW) * 100;
-      mergedTags.push({ ...t, id: Date.now() + '_' + Math.random().toString(36).slice(2), xPct: globalXPct });
+      const localX = (t.xPct / 100) * p.fullW;
+      mergedTags.push({ ...t, id: Date.now() + '_' + Math.random().toString(36).slice(2), xPct: ((p.x - p.sL + localX) / totalW) * 100 });
     }
   });
-
-  const areaHeightRatios = sourceItems
-    .map(it => (it.lyrics && it.lyrics.areaHeightRatio) || 0)
-    .filter(v => v > 0);
+  const areaHeightRatios = sourceItems.map(it => (it.lyrics && it.lyrics.areaHeightRatio) || 0).filter(v => v > 0);
   const areaHeightRatio = areaHeightRatios.length ? Math.max(...areaHeightRatios) : null;
-
-  // 0-based indices (within sourceItems) whose staff detection failed — these pieces got NEITHER
-  // the scale correction NOR the content-boundary trim/overlap (both derive from the same
-  // detectStaffBand result), and silently fell back to plain edge-to-edge concatenation at their
-  // own native scale. Returned so the caller can tell the user exactly which pieces this happened
-  // to, instead of a single generic flag that only mentions the scale side of it.
-  const missingStaffIndices = processed.map((p, i) => (p.staff ? null : i)).filter(i => i !== null);
-
+  const ranges = sourceItems.map(it => it.timeRange).filter(Boolean);
+  const timeRange = ranges.length && ranges.length === sourceItems.length
+    ? { start: Math.min(...ranges.map(r => r.start)), end: Math.max(...ranges.map(r => r.end)) }
+    : null;
+  const videoSourceId = sourceItems.length && sourceItems.every(it => it.videoSourceId === sourceItems[0].videoSourceId)
+    ? (sourceItems[0].videoSourceId || null) : null;
   return {
-    canvas: out,
+    canvas: res.canvas, seams: res.seams, parts,
     lyrics: { tags: mergedTags, areaHeightRatio },
-    anyStaffMissing: missingStaffIndices.length > 0,
-    missingStaffIndices,
+    anyStaffMissing: res.missing.length > 0, missingStaffIndices: res.missing,
+    timeRange, videoSourceId,
   };
 }
 
-// Left-aligns a too-short trailing batch-merge row's already-merged canvas onto a wider blank canvas
-// matching the other rows' width — content stays at its own natural scale (no stretching/zooming;
-// that was tried and rejected, since scaling up made the last row's text/numbers visibly larger than
-// every other row instead of matching them) and any leftover width is plain white space on the right.
-// A no-op (returns the original canvas) if it's already at least as wide as targetWidth.
+// 합친 블록에 붙여 두는 "다시 맞추기" 정보 — 빌더에서 이음새 간격을 다시 조절하거나 낱장으로 되돌릴 때 쓴다
+function makeMergeMeta(result, sourceItems, gapPct, seamGaps) {
+  return {
+    v: 2, gapPct: gapPct || 0,
+    seamGaps: (seamGaps || []).slice(0, Math.max(0, result.parts.length - 1)),
+    parts: result.parts.map((p, i) => ({
+      src: p.canvas.toDataURL('image/png'), ext: p.ext,
+      timeRange: (sourceItems[i] && sourceItems[i].timeRange) || null,
+    })),
+  };
+}
+
+async function mergePartsFromMeta(meta) {
+  const parts = [];
+  for (const p of meta.parts) {
+    const img = await loadImage(p.src);
+    const c = document.createElement('canvas');
+    c.width = img.naturalWidth; c.height = img.naturalHeight;
+    c.getContext('2d').drawImage(img, 0, 0);
+    parts.push({ canvas: c, ext: p.ext || null });
+  }
+  return parts;
+}
+// ---- N장씩 합치기 v2 끝 ----
+
 function padCanvasRightTo(canvas, targetWidth) {
   if (canvas.width >= targetWidth) return canvas;
   const out = document.createElement('canvas');
@@ -1571,7 +1630,87 @@ function wrapPctToImageXPct(wrapPct) {
 }
 
 
-const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults, lyricFontSize, lyricLetterSpacing, defaultLyricAreaHeight, onChange, onDelete, onMove, mergeSelected, onToggleMergeSelect, nextItemId }) {
+// 합친 줄 "이음새 다시 맞추기" — 영상 추출 페이지나 이 화면의 N장씩 합치기로 만든 줄은 합치기 전 낱장(mergeMeta.parts)을 함께 저장해 둔다.
+// 이음새마다 간격을 다시 조절해 다시 합치거나, 낱장으로 되돌려 따로 고칠 수 있다.
+function MergeSeamEditor({ item, onChange, onSplit }) {
+  const meta = item.mergeMeta;
+  const nSeam = meta.parts.length - 1;
+  const [open, setOpen] = useState(false);
+  const [gapPct, setGapPct] = useState(meta.gapPct || 0);
+  const [gaps, setGaps] = useState(() => Array.from({ length: nSeam }, (_, k) => (meta.seamGaps && meta.seamGaps[k] != null ? meta.seamGaps[k] : null)));
+  const [pv, setPv] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const partsRef = useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setBusy(true);
+    const timer = setTimeout(async () => {
+      try {
+        if (!partsRef.current) partsRef.current = await mergePartsFromMeta(meta);
+        const r = composeMergedRow(partsRef.current, gapPct, gaps);
+        if (cancelled) return;
+        const c = meta.padTo ? padCanvasRightTo(r.canvas, meta.padTo) : r.canvas;
+        setPv({ src: c.toDataURL('image/png'), w: c.width, seams: r.seams });
+      } finally { if (!cancelled) setBusy(false); }
+    }, 250);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [open, gapPct, gaps]);
+  function setGap(k, v) { setGaps(prev => { const n = prev.slice(); n[k] = v == null ? null : Math.max(-40, Math.min(10, Math.round(v * 10) / 10)); return n; }); }
+  function apply() {
+    if (!pv) return;
+    onChange({ ...item, src: pv.src, barLayout: null, mergeMeta: { ...meta, gapPct, seamGaps: gaps } });
+    setOpen(false);
+  }
+  const hasLyrics = item.lyrics && item.lyrics.tags && item.lyrics.tags.length > 0;
+  if (!open) {
+    return (
+      <div className="toolbar" style={{ margin: '4px 0' }}>
+        <button className="icon-btn" onClick={() => setOpen(true)}>이음새 다시 맞추기 ({meta.parts.length}장을 합친 줄)</button>
+        <button className="icon-btn" onClick={() => { if (window.confirm('이 줄을 합치기 전 ' + meta.parts.length + '장으로 되돌릴까요?' + (hasLyrics ? ' 이 줄에 배치한 가사는 사라집니다.' : ''))) onSplit(); }}>낱장으로 되돌리기</button>
+      </div>
+    );
+  }
+  return (
+    <div className="controls" style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 8, margin: '6px 0' }}>
+      <div className="slider-label" style={{ margin: 0 }}>이음새 다시 맞추기 — 0은 오선 끝과 시작이 맞닿음, 음수는 겹침(겹친 폭의 절반씩 양쪽을 잘라 맞붙임){busy ? ' (갱신 중...)' : ''}</div>
+      {pv && (
+        <div style={{ position: 'relative' }}>
+          <img src={pv.src} alt="이음새 미리보기" style={{ width: '100%', display: 'block', background: '#fff', border: '1px solid var(--border)' }} />
+          {pv.seams.map((sm, k) => (
+            <div key={k} style={{ position: 'absolute', top: 0, bottom: 0, left: (sm.x / pv.w * 100) + '%', borderLeft: '2px dashed rgba(231,76,60,0.75)', pointerEvents: 'none' }}>
+              <span style={{ position: 'absolute', top: 0, left: 2, background: '#e74c3c', color: '#fff', fontSize: 11, borderRadius: 3, padding: '0 4px' }}>{k + 1}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      <div>
+        <div className="slider-label">모든 이음새 기본 간격 ({gapPct}%)</div>
+        <input type="range" min="-40" max="10" step="0.5" value={gapPct} onChange={e => setGapPct(Number(e.target.value))} />
+      </div>
+      {gaps.map((g, k) => {
+        const cur = g != null ? g : gapPct;
+        return (
+          <div key={k} style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+            <span className="slider-label" style={{ margin: 0, minWidth: '5em' }}>이음새 {k + 1}</span>
+            <button className="icon-btn" onClick={() => setGap(k, cur - 0.5)}>− 겹치기</button>
+            <input type="range" min="-40" max="10" step="0.1" value={cur} onChange={e => setGap(k, Number(e.target.value))} style={{ flex: 1, minWidth: 120 }} />
+            <button className="icon-btn" onClick={() => setGap(k, cur + 0.5)}>띄우기 +</button>
+            <span className="slider-label" style={{ margin: 0, minWidth: '4.5em' }}>{cur.toFixed(1)}%{g == null ? ' (기본)' : ''}</span>
+            {g != null && <button className="icon-btn" onClick={() => setGap(k, null)}>기본값으로</button>}
+          </div>
+        );
+      })}
+      {hasLyrics && <div className="hint-text">이 줄에 배치한 가사는 그대로 남습니다 — 폭이 바뀌면 위치를 다시 확인하세요.</div>}
+      <div className="toolbar">
+        <button className="icon-btn" onClick={() => setOpen(false)}>닫기</button>
+        <button onClick={apply} disabled={!pv || busy}>이대로 다시 합치기</button>
+      </div>
+    </div>
+  );
+}
+
+const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults, lyricFontSize, lyricLetterSpacing, defaultLyricAreaHeight, onChange, onDelete, onMove, mergeSelected, onToggleMergeSelect, nextItemId, onReplaceWith }) {
   const canvasRef = useRef(null);
   const imgRef = useRef(null);
   const laneRef = useRef(null);
@@ -2528,6 +2667,17 @@ const ImageBlock = React.memo(function ImageBlock({ item, index, total, defaults
           image, so there's no more duplicate rendering of the same TAB image. */}
       <canvas ref={canvasRef} style={{ display: 'none' }} />
 
+      {item.mergeMeta && item.mergeMeta.parts && item.mergeMeta.parts.length > 1 && onReplaceWith && (
+        <MergeSeamEditor item={item} onChange={onChange}
+          onSplit={() => onReplaceWith(item.mergeMeta.parts.map((p, k) => ({
+            id: Date.now() + '_' + Math.random().toString(36).slice(2) + '_' + k,
+            type: 'image', src: p.src, invert: false, override: { ...MERGED_ROW_NEUTRAL_OVERRIDE },
+            lyrics: { tags: [], areaHeightRatio: null },
+            playheadExcluded: [], barLayout: null, stitchMeta: null,
+            timeRange: p.timeRange || null, videoSourceId: item.videoSourceId || null,
+          })))} />
+      )}
+
       {settingsOpen && (
       <div className="controls">
         {!advanced ? (
@@ -3215,6 +3365,7 @@ function TabScoreBuilder() {
         invert: false, override: { ...MERGED_ROW_NEUTRAL_OVERRIDE },
         lyrics: result.lyrics,
         playheadExcluded: [], barLayout: null, stitchMeta: null,
+        mergeMeta: makeMergeMeta(result, sourceItems, mergeGapPct, null),
       };
       setItems(prev => {
         const next = [...prev];
@@ -3350,6 +3501,7 @@ function TabScoreBuilder() {
         invert: false, override: { ...MERGED_ROW_NEUTRAL_OVERRIDE },
         lyrics: result.lyrics,
         playheadExcluded: [], barLayout: null, stitchMeta: null,
+        mergeMeta: groups[i].length > 1 ? { ...makeMergeMeta(result, groups[i], mergeGapPct, null), padTo: (i === mergedResults.length - 1 && lastIsPartial) ? result.canvas.width : null } : null,
       }));
 
       setItems([...before, ...excluded, ...newBlocks]);
@@ -3801,7 +3953,8 @@ function TabScoreBuilder() {
             onMove={dir => moveItem(item.id, dir)}
             mergeSelected={mergeSelectedIds.has(item.id)}
             onToggleMergeSelect={() => toggleMergeSelect(item.id)}
-            nextItemId={items[idx + 1] ? items[idx + 1].id : null} />
+            nextItemId={items[idx + 1] ? items[idx + 1].id : null}
+            onReplaceWith={list => setItems(prev => { const i = prev.findIndex(it => it.id === item.id); if (i < 0) return prev; const n = prev.slice(); n.splice(i, 1, ...list); return n; })} />
         ))}
       </div>
 
