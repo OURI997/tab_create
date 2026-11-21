@@ -3333,8 +3333,10 @@ function detectBarsThroughSystem(g, sys, T, left, darkThresh, frames, headerSpac
     );
     if (protrude >= space * 0.6) { protruded++; continue; }
     let endsOk = false;
-    for (let dx = -1; dx <= 1 && !endsOk; dx++) {
-      const xx = px + dx;
+    // 겹세로줄(‖)은 두 선의 평균 위치가 선 사이 빈칸이라 끝점 검사가 늘 실패했다(Misty 2곳) → 각 선 위치도 검사
+    const tryXs = [...new Set([px - 1, px, px + 1, ...gr.items.map(m => Math.round(m.x))])];
+    for (const xx of tryXs) {
+      if (endsOk) break;
       if (xx < 0 || xx >= g.w) continue;
       const e1 = runExtentFrom(g, xx, (staves[0][0].y0 + staves[0][staves[0].length - 1].y1) / 2, darkThresh);
       const lastSt = staves[K - 1];
@@ -7646,6 +7648,8 @@ function flowCropStrip(chunks, x0, x1) {
 // 조각별로 기존 마디선 검출(detectStaffSystem / detectBarsThroughSystem — 밴드 정확 일치·재생바 제외 규칙 포함)을
 // 실행하고 전체 좌표로 합친다. 조각 경계 ±(오선 간격×3)는 인접 조각을 이어 붙인 확장 캔버스에서 검사하고, 각 마디선은
 // 그것이 속한 조각 한 곳에서만 채택해(소유권) 경계에서 갈라지거나 중복되지 않게 한다. 헤더 제외는 첫 조각만.
+// 첫 마디선 검출에서 제외할 머리 부분(TAB 표시·박자표) 폭 — 오선 간격 기준. 20이면 못갖춘마디(Misty 첫 마디)의 마디선까지 지워졌다
+const FLOW_HEADER_SPACES = 10;
 async function flowDetectBars(chunks, nativeW, onProgress) {
   const starts = [];
   let total = 0;
@@ -7671,7 +7675,7 @@ async function flowDetectBars(chunks, nativeW, onProgress) {
     let res = null;
     for (const t of [0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5]) {
       T = t;
-      res = detectBarsThroughSystem(gE, sysE, T, leftE, 140, null, 20);
+      res = detectBarsThroughSystem(gE, sysE, T, leftE, 140, null, FLOW_HEADER_SPACES);
       if (res.bars.length >= expectMin) break;
     }
     weak = !res || res.bars.length < expectMin;
@@ -7680,9 +7684,12 @@ async function flowDetectBars(chunks, nativeW, onProgress) {
   for (let i = 0; i < chunks.length; i++) {
     const e = i === 0 ? { canvas: e0.canvas, x0: 0 } : ext(i);
     const g = i === 0 ? gE : scrollGetFullGrayData(e.canvas);
-    const sys = i === 0 ? sysE : detectStaffSystem(g, 0.3, 140);
+    // 띠는 한 줄이라 오선 위치가 모든 조각에서 같다. 조각마다 다시 찾으면 코드 그림(가로줄 격자)이 많은 조각에서 실패해
+    // 그 조각의 마디선을 통째로 놓쳤다(Misty 마지막 2천 px에서 5개) → 못 찾거나 위치가 다르면 첫 조각의 오선을 쓴다
+    let sys = i === 0 ? sysE : detectStaffSystem(g, 0.3, 140);
+    if (i > 0 && sysE && (!sys || Math.abs(sys.main.top - sysE.main.top) > sysE.space || Math.abs(sys.main.bottom - sysE.main.bottom) > sysE.space)) sys = sysE;
     if (sys) {
-      const r = detectBarsThroughSystem(g, sys, T, staffLeftEdge(g, sys), 140, null, i === 0 ? 20 : 0);
+      const r = detectBarsThroughSystem(g, sys, T, i === 0 ? staffLeftEdge(g, sys) : 0, 140, null, i === 0 ? FLOW_HEADER_SPACES : 0);
       const lo = starts[i], hi = starts[i] + chunks[i].width;
       for (const b of r.bars) {
         const gx = b.x + e.x0;
@@ -9306,6 +9313,7 @@ function UniBarStrip({ chunks, totalW, H, scale, bars, flagged, warnIdx, selIdx,
                 onPointerDown={e => { e.preventDefault(); e.stopPropagation(); dragRef.current = { i, startClient: e.clientX, origX: b, moved: false, x: b }; }}
                 style={{ position: 'absolute', left: x * scale - 5, width: 10, top: 0, bottom: 0, cursor: 'ew-resize' }}>
                 <div style={{ position: 'absolute', left: 4, width: sel ? 3 : 2, top: 0, bottom: 0, background: sel ? '#ff9500' : '#e02020', pointerEvents: 'none' }} />
+                {i < bars.length - 1 && <div style={{ position: 'absolute', left: 8, top: 1, background: 'rgba(21,101,192,0.9)', color: '#fff', fontSize: 10, lineHeight: '13px', padding: '0 3px', borderRadius: 3, pointerEvents: 'none', zIndex: 6 }}>{i + 1}</div>}
               </div>
             );
           })}
@@ -9590,7 +9598,44 @@ function UniStage2({ result, videoFile, flowDefaults, editCtx }) {
       setDet(r); setBars(r.bars);
     } finally { setDetecting(false); }
   }
-  useEffect(() => { detect(); }, [result]);
+  // 마디를 지우거나 되돌릴 때 마디선을 다시 검출하지 않는다 — 손으로 고친 마디선이 사라져 처음부터 다시 해야 했다.
+  // 결과(띠)마다 마디선을 기억해 두고, 지운 구간만큼 뒤쪽 마디선을 당긴다
+  const barsMemoRef = useRef(new WeakMap());
+  useEffect(() => {
+    const memo = barsMemoRef.current;
+    setSelIdx(null); setEditIdx(null);
+    if (memo.has(result)) { const m = memo.get(result); setDet(m.det); setBars(m.bars); return; }
+    if (result.lastCut && result.cutFrom && memo.has(result.cutFrom)) {
+      const { a, b } = result.lastCut, cut = b - a;
+      const m = memo.get(result.cutFrom);
+      const nb = [];
+      for (const x of m.bars) {
+        const r = Math.round(x);
+        if (r > a && r <= b) continue;
+        const v = r > b ? x - cut : x;
+        if (!nb.length || v > nb[nb.length - 1] + 1) nb.push(v);
+      }
+      let nd = m.det;
+      if (nd) {
+        let blank = nd.blank;
+        if (blank && blank.length >= b) { const nbk = new Uint8Array(Math.max(1, blank.length - cut)); nbk.set(blank.subarray(0, a), 0); nbk.set(blank.subarray(b), a); blank = nbk; }
+        nd = { ...nd, bars: nb, blank, total: totalW };
+      }
+      setDet(nd); setBars(nb);
+      return;
+    }
+    detect();
+  }, [result]);
+  useEffect(() => { if (det) barsMemoRef.current.set(result, { det, bars }); }, [bars, det]);
+  const [delFrom, setDelFrom] = useState('');
+  const [delTo, setDelTo] = useState('');
+  function deleteRange() {
+    const nM = Math.max(0, bars.length - 1);
+    const i = parseInt(delFrom, 10), j = delTo === '' ? i : parseInt(delTo, 10);
+    if (!(i >= 1 && j >= i && j <= nM) || !ctx2.onDeleteMeasure) return;
+    ctx2.onDeleteMeasure(bars[i - 1], bars[j]);
+    setDelFrom(''); setDelTo('');
+  }
 
   const videoUrl = useMemo(() => (videoFile ? URL.createObjectURL(videoFile) : null), [videoFile]);
   useEffect(() => () => { if (videoUrl) URL.revokeObjectURL(videoUrl); }, [videoUrl]);
@@ -9745,10 +9790,20 @@ function UniStage2({ result, videoFile, flowDefaults, editCtx }) {
       )}
       <div className="toolbar">
         <span className="hint-text" style={{ margin: 0 }}>
-          {editIdx != null ? ('편집 중: 마디 ' + (editIdx + 1) + ' — 초록 핸들을 끌면 이음새에서 잘린 구간 → 인접 조각 원본 가장자리 순으로 원본 픽셀을 가져오거나(바깥), 더 잘라 냅니다(안쪽)') : '마디를 더블클릭하면 편집 모드로 들어갑니다'}
+          {editIdx != null ? ('편집 중: 마디 ' + (editIdx + 1) + ' — 초록 핸들을 끌면 이음새에서 잘린 구간 → 인접 조각 원본 가장자리 순으로 원본 픽셀을 가져오거나(바깥), 더 잘라 냅니다(안쪽)') : ('마디를 더블클릭하면 편집 모드(가장자리 조절' + (ctx2.onDeleteMeasure ? '·삭제' : '') + ')로 들어갑니다 · 띠 위 파란 숫자 = 마디 번호')}
         </span>
         {editIdx != null && <button className="icon-btn" style={{ color: '#c0392b', borderColor: '#c0392b' }} onClick={() => { if (ctx2.onDeleteMeasure) ctx2.onDeleteMeasure(bars[editIdx], bars[editIdx + 1]); setEditIdx(null); }}>삭제 (Delete)</button>}
         {editIdx != null && <button className="icon-btn" onClick={() => setEditIdx(null)}>편집 종료</button>}
+        {ctx2.onDeleteMeasure && (
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+            <span className="slider-label" style={{ margin: 0 }}>마디 지우기:</span>
+            <input type="number" min="1" max={Math.max(1, bars.length - 1)} value={delFrom} placeholder="번호" onChange={e => setDelFrom(e.target.value)} style={{ width: '4.5em' }} />
+            <span>~</span>
+            <input type="number" min="1" max={Math.max(1, bars.length - 1)} value={delTo} placeholder="(끝)" onChange={e => setDelTo(e.target.value)} style={{ width: '4.5em' }} />
+            <button className="icon-btn" style={{ color: '#c0392b', borderColor: '#c0392b' }} onClick={deleteRange}
+              disabled={!(parseInt(delFrom, 10) >= 1 && parseInt(delFrom, 10) <= bars.length - 1 && (delTo === '' || (parseInt(delTo, 10) >= parseInt(delFrom, 10) && parseInt(delTo, 10) <= bars.length - 1)))}>지우기</button>
+          </span>
+        )}
         <button className="icon-btn" onClick={() => ctx2.onUndo && ctx2.onUndo()} disabled={!ctx2.canUndo}>← 되돌리기</button>
         <button className="icon-btn" onClick={() => ctx2.onRedo && ctx2.onRedo()} disabled={!ctx2.canRedo}>다시 실행 →</button>
         {ctx2.msg && <span className="save-msg">{ctx2.msg}</span>}
@@ -10697,7 +10752,9 @@ async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress
         const e = mosNcc(prev.ext, fr.ext, W, hf, s);
         de = e;
         // 정지 장면만 — 움직이는 영상은 제목·로고처럼 화면에 고정된 글자가 띠 바깥에 있어 값이 원래 낮다
-        if (Math.abs(s) < 0.02 * W && e > -1 && e < (strict ? 0.8 : 0.5)) same = false;
+        // (진단: Misty 끝부분처럼 천천히 흐르는 악보는 0.2초에 저해상도 5~9px만 움직인다 — 예전 기준(2% = 9.6px)으로는 '정지'로 보고
+        //  강조색이 바뀐 것만으로 끊어 같은 마디가 여러 번 이어 붙었다 → 정지 판단은 2px 이하만)
+        if (Math.abs(s) <= 2 && e > -1 && e < (strict ? 0.8 : 0.5)) same = false;
       }
       // 출력 해상도(숫자 하나하나가 보이는 해상도)에서도 맞아야 같은 장면. 저해상도에선 리듬 기둥·오선이 같은 다른 페이지가 0.9 넘게 나온다.
       // 실측(소수빈 영상): 같은 페이지 0.90~1.0, 페이지가 바뀐 순간 0.73~0.74
@@ -10708,18 +10765,28 @@ async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress
         const medv = hist.length >= 3 ? hist.slice().sort((a, b) => a - b)[hist.length >> 1] : 1;
         // 정지 장면(이동 2% 미만)에서만 적용 — 움직이는 장면은 흔들림·번짐으로 원래 값이 낮다
         dref = ref[0];
-        if (Math.abs(ref[1]) < 0.02 * OW && (strict ? ref[0] < Math.max(0.88, medv - 0.04) : ref[0] < 0.82 && ref[0] < medv - 0.1)) same = false;
+        if (Math.abs(s) <= 2 && Math.abs(ref[1]) <= Math.ceil(2 * kk) && (strict ? ref[0] < Math.max(0.88, medv - 0.04) : ref[0] < 0.82 && ref[0] < medv - 0.1)) same = false;
       }
       if (same) {
         const so = ref[1];
-        if (Math.abs(so) < 0.02 * OW) { (cur.vr = cur.vr || []).push(ref[0]); if (cur.vr.length > 25) cur.vr.shift(); }
-        const x = cur.frames[cur.frames.length - 1].x + so;
+        if (Math.abs(s) <= 2 && Math.abs(so) <= Math.ceil(2 * kk)) { (cur.vr = cur.vr || []).push(ref[0]); if (cur.vr.length > 25) cur.vr.shift(); }
+        let x = cur.frames[cur.frames.length - 1].x + so;
+        // 위치 누적 오차 막기: 바로 앞 장면과의 이동량(정수 px)만 계속 더하면 반 픽셀씩 어긋남이 쌓여, 같은 곳을 여러 장면의 중앙값으로
+        // 그릴 때 숫자가 두 겹으로 번진다 → 가장 최근 기준 장면(key)에 직접 맞춰 위치를 다시 잡는다
+        const ak = cur.keys[cur.keys.length - 1];
+        if (ak && ak.zf && Math.abs(x - ak.x) < OW * 0.7) {
+          const ra = mosRefineV(ak.zf, fr.zf, OW, hc, Math.round(x - ak.x), 2);
+          if (ra[0] >= 0.6) x = ak.x + ra[1];
+        }
         cur.frames.push({ t, x });
         cur.vel = (so / kk) / dt;
+        // 구간 첫 장면은 장면이 바뀌는 순간(앞 화면과 섞인 프레임)인 경우가 많다 — 바로 다음 장면이 같은 자리면 그것으로 바꾼다
+        // (Neo Soul 영상: 줄이 바뀔 때 코드 이름이 두 겹으로 겹쳐 그려짐)
+        if (cur.frames.length === 2 && cur.keys.length === 1 && Math.abs(x - cur.keys[0].x) <= 4) cur.keys[0] = { x, t, gray, zf: fr.zf };
         const near = cur.keys.filter(q => Math.abs(q.x - x) < KEY_MOVE);
         const lastKey = cur.keys[cur.keys.length - 1];
-        if (!lastKey || Math.abs(x - lastKey.x) >= KEY_MOVE || (t - lastKey.t >= 1.0 && near.length < MOS_MAX_COVER)) { cur.keys.push({ x, t, gray }); cur.pend = null; }
-        else cur.pend = { x, t, gray };
+        if (!lastKey || Math.abs(x - lastKey.x) >= KEY_MOVE || (t - lastKey.t >= 1.0 && near.length < MOS_MAX_COVER)) { cur.keys.push({ x, t, gray, zf: fr.zf }); cur.pend = null; }
+        else cur.pend = { x, t, gray, zf: fr.zf };
         cur.last = fr;
         joined = true;
         if (cur.keys.length > 24) flushRun(false);
@@ -10727,7 +10794,7 @@ async function mosCollect(video, roi, { rate, startT, endT, abortRef, onProgress
     }
     if (!joined) {
       flushRun(true);
-      cur = { id: ++mosRunSeq, frames: [{ t, x: 0 }], keys: [{ x: 0, t, gray }], pend: null, blocks: new Map(), first: fr, last: fr, nextBlock: null, vel: null };
+      cur = { id: ++mosRunSeq, frames: [{ t, x: 0 }], keys: [{ x: 0, t, gray, zf: fr.zf }], pend: null, blocks: new Map(), first: fr, last: fr, nextBlock: null, vel: null };
     }
     if (diag) diag.push([D3(t), dv == null ? null : D3(dv), ds, dref == null ? null : D3(dref), de == null ? null : D3(de), joined ? 'J' : 'N']);
     prev = fr;
@@ -10774,7 +10841,14 @@ function mosPlace(col, motion, edits) {
       // — 반복 페이지가 많은 페이지 전환 영상에서 다른 페이지가 위에 겹쳐 그려지던 문제
       const extOk = e <= -1 || e >= 0.5;
       const strongEnough = overlap < 0.85 || v >= 0.88;
-      const autoOverlap = v >= thr && overlap >= 0.08 && extOk && strongEnough && (motion !== 'page' || (overlap >= 0.95 && v >= 0.9));
+      // 흐르던 악보가 잠깐 끊긴 경우(강조색 변화·흔들림): 앞 구간의 속도로 예상한 자리와 맞으면 겹친다.
+      // 예전엔 겹침 85%+에 NCC 0.88을 요구해 Misty 끝부분(겹침 98%, NCC 0.84~0.87)이 계속 이어 붙어 같은 마디가 반복됐다
+      const gapT0 = r.frames[0].t - p.frames[p.frames.length - 1].t;
+      const pMoving = p.vel != null && Math.abs(p.vel) * 0.2 >= 2 && (p.hi - p.lo - OW) >= 0.05 * OW;
+      const contPred = pMoving ? p.vel * gapT0 : null;
+      const continues = motion !== 'page' && contPred != null && gapT0 <= 0.7 && v >= 0.7 && extOk
+        && Math.abs(s - contPred) <= Math.max(4, 0.04 * W);
+      const autoOverlap = continues || (v >= thr && overlap >= 0.08 && extOk && strongEnough && (motion !== 'page' || (overlap >= 0.95 && v >= 0.9)));
       const want = md[r.id] === 'overlap' ? true : md[r.id] === 'append' ? false : autoOverlap;
       if (want) {
         const so = mosRefine(p.last.zf, r.first.zf, OW, hc, Math.round(s * kk), rr);
@@ -10874,6 +10948,35 @@ function mosRender(col, pl, preproc) {
     r._cv = c; r._cvSc = sc;
     return c;
   };
+  // 구간마다 세로 위치 맞추기: 영상이 줄마다 악보를 몇 px씩 위아래로 다르게 놓는 경우(Neo Soul: ±5px)
+  // 띠의 오선이 세 겹으로 어긋나 마디선 검출이 통째로 실패했다 → 행별 잉크 분포가 첫 구간과 가장 잘 맞는 높이로 옮긴다
+  const rowProf = rc => {
+    const w = rc.width, h = rc.height, d = rc.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data;
+    const pr = new Float32Array(h);
+    const step = Math.max(1, Math.floor(w / 1500));
+    for (let y = 0; y < h; y++) { let c = 0, n = 0; for (let x = 0; x < w; x += step) { if (d[(y * w + x) * 4] < 128) c++; n++; } pr[y] = c / n; }
+    let m = 0; for (const v of pr) m += v; m /= h;
+    for (let y = 0; y < h; y++) pr[y] -= m;
+    return pr;
+  };
+  const dys = runs.map(() => 0);
+  {
+    let ref = null, refH = 0;
+    runs.forEach((r, ri) => {
+      const rc = runCanvas(r);
+      if (!rc) return;
+      const pr = rowProf(rc);
+      if (!ref) { ref = pr; refH = rc.height; return; }
+      const k = rc.height / refH, lim = Math.round(rc.height * 0.08);
+      let best = -Infinity, bd = 0;
+      for (let dy = -lim; dy <= lim; dy++) {
+        let sum = 0;
+        for (let y = 0; y < rc.height; y++) { const yr = Math.round((y + dy) / k); if (yr >= 0 && yr < refH) sum += pr[y] * ref[yr]; }
+        if (sum > best) { best = sum; bd = dy; }
+      }
+      dys[ri] = bd * (H / rc.height);
+    });
+  }
   const CH = 6000, chunks = [];
   for (let c0 = 0; c0 < total; c0 += CH) {
     const cw = Math.min(CH, total - c0);
@@ -10888,7 +10991,7 @@ function mosRender(col, pl, preproc) {
       const gx = Math.round((pl.place[ri] + rc._x0) * sc) - c0;
       const gw = isNative ? rc.width : Math.round(rc.width * sc);
       if (gx + gw <= 0 || gx >= cw) return;
-      g.drawImage(rc, gx, 0, gw, H);
+      g.drawImage(rc, gx, Math.round(dys[ri]), gw, H);
     });
     // 흑백 처리는 정답 악보 7곡으로 검증된 페이지 전환형과 같은 방식: 임계값 + 그림 배경 지우기(얼룩이 있을 때만) + 잡티 제거.
     // 예전 방식(화면 배경 빼기·오선 복원·탑햇 전체 적용)은 숫자를 배경으로 지우거나, 오선을 굵게 칠해 줄 위 숫자를 덮었다
@@ -10964,7 +11067,7 @@ function mosCutStrip(result, a, b) {
     T.push(tr.t[i]); S.push(ns);
   });
   if (!T.length) { T.push(0); S.push(0); }
-  return { ...result, chunks, totalW, track: { ...tr, t: T, X: S, k1: T.length - 1, totalW }, tFirst: T[0] };
+  return { ...result, chunks, totalW, track: { ...tr, t: T, X: S, k1: T.length - 1, totalW }, tFirst: T[0], lastCut: { a, b }, cutFrom: result };
 }
 
 function MosaicStep({ videoRef, onModeBack }) {
